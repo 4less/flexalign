@@ -1,0 +1,36 @@
+cargo-features = ["profile-rustflags"]
+
+[package]
+name = "flexalign"
+version = "0.1.0"
+edition = "2021"
+channel = "nightly"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+kmerrs = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/kmerrs/" }
+flexmap = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/flexmap/" }
+bioreader = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/bioreader/" }
+clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
+clap_derive = "4.5.3"
+flate2 = "1.0.28"
+gzp = "0.11.3"
+savefile = { version="0.17", feature="derive" }
+savefile-derive = "0.17"
+log = "0.4.22"
+popcnt = "0.1.0"
+colored = "2.1.0"
+anstyle = "1.0.8"
+glidesort = { version="0.1.2", feature="unstable" }
+serde = { version = "1.0.207", features = ["derive"] }
+serde_derive = "1.0.207"
+bincode = { version = "2.0.0-rc.3" }
+
+
+[profile.release]
+opt-level = 3               # Use best optimizations
+overflow-checks = false     # Disable integer overflow checks.
+rustflags = ["-C", "target-feature=+avx,+sse3,+avx2,+fma"]#
+lto = "fat"
+
