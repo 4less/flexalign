@@ -2,7 +2,7 @@
 #![feature(map_try_insert)]
 #![feature(const_option)]
 #![feature(const_trait_impl)]
-#![feature(effects)]
+// #![feature(effects)]
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -10,9 +10,11 @@ use std::io::{BufReader, BufWriter};
 use clap::Parser;
 #[allow(unused_parens)]
 pub mod options;
+pub mod utils;
 use colored::control::SHOULD_COLORIZE;
 use colored::Colorize;
 use flexalign::flexalign::{run, time};
+use flexalign::misc::test2;
 use flexalign::options::Args;
 use flexmap::keys::{FMKeysHash, KHashEntry};
 use savefile::{load, save};
@@ -57,5 +59,5 @@ fn main() {
     let args: Args = Args::parse();
     let (duration, _) = time(|| run(args));
 
-    eprintln!("Protal took {:?}", duration);
+    eprintln!("Flexalign took {:?}", duration);
 }

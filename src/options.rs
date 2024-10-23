@@ -1,6 +1,9 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, str::FromStr};
 
 use clap::Parser;
+use clap_derive::Args;
+
+use crate::utils::infer_output_prefix;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -9,16 +12,16 @@ use clap::Parser;
 #[command(max_term_width = 120)] // term_width sets it fixed, max term_width can be smaller
 pub struct Args {
     /// Forward read of pair (.fastq, .fq)
-    #[arg(short = '1', long, default_value_t = String::default())]
-    pub fwd: String,
+    #[arg(num_args(0..), short = '1', long, default_values_t = ["".to_string()], action = clap::ArgAction::Append)]
+    pub fwd: Vec<String>,
 
     /// Reverse read of pair (.fastq, .fq)
-    #[arg(short = '2', long, default_value_t = String::default())]
-    pub rev: String,
+    #[arg(num_args(0..), short = '2', long, default_values_t = ["".to_string()], action = clap::ArgAction::Append)]
+    pub rev: Vec<String>,
 
     /// Output file
-    #[arg(short = '0', long, default_value_t = String::default())]
-    pub output: String,
+    #[arg(short = '0', long)] // String::default()
+    pub output: Option<String>,
 
     /// Database reference
     #[arg(short = 'r', long = "reference", default_value_t = String::default())]
@@ -32,17 +35,27 @@ pub struct Args {
     #[arg(short, long, default_value_t = 1)]
     pub threads: u32,
 
-    /// ranges 
+    /// How many minimizers should be looked at
     #[arg(short = 'a', long = "ranges", default_value_t = 15)]
     pub ranges: u32,
 
-    /// max_range_size 
+    /// For a single minimizer, how many occurances may there be at max.
     #[arg(short = 'b', long = "max-range-size", default_value_t = 256)]
     pub max_range_size: usize,
 
-    /// max_range_size 
+    /// For all occurrences of a key, flexalign only takes the seeds with the highest matching flanking region.
+    /// This limits the number of values to be retrieved in this scenario. 
     #[arg(short = 'f', long = "max-best-flex", default_value_t = 16)]
     pub max_best_flex: usize,
+
+    /// After the seeds are grouped into anchors, the top x will be extended with the use of hamming distance.
+    /// This affects speed negatively but sensitivity and precision positively
+    #[arg(short = 'x', long = "extend-top-x", default_value_t = 4)]
+    pub extend_top_x: usize,
+
+    /// align the top y anchors. This happens after anchor extension 
+    #[arg(short = 'y', long = "align-top-y", default_value_t = 4)]
+    pub align_top_y: usize,
 
     /// Minimum number of ranges for lookup. With max-best-flex defines, none of the ranges might actually yield any seeds.
     #[arg(long = "min-ranges", default_value_t = 4)]
@@ -51,15 +64,19 @@ pub struct Args {
     /// force_build
     #[arg(long = "force-build", action)]
     pub force_build: bool,
+
+    /// force_build
+    #[arg(long = "debug", action)]
+    pub debug: bool,
 }
 
 #[derive(Debug)]
 pub struct Options {
     pub fwd: Vec<PathBuf>,
     pub rev: Vec<Option<PathBuf>>,
+    pub output_prefix: Option<Vec<PathBuf>>,
     pub reference: PathBuf,
     pub reference_database: PathBuf,
-    output_prefix: Vec<PathBuf>,
     
     pub args: Args,
 }
@@ -72,7 +89,7 @@ impl Options {
             rev: vec![None; 0],
             reference: PathBuf::default(),
             reference_database: PathBuf::default(),
-            output_prefix: vec![PathBuf::default(); 0],
+            output_prefix: None,
             args: args,
         };
         Self::init(&mut options);
@@ -80,16 +97,40 @@ impl Options {
     }
 
     pub fn init(&mut self) {
-        self.fwd.push(self.args.fwd.clone().into());
+        self.fwd.extend(self.args.fwd.iter().map(|x| x.into()));
+        self.rev.extend(self.args.rev.iter().map(|x| Some(x.into())));
 
-        self.rev.push(if self.args.rev.is_empty() { 
-            None 
-        } else {
-            Some(self.args.rev.clone().into())
-        });
+        if self.fwd.len() > 1 {
+            if self.args.output.is_none() {
+                panic!("When processing multiple files in one run you need to provide an output folder for the results to be stored. (--output FOLDER)")
+            }
+
+            let inputs = self.fwd.iter().map(|x| x.to_string_lossy().into_owned()).collect::<Vec<String>>();
+            self.output_prefix = Some(infer_output_prefix(&inputs)
+                .iter()
+                .map(|s| { 
+                    let mut p = PathBuf::from_str(&self.args.output.as_ref().unwrap()).expect("Cannot turn string into path");
+                    p.push(s);
+                    p
+                })
+                .collect::<Vec<_>>());
+        } else if self.fwd.len() == 1 && self.args.output.is_some() {
+            let s = self.fwd.first().unwrap().to_str().unwrap();
+            let s = s.strip_suffix(".gz").unwrap_or(s);
+            let s = s.strip_suffix(".bz").unwrap_or(s);
+            let s = s.strip_suffix(".bz2").unwrap_or(s);     // Remove .gz if present
+            let s = s.rsplit_once('.').map_or(s, |(left, _)| left);
+            
+            self.output_prefix = Some(vec![PathBuf::from(s); 0]);
+        }
         
+        if self.output_prefix.is_some() {
+            for s in self.output_prefix.as_ref().unwrap() {
+                println!("{:?}", s);
+            }
+        }
+
         self.reference.push(self.args.reference.clone());
-        self.output_prefix.push("test.out".into());
     }
 }
 

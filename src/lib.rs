@@ -12,6 +12,8 @@ pub mod align;
 pub mod flexalign;
 pub mod options;
 pub mod io;
+pub mod misc;
+pub mod utils;
 
 const GLOBAL_VERSION: u32 = 1;
 

@@ -1,9 +1,9 @@
 
 use std::{cmp::{max, min}, io::stdin, mem::swap};
 
-use super::{super::GOLDSTD_EVAL, stats::Stats};
+use super::{super::GOLDSTD_EVAL, common::{KmerExtractor}, stats::Stats};
 use bioreader::sequence::fastq_record::{print_color_qualities, OwnedFastqRecord, RefFastqRecord};
-use flexmap::values::{VData, VRange};
+use flexmap::{values::{VData, VRange}, VD};
 use kmerrs::{consecutive::kmer::{Kmer, KmerIter}, minimizer::context_free::Minimizer};
 use colored::Colorize;
 
@@ -11,7 +11,6 @@ use crate::{database::common::FlexalignDatabase, flexalign::time, io::output_buf
 
 use super::data_structures::{Anchor, AnchorSeed, Seed};
 
-type VD = VData::<20,40>;
 
 #[derive(Clone)]
 pub struct Standard<
@@ -60,8 +59,6 @@ impl<
         D: FlexalignDatabase
     > Standard<'a, K, C, F, S, L, HEADER_THRESHOLD, T, D>
 {
-
-
     pub fn new(db: &'a D, minimizer: T, options: &'a Options, output: OutputBuffer) -> Self {
         Self {
             ranges: Vec::new(),
@@ -251,7 +248,7 @@ impl<
     }
 
     pub fn sanity_check_anchor(&self, anchor: &Anchor, rec_fwd: &RefFastqRecord, rec_rev: &OwnedFastqRecord) -> bool {
-        if !anchor.forward_set {
+        if !anchor.orientation_set {
             return true
         }
         
@@ -315,7 +312,7 @@ impl<
         // let read_slice = &rec.seq()[best.read_pos as usize + F/2..best.read_pos as usize + F/2 as usize + C];
         let ref_seed = &seq[start..end];
 
-        let _read_seed = if best.seed_count == 1 && !best.forward_set {
+        let _read_seed = if best.seed_count == 1 && !best.orientation_set {
 
             let start_fwd = best_first.qpos as usize;
             let seed_fwd = &rec.seq()[start_fwd..start_fwd + best_first.length as usize];
@@ -419,14 +416,7 @@ impl<
                 let first = seeds.get(*self.indices.first().unwrap()).unwrap();
                 
                 // Set first seed as an anchor.
-                let mut a = Anchor {
-                    reference: first.rval,
-                    seed_count: 1,
-                    mismatches: first.mismatch as u32,
-                    forward: true,
-                    forward_set: false,
-                    seeds: vec! [AnchorSeed{ qpos: first.qpos, rpos: first.rpos, length: first.length as u32 }],
-                };
+                let mut a = Anchor::from_seed(first);
 
                 // eprintln!("Starting with anchor: {}", first.to_string());
                 
@@ -481,7 +471,7 @@ impl<
 
         let mut matches = 0;
         let mut discarded_max_flex_count = 0;
-        for (pos, flex, range, _range_size) in &self.ranges {
+        for (qpos, flex, range, _range_size) in &self.ranges {
             match range.header {
                 Some(headers) => {
                     let mut min_dist = u32::MAX;
@@ -511,13 +501,7 @@ impl<
                         if dist == min_dist {
                             // self.seeds.push((*pos, range.positions[index].clone()))
                             let (value, rpos) = VD::get(range.positions[index].0);
-                            self.seeds.push(Seed {
-                                qpos: if dist == 0 { *pos as u32 } else { *pos as u32 + (F as u32/2) },
-                                rpos: if dist == 0 { rpos } else { rpos + (F as u64/2) },
-                                rval: value,
-                                mismatch: dist as u8,
-                                length: if dist == 0 {K as u8} else {C as u8},
-                            });
+                            self.seeds.push(Seed::from_flexmer::<K,C,F>(*qpos, rpos, value, dist));
                             // eprintln!("H Push: {} {} {}", self.seeds.last().unwrap().to_string(), *pos, rpos);
                         }
                     }
@@ -526,13 +510,7 @@ impl<
                     for cell in range.positions {
                         // self.seeds.push((*pos, cell.clone()));
                         let (value, rpos) = VD::get(cell.0);
-                        self.seeds.push(Seed {
-                            qpos: *pos as u32 + (F as u32/2),
-                            rpos:  rpos + (F as u64/2),
-                            rval: value,
-                            mismatch: 0,
-                            length: C as u8,
-                        });
+                        self.seeds.push(Seed::from_coremer::<K,C,F>(*qpos, rpos, value));
                         // eprintln!("N Push: {} {} {}", self.seeds.last().unwrap().to_string(), *pos, rpos);
                     }
                 },
@@ -671,8 +649,6 @@ impl<
 
     pub fn get_anchors(&mut self, _stats: &mut Stats) {
         if self.seeds.len() < 10 { return }
-        // println!("Get Anchors... {}", self.seeds.len());
-        // let _ = self.seeds.iter().map(|seed| println!("{}", seed));
 
         let mut stop = false;
         for seed in self.seeds.iter() {
@@ -689,3 +665,4 @@ impl<
 
     }
 }
+

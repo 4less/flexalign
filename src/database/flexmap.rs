@@ -3,10 +3,14 @@ use std::{collections::HashMap, fs::File, io::BufReader};
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
 use flexmap::flexmap::{Flexmap, FlexmapHash, VRangeGetter};
 use savefile::{load, save};
+use ser_raw::{storage, CompleteSerializer, PureCopySerializer, Serialize, SerializeWith, Serializer};
+
+use crate::flexalign::time;
 
 use super::common::{DBPaths, load_references, FlexalignDatabase};
 
 
+#[repr(C)]
 #[derive(Clone)]
 pub struct DB<
     const K: usize,
@@ -94,7 +98,10 @@ impl<
         let rid_to_rname: Vec<String> = load(rid2rname_file, version).expect("Valid reference database");
         let rname_to_rid: HashMap<String, usize> = load(rname2rid_file, version).expect("Valid reference database");
 
-        let references = load_references(references_file, &rname_to_rid, &rid_to_rname);
+        let (duration, references) = time(|| {
+            load_references(references_file, &rname_to_rid, &rid_to_rname)
+        });
+        eprintln!("Loading references took {:?}", duration);
 
         let references = match references {
             Ok(references) => references,
@@ -136,6 +143,9 @@ impl<
             Ok(file) => file,
         };
         let _ = save(&mut file, version, &self.rname_to_rid);
+
+        // let mut ser = PureCopySerializer::<16, 8, 16, 1024, _>::new();
+        // let storage = ser.serialize(&self.flexmap);
 
         Ok(())
     }

@@ -1,4 +1,4 @@
-use std::{cmp::max, fmt::Display};
+use std::{cmp::{max, min}, fmt::Display};
 
 use bioreader::parallel::fastq::Merge;
 
@@ -12,71 +12,71 @@ pub struct BinaryEvaluator {
 
 impl BinaryEvaluator {
 
-    fn actual_positives(&self) -> u64 {
+    pub fn actual_positives(&self) -> u64 {
         self.tps + self.fns
     }
 
-    fn actual_negatives(&self) -> u64 {
+    pub fn actual_negatives(&self) -> u64 {
         self.fps + self.tns
     }
 
-    fn predicted_positives(&self) -> u64 {
+    pub fn predicted_positives(&self) -> u64 {
         self.tps + self.fps
     }
 
-    fn predicted_negatives(&self) -> u64 {
+    pub fn predicted_negatives(&self) -> u64 {
         self.tns + self.fns
     }
 
-    fn total(&self) -> u64 {
+    pub fn total(&self) -> u64 {
         self.tps + self.tns + self.fps + self.fns
     }
 
-    fn sensitivity(&self) -> f64 {
+    pub fn sensitivity(&self) -> f64 {
         self.tps as f64 / self.actual_positives() as f64
     }
 
-    fn recall(&self) -> f64 {
+    pub fn recall(&self) -> f64 {
         self.sensitivity()
     }
 
-    fn true_positive_rate(&self) -> f64 {
+    pub fn true_positive_rate(&self) -> f64 {
         self.sensitivity()
     }
 
-    fn false_positive_rate(&self) -> f64 {
+    pub fn false_positive_rate(&self) -> f64 {
         self.fps as f64 / self.actual_negatives() as f64
     }
 
-    fn true_negative_rate(&self) -> f64 {
+    pub fn true_negative_rate(&self) -> f64 {
         self.tns as f64 / self.actual_negatives() as f64
     }
 
-    fn false_negative_rate(&self) -> f64 {
+    pub fn false_negative_rate(&self) -> f64 {
         self.fns as f64 / self.actual_negatives() as f64
     }
     
-    fn negative_predictive_value(&self) -> f64 {
+    pub fn negative_predictive_value(&self) -> f64 {
         self.tns as f64 / self.predicted_negatives() as f64
     }
 
-    fn specificity(&self) -> f64 {
+    pub fn specificity(&self) -> f64 {
         self.true_negative_rate()
     }
 
-    fn precision(&self) -> f64 {
+    pub fn precision(&self) -> f64 {
         self.tps as f64 / self.predicted_positives() as f64
     }
 
-    fn positive_predictive_value(&self) -> f64 {
+    pub fn positive_predictive_value(&self) -> f64 {
         self.precision()
     }
 
-    fn f1_score(&self) -> f64 {
+    pub fn f1_score(&self) -> f64 {
         (2 * self.tps) as f64 / (2 * self.tps + self.fps + self.fns) as f64
     }
 
-    fn accuracy(&self) -> f64 {
+    pub fn accuracy(&self) -> f64 {
         (self.tps + self.fns) as f64 / self.total() as f64
     }
 }
@@ -94,12 +94,14 @@ pub struct MapqEvaluation {
 }
 
 impl Display for MapqEvaluation {
+
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let binary_eval = self.binary_evaluator(0);
 
+        let max_display = 10;
         let mut str = String::default();
         str.push_str("MAPQ\tTP\tFP\tFN\tTN\tSensitivity\tPrecision\tF1\tSpecificity\tAccuracy\n");
-        for mapq_threshold in 0..max(self.mapq_correct.len(), self.mapq_incorrect.len()) {
+        for mapq_threshold in 0..min(max(self.mapq_correct.len(), self.mapq_incorrect.len()), max_display) {
             let binary_eval = self.binary_evaluator(mapq_threshold);
             str.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
                 mapq_threshold,

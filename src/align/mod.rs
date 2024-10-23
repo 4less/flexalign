@@ -3,3 +3,8 @@ pub mod stats;
 pub mod eval;
 pub mod workflow;
 pub mod data_structures;
+pub mod common;
+pub mod modular_workflow;
+pub mod process;
+pub mod sam;
+pub mod errors;

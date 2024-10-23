@@ -1,3 +1,10 @@
+use std::{fs::File, io::{BufReader, BufWriter}};
+
+use flexmap::keys::KHashEntry;
+use savefile::{load, save};
+
+use crate::flexalign::time;
+
 
 #[derive(Clone, Savefile)]
 struct Container {
@@ -43,4 +50,24 @@ fn test() {
     let (duration, result) = time(|| load::<Vec<KHashEntry>>(&mut file_b, 1));
     eprintln!("Load B took {:?} : {}", duration, result.unwrap().len());
 
+}
+
+
+pub trait TestTrait {
+    fn test();
+}
+pub struct TestStruct;
+
+impl TestTrait for TestStruct {
+    fn test() {
+        eprintln!("Test successful");
+    }
+}
+
+pub fn test2() {
+    test2_worker::<TestStruct>();
+}
+
+pub fn test2_worker<T: TestTrait>() {
+    T::test();
 }
