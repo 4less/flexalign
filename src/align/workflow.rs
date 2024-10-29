@@ -9,7 +9,8 @@ use colored::Colorize;
 
 use crate::{database::common::FlexalignDatabase, flexalign::time, io::output_buffer::OutputBuffer, options::Options};
 
-use super::data_structures::{Anchor, AnchorSeed, Seed};
+use super::data_structures::common::Seed;
+use super::data_structures::anchor::{Anchor, AnchorSeed};
 
 
 #[derive(Clone)]

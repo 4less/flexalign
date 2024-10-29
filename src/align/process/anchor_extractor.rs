@@ -1,8 +1,7 @@
 use std::{cmp::{max, min}, fmt::Display, mem::swap, ops::Range};
 
-use flate2::read;
 
-use crate::{align::{common::{AnchorExtractor, AnchorPair, AnchorScore, PairedAnchorExtractor, PairedAnchorMAPQ, SeedGroupPairList, SeedGroupPairedList, StdAnchorScore, StdPairedAnchorMAPQ}, data_structures::{Anchor, AnchorSeed, Seed}, stats::{self, Stats}}, flexalign::time};
+use crate::{align::{common::{AnchorExtractor, AnchorPair, AnchorScore, PairedAnchorExtractor, SeedGroupPairList, SeedGroupPairedList, StdAnchorScore, StdPairedAnchorMAPQ}, data_structures::{anchor::Anchor, common::Seed}, stats::{self, Stats}}, flexalign::time};
 
 
 #[repr(C)]

@@ -1,147 +1,28 @@
-use std::{cmp::{max, min}, fmt::Display, iter::{zip, Zip}, ops::Range, slice::Iter, thread::current};
+use std::{cmp::{max, min}, fmt::Display, iter::zip, ops::Range};
 
-use bioreader::sequence::{fastq_record::{OwnedFastqRecord, RefFastqRecord}, utils::reverse_complement_into_vec};
+use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use colored::{Color, Colorize};
-use thiserror::Error;
-use triple_accel::hamming as triple_hamming;
 
-use crate::align::common::Status;
+use crate::align::{common::{Align, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, sam::Cigar};
 
-use super::{common::{print_alignment, Align, Heuristic}, errors::{AlignmentError, AlignmentResult}, sam::Cigar};
+use super::common::{hamming, Seed};
 
-
-#[derive(Debug, Clone, Error)]
-struct ResolveOrientationError;
-impl Display for ResolveOrientationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Error while resolving the orientation for an anchor")
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
-pub struct Seed {
-    pub rpos: u64,
-    pub rval: u64,
-    pub qpos: u32,
-    pub mismatch: u8,
-    pub length: u8,
-    pub flag: u8,
-}
+pub struct AnchorStatus(bool);
 
-impl Seed {
-    #[inline(always)]
-    pub fn from_flexmer<const K: usize, const C: usize, const F: usize>(qpos: usize, rpos: u64, reference: u64, dist: u32) -> Self {
-        Self {
-            qpos: if dist == 0 { qpos as u32 } else { qpos as u32 + (F as u32/2) },
-            rpos: if dist == 0 { rpos as u64 } else { rpos + (F as u64/2) },
-            rval: reference,
-            mismatch: dist as u8,
-            length: if dist == 0 {K as u8} else {C as u8},
-            flag: 0,
-        }
+impl AnchorStatus {
+    pub fn is_valid(&self) -> bool {
+        return self.0
     }
 
-    #[inline(always)]
-    pub fn from_coremer<const K: usize, const C: usize, const F: usize>(qpos: usize, rpos: u64, reference: u64) -> Self {
-        Self {
-            qpos: qpos as u32 + (F as u32/2),
-            rpos:  rpos + (F as u64/2),
-            rval: reference,
-            mismatch: 0,
-            length: C as u8,
-            flag: 0,
-        }
-    }
-
-    pub fn offset(&self) -> u64 {
-        self.rpos as u64 - self.qpos as u64
-    }
-
-    pub fn offsets(&self,  read_length: usize) -> (i64, i64) {
-        // ((self.rpos as u64 - self.qpos as u64) | (1 << 62), self.rpos as u64 + self.qpos as u64)
-
-        (self.rpos as i64 - self.qpos as i64, self.rpos as i64 - (read_length as i64 - self.length as i64 - self.qpos as i64))
-    }
-
-    pub fn offset_dist(&self, other: &Self, read_length: usize) -> u64 {
-        let (oa1, oa2) = self.offsets(read_length);
-        let (ob1, ob2) = other.offsets(read_length);
-        let min1 = min(oa1.abs_diff(ob1), oa1.abs_diff(ob2));
-        let min2 = min(oa2.abs_diff(ob1), oa2.abs_diff(ob2));
-        min(min1, min2)
-    }
-
-    pub fn closest_offset(&self, other: &Self, read_length: usize) -> (i64, bool, u64) {
-        let (self_fwd, self_rev) = self.offsets(read_length);
-        let (other_fwd, other_rev) = other.offsets(read_length);
-
-        let diff_fwd = self_fwd.abs_diff(other_fwd);
-        let diff_rev = self_rev.abs_diff(other_rev);
-
-        if diff_fwd < diff_rev {
-            (self_fwd, true, diff_fwd)
-        } else {
-            (self_rev, false, diff_rev)
-        }
-    }
-
-    pub fn reverse(&self, read_length: usize) -> Seed {
-        Seed {
-            qpos: read_length as u32 - self.length as u32 - self.qpos as u32,
-            rpos: self.rpos,
-            rval: self.rval,
-            mismatch: self.mismatch,
-            length: self.length,
-            flag: 0,
-        }
-    }
-
-    pub fn to_visual_string_x(&self, read_length: Option<usize>) -> String {
-        let mut output = String::new();
-
-        match read_length {
-            Some(read_length) => {
-                let spaces = String::from_utf8(vec![b' '; read_length - self.length as usize - self.qpos as usize]).unwrap();
-                let xes = String::from_utf8(vec![b'X'; self.length as usize]).unwrap();
-                output += &spaces;
-                output += &xes;
-                output += "          ";
-                output += &self.to_string();
-            },
-            None => {
-                let spaces = String::from_utf8(vec![b' '; (self.qpos) as usize]).unwrap();
-                let xes = String::from_utf8(vec![b'X'; self.length as usize]).unwrap();
-                output += &spaces;
-                output += &xes;
-            },
-        };
-
-        output
-    }
-
-
-    pub fn to_visual_string(&self, read: &[u8]) -> String {
-        let mut output = String::new();
-
-        let spaces = String::from_utf8(vec![b' '; (self.qpos) as usize]).unwrap();
-        let xes = String::from_utf8_lossy(&read[self.qpos as usize..self.qpos as usize + self.length as usize]);
-        output += &spaces;
-        output += &xes;
-
-        output
+    pub fn set_valid(&mut self) {
+        self.0 = true
     }
 }
-
-impl Display for Seed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reference: {}  rpos: {},  qpos: {}, mismatch: {}, length: {}, offsets: {:?}", 
-            self.rval,
-            self.rpos,
-            self.qpos,
-            self.mismatch, 
-            self.length,
-            self.offsets(150)) // CHANGE!!!
+impl Default for AnchorStatus {
+    fn default() -> Self {
+        Self(false)
     }
 }
 
@@ -309,6 +190,13 @@ impl AnchorSeed {
 }
 
 
+pub fn seed_match(seed: &AnchorSeed, query: &[u8], reference: &[u8]) -> bool {
+    fn seed_match(query_seed: &[u8], reference_seed: &[u8]) -> bool {
+        hamming(query_seed, reference_seed) == 0
+    }
+    seed_match(&query[seed.qrange()], &reference[seed.rrange()])
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
 pub struct Anchor {
@@ -318,31 +206,18 @@ pub struct Anchor {
     pub forward: bool,
     pub orientation_set: bool,
     pub flagged_for_indel: bool,
-    pub flag: u8, //
+    pub flag: u8, // 20
     pub counter1: u16,
     pub counter2: u16, // 24
     pub seeds: Vec<AnchorSeed>, // 40
     pub score: i32, // 44
-    pub cigar: Option<Cigar>,
+    pub cigar: Option<Cigar>, // 52
     pub reference_cigar_range: Range<usize>,
+    pub seed_status: AnchorStatus,
 }
 
 
 
-
-pub trait ToString {
-    fn ts(&self) -> String;
-}
-
-impl ToString for &[u8] {
-    fn ts(&self) -> String {
-        String::from_utf8_lossy(self).to_string()
-    }
-}
-
-pub fn hamming(query: &[u8], reference: &[u8]) -> u64 {
-    zip(query, reference).fold(0, |acc, (a,b)| acc + (a != b) as u64)
-}
 
 impl Anchor {
     #[inline(always)]
@@ -361,6 +236,7 @@ impl Anchor {
             seeds: vec! [AnchorSeed{ qpos: seed.qpos, rpos: seed.rpos, length: seed.length as u32 }],
             cigar: None,
             reference_cigar_range: 0..0,
+            seed_status: AnchorStatus(false),
         }
     }
 
@@ -414,7 +290,19 @@ impl Anchor {
         status
     }
 
+    pub fn align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, max_score: i32) -> Status {
+        if self.seed_status.is_valid() {
+            self.extend_seeds(query, reference);
+            self.smart_align(aligner, query, reference, free_ends, max_score)
+        } else {
+            self.whole_align(aligner, query, reference, free_ends*2, max_score)
+        }
+    }
+    
+
     pub fn smart_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32) -> Status {
+        assert!(self.seed_status.0);
+        
         // Accurate alignment of flanks first.
         // Add threshold later and do hamming first, and if the score can possibly improve with perfect alignment, do that
 
@@ -691,7 +579,7 @@ impl Anchor {
     }
 
     pub fn extend_seeds(&mut self, query: &[u8], reference: &[u8]) {
-
+        assert!(self.seed_status.is_valid());
         // Check orientation before this !
         if !self.orientation_set { 
             return
@@ -715,10 +603,11 @@ impl Anchor {
         let left_q = &query[left_range.0.clone()];
         let left_r = &reference[left_range.1.clone()];
 
-        let by = zip(left_q, left_r)
+        let zip_obj = zip(left_q, left_r);
+        let by = zip_obj
             .rev()
             .enumerate()
-            .find(|(i, (a, b))| a != b);
+            .find(|(_, (a, b))| a != b);
         
         match by {
             Some((by, _)) => self.seeds.first_mut().unwrap().extend_left(by),
@@ -733,18 +622,16 @@ impl Anchor {
         let mut current_i = 0;
         let mut next_i = 1;
         while next_i < self.seeds.len() {
-            let middle_range = self.between(&self.seeds[current_i], &self.seeds[next_i]);
+            let between_seeds = self.between(&self.seeds[current_i], &self.seeds[next_i]);
             
-            let middle_q = &query[middle_range.0.clone()];
-            let middle_r = &reference[middle_range.1.clone()];
-
-            // eprintln!("Middle:\n{}\n{}", String::from_utf8_lossy(middle_q), String::from_utf8_lossy(middle_r));
+            let middle_q = &query[between_seeds.0.clone()];
+            let middle_r = &reference[between_seeds.1.clone()];
 
             // First extend from right to left to see if we can merge
             let by = zip(middle_q, middle_r)
                 .rev()
                 .enumerate()
-                .find(|(i, (a, b))| a != b);
+                .find(|(_, (a, b))| a != b);
 
             match by {
                 Some((by, _)) => self.seeds[next_i].extend_left(by),
@@ -786,16 +673,7 @@ impl Anchor {
         
         match by {
             Some((by, _)) => {
-                // eprintln!("{}", String::from_utf8_lossy(right_q));
-                // eprintln!("{}", String::from_utf8_lossy(right_r));
-                // eprintln!("Before {:?}", self.seeds.last());
                 self.seeds.last_mut().unwrap().extend_right(by);
-                // eprintln!("After  {:?}", self.seeds.last());
-
-                // let last = self.seeds.last_mut().unwrap();
-                // if last.qend() > query.len() || last.rend() > reference.len() {
-                //     panic!("By {:?} -- qe{} ql{} re{} rl{}", by, last.qend(), query.len(), last.rend(), reference.len())
-                // }
             },
             None =>  {
                 self.seeds.last_mut().unwrap().extend_right(right_q.len())
@@ -813,6 +691,14 @@ impl Anchor {
 
     pub fn hamming(&self, query: &[u8], reference: &[u8]) -> u64 {
         let (qr, rr) = self.whole(query.len(), reference.len());
+
+        if qr.end > query.len() {
+            panic!("Q: {}, \n{:?}, {}", self, qr, query.len())
+        }
+        if rr.end > reference.len() {
+            panic!("R: {}, \n{:?}, {}", self, rr, reference.len())
+        }
+
         triple_accel::hamming(&query[qr], &reference[rr]) as u64
     }
 
@@ -848,6 +734,8 @@ impl Anchor {
         //requires seeds sorted in ascending order
         let s: &AnchorSeed = self.seeds.first().unwrap();
 
+        assert!(s.qend() <= read_length);
+
         let q_overhang_length = s.qbegin();
         let r_overhang_length = s.rbegin();
         let left_overhang_length = min(q_overhang_length, r_overhang_length);
@@ -856,7 +744,12 @@ impl Anchor {
         let r_overhang_length = ref_length - s.rend();
         let right_overhang_length = min(q_overhang_length, r_overhang_length);
 
-        (((s.qbegin() - left_overhang_length)..s.qend() + right_overhang_length),((s.rbegin() - left_overhang_length)..s.rend() + right_overhang_length))
+        // eprintln!("Q {} - {} .. {} + {} (== min({} ({} - {}),{} ({} - {})))", s.qbegin(), left_overhang_length, s.qend(), right_overhang_length, q_overhang_length, read_length, s.qend(), r_overhang_length, ref_length, s.rend());
+        // eprintln!("R {} - {} .. {} + {}", s.rbegin(), left_overhang_length, s.rend(), right_overhang_length);
+        let q = ((s.qbegin() - left_overhang_length)..s.qend() + right_overhang_length);
+        let r = ((s.rbegin() - left_overhang_length)..s.rend() + right_overhang_length);
+
+        (q,r)
     }
 
     pub fn left_flank(&self) -> (Range<usize>, Range<usize>) {
@@ -1002,6 +895,9 @@ impl Anchor {
         type ASC = AnchorSeedConfig;
         match config {
             ASC::QueryRCSeedRC => {
+                if self.seeds.len() > 1 {
+                    println!("QueryRCSeedRC {}", self);
+                }
                 self.set_forward(false, read_length);
             },
             ASC::QuerySeedRC => {
@@ -1021,10 +917,22 @@ impl Anchor {
     pub fn set_forward(&mut self, forward: bool, read_length: usize) -> &Self {
         self.orientation_set = true;
         self.forward = forward;
-        assert!(self.seeds.len() == 1);
         if !forward {
-            self.seeds.first_mut().unwrap().reverse(read_length);
+            if self.seeds.len() > 1 {
+                eprintln!("MARKER REVERSE MULTIPLE SEEDS");
+                self.seeds.iter_mut().for_each(|s| {
+                    s.reverse(read_length);
+                });
+                eprintln!("Sort by key....");
+                self.seeds.sort_by_key(|s| {
+                    s.qbegin()
+                });
+                eprintln!("{}", self);
+            } else {
+                self.seeds.first_mut().unwrap().reverse(read_length);
+            }
         }
+
         self
     }
 
@@ -1172,6 +1080,7 @@ impl Anchor {
     }
 }
 
+
 impl Display for Anchor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let first = self.seeds.first().unwrap();
@@ -1186,6 +1095,7 @@ impl Display for Anchor {
             let xes = String::from_utf8(vec![seed_char; seed.length as usize]).unwrap();
             seeds_vstr += &spaces;
             seeds_vstr += &xes;
+            seeds_vstr += &format!(" ({}-{}, {}-{})", seed.qbegin(), seed.qend(), seed.rbegin(), seed.rend());
             seeds_vstr += "\n";
 
             seeds_str += &format!(" (qpos {} rpos {} len {})", seed.qpos, seed.rpos, seed.length);
@@ -1223,9 +1133,11 @@ impl Default for Anchor {
             seeds: Vec::new(),
             cigar: None,
             reference_cigar_range: 0..0,
+            seed_status: AnchorStatus(false),
         }
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub enum AnchorSeedConfig {
@@ -1261,33 +1173,10 @@ pub fn get_seed_config(seed: &AnchorSeed, query: &[u8], query_rc: &[u8], referen
         return ASC::QueryRCSeed;
     }
 
-    eprintln!("{}", hamming(&query_rc[seed_rc.qrange()], reference_seed));
-    eprintln!("{}", hamming(&query[seed.qrange()], reference_seed));
-    eprintln!("{}", hamming(&query[seed_rc.qrange()], reference_seed));
-    eprintln!("{}", hamming(&query_rc[seed.qrange()], reference_seed));
+    // eprintln!("{}", hamming(&query_rc[seed_rc.qrange()], reference_seed));
+    // eprintln!("{}", hamming(&query[seed.qrange()], reference_seed));
+    // eprintln!("{}", hamming(&query[seed_rc.qrange()], reference_seed));
+    // eprintln!("{}", hamming(&query_rc[seed.qrange()], reference_seed));
     
     ASC::None
-}
-
-pub fn seed_match(seed: &AnchorSeed, query: &[u8], reference: &[u8]) -> bool {
-    fn seed_match(query_seed: &[u8], reference_seed: &[u8]) -> bool {
-        hamming(query_seed, reference_seed) == 0
-    }
-    seed_match(&query[seed.qrange()], &reference[seed.rrange()])
-}
-
-#[derive(Clone)]
-pub struct Alignment {
-    pub reference_id: u64,
-    pub position: u32,
-    pub forward: bool,
-    pub cigar: Cigar,
-}
-
-pub type Alignments<'a> = &'a [Alignment];
-
-impl Alignment {
-    fn valid(&self) -> bool {
-        true
-    }
 }

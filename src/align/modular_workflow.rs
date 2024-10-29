@@ -4,7 +4,7 @@ use bioreader::sequence::fastq_record::{print_color_qualities, OwnedFastqRecord,
 use colored::Colorize;
 use kmerrs::{consecutive::kmer::{Kmer, KmerIter}, minimizer::context_free::Minimizer};
 
-use crate::{align::{common::{AnchorScore, Print, StdAnchorScore}, data_structures::ToString}, database::common::FlexalignDatabase, flexalign::time, options::Options, GOLDSTD_EVAL};
+use crate::{align::{common::{AnchorScore, Print, StdAnchorScore}, data_structures::{anchor::AnchorSeed, common::ToString}}, database::common::FlexalignDatabase, flexalign::time, options::Options, GOLDSTD_EVAL};
 
 use super::{common::{is_alignment_valid, print_alignment, Align, AnchorExtractor, AnchorPair, Heuristic, KmerExtractor, Or, PAFOutput, PairedAnchorExtractor, PairedAnchorMAPQ, PairedAnchorSorter, RangeExtractor, SAMOutput, SeedExtractor, StdPairedAnchorMAPQ}, process::{alignment::ani_abort_score, evaluate::{self, correct, get_id_from_header}, output::StdPAFOutput}, stats::Stats};
 
@@ -234,6 +234,23 @@ impl<
         });
         stats.time_get_ranges += duration;
 
+        ranges_fwd.iter().for_each(|x| {
+            let qend = x.0 + 31;
+            if qend as usize > rec_fwd.seq().len() {
+                println!("->> {:?} {}/{}", x.0, qend, rec_fwd.seq().len());
+                println!("{}", x.2);
+            }
+            assert!(qend as usize <= rec_fwd.seq().len());
+        });
+
+        ranges_rev.iter().for_each(|x| {
+            let qend = x.0 + 31;
+            if qend as usize > rec_rev.seq().len() {
+                println!("->> {:?} {}/{}", x.0, qend, rec_rev.seq().len());
+                println!("{}", x.2);
+            }
+            assert!(qend as usize <= rec_rev.seq().len());
+        });
 
         // Get Seeds from ranges
         let (duration, seeds_fwd) = time(|| {
@@ -247,12 +264,46 @@ impl<
         stats.time_range_header += duration;
         stats.seeds += seeds_rev.len();
 
+        seeds_fwd.iter().for_each(|s| {
+            let qend = s.qpos + s.length as u32;
+            if qend as usize > rec_fwd.seq().len() {
+                println!("->> {:?} {}/{}", s, qend, rec_fwd.seq().len());
+            }
+            assert!(qend as usize <= rec_fwd.seq().len());
+        });
+        seeds_rev.iter().for_each(|s| {
+            let qend = s.qpos + s.length as u32;
+            if qend as usize > rec_rev.seq().len() {
+                println!("->> {:?} {}/{}", s, qend, rec_rev.seq().len());
+            }
+            assert!(qend as usize <= rec_rev.seq().len());
+        });
+
         // eprintln!("Header {} ... \nID {}", String::from_utf8_lossy(rec_fwd.head()), get_id_from_header(&String::from_utf8_lossy(rec_fwd.head()), self.db));
         let (duration, mut anchors) = time(|| {
             self.anchor_extractor.generate(seeds_fwd, seeds_rev, rec_fwd.seq().len(), rec_rev.seq().len(), stats)
         });
         stats.time_get_anchors += duration;
         stats.anchors += anchors.len();
+
+
+        for AnchorPair(a1, a2) in anchors.iter() {
+            match a1 {
+                Some(a) => {
+                    let first: &AnchorSeed = &a.seeds[0];
+                    assert!(first.qend() <= rec_fwd.seq().len());
+                },
+                None => (),
+            }
+            match a2 {
+                Some(a) => {
+                    // println!("Querylen: {},\nAnchor... {}", rec_rev.seq().len(), a);
+                    let first: &AnchorSeed = &a.seeds[0];
+                    assert!(first.qend() <= rec_rev.seq().len());
+                },
+                None => (),
+            }
+        }
 
         if anchors.is_empty() {
             if GOLDSTD_EVAL {
@@ -312,7 +363,7 @@ impl<
         extension_anchors.iter_mut().enumerate().for_each(|(i, (AnchorPair(a1, a2)))| {
             match a1 {
                 Some(a) => {
-                    if a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
+                    if a.seed_status.is_valid() && a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
                         eprintln!("{}\n{}\n", rec_fwd.to_string(), rec_rev.to_string());
                         panic!("Z 1  {}", a);
                     }
@@ -321,7 +372,7 @@ impl<
 
             match a2 {
                 Some(a) => {
-                    if a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
+                    if a.seed_status.is_valid() && a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
                         eprintln!("{}\n{}\n", rec_fwd.to_string(), rec_rev.to_string());
                         panic!("Z 2  {}", a);
                     }
@@ -361,9 +412,10 @@ impl<
                                 eprintln!("1  {}", a);
                             }
 
-                            let status = a.smart_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
+                            // let status = a.smart_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
                             // let status = a.whole_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
                             
+                            let status = a.align(&mut self.align, query, reference, 10, min_score_1.unwrap());
 
                             // let (qr, rr) = a.whole(query.len(), reference.len());
                             // let (duration, (score, cigar, status)) = time(|| self.align.align(&query[qr], &reference[rr]));
@@ -410,10 +462,13 @@ impl<
                                 eprintln!("2  {}", a);
                             }
 
-                            self.align.set_max_alignment_score(min_score_2.unwrap());
-                            let status = a.smart_align(&mut self.align, query, reference, 10, min_score_2.unwrap());
+                            // self.align.set_max_alignment_score(min_score_2.unwrap());
+                            // let status = a.smart_align(&mut self.align, query, reference, 10, min_score_2.unwrap());
                             // let status = a.whole_align(&mut self.align, query, reference, 10, min_score_2.unwrap());
                             
+                            let status = a.align(&mut self.align, query, reference, 10, min_score_2.unwrap());
+
+
                             // let (qr, rr) = a.whole(query.len(), reference.len());
                             // let (duration, (score, cigar, status)) = time(|| self.align.align(&query[qr], &reference[rr]));
                                                

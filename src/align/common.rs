@@ -2,7 +2,8 @@ use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use flexmap::values::{VData, VRange};
 use kmerrs::consecutive::kmer::Kmer;
 
-use super::{data_structures::{Alignment, Alignments, Anchor, Seed}, process::{anchor_extractor::{SeedGroupPair, SeedGroupPaired}, range_extractor::Range}, sam::{Cigar, CigarRef}, stats::Stats};
+use super::{data_structures::{anchor::Anchor, common::{Alignments, Seed}}, process::{anchor_extractor::{SeedGroupPair, SeedGroupPaired}, range_extractor::Range}, sam::Cigar, stats::Stats};
+
 
 #[derive(Debug)]
 pub enum Status {

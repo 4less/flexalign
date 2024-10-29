@@ -1,7 +1,7 @@
 
 use flexmap::VD;
 
-use crate::{align::{common::SeedExtractor, data_structures::Seed, stats::Stats}, flexalign::time};
+use crate::{align::{common::SeedExtractor, data_structures::common::Seed, stats::Stats}, flexalign::time};
 
 use super::range_extractor::Range;
 
