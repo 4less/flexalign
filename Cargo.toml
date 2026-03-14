@@ -12,10 +12,10 @@ channel = "nightly"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-kmerrs = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/kmerrs/" }
-flexmap = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/flexmap/" }
-bioreader = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/bioreader/" }
-libwfa2 = { path = "/usr/users/QIB_fr017/fritsche/ProjectsPrivate/libwfa2/" }
+kmerrs = { git = "https://github.com/4less/kmerr.git" }
+flexmap = { git = "https://github.com/4less/flexmap.git" }
+bioreader = { git = "https://github.com/4less/bioreader.git" }
+libwfa2 = "0.1.1"
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
 clap_derive = "4.5.3"
 flate2 = "1.0.28"
@@ -47,4 +47,3 @@ opt-level = 3               # Use best optimizations
 overflow-checks = false     # Disable integer overflow checks.
 rustflags = ["-C", "target-feature=+avx,+sse3,+avx2,+fma"]#
 lto = "fat"
-
