@@ -1,0 +1,33 @@
+{% set version = "0.1.0" %}
+
+package:
+  name: myproject
+  version: {{ version }}
+
+source:
+#  url: https://github.com/someuser/myproject/archive/{{ version }}.tar.gz
+  path: /usr/users/QIB_fr017/fritsche/ProjectsPrivate/flexalign
+#  sha256: d8ceef347b07b8de1675950ec917bf4f5432d189c952d8b415e5d5470bc6c008
+
+build:
+  number: 1
+
+requirements:
+  build:
+    - rust
+    - {{ compiler('c') }}        # [not win]
+    - {{ compiler('m2w64_c') }}  # [win]
+
+test:
+  commands:
+    - myproject --help
+
+about:
+  home: https://github.com/someuser/myproject
+  license: GPL-3.0
+  summary: One-line description of your project in here.
+  license_file: LICENSE
+
+extra:
+  recipe-maintainers:
+    - someuser

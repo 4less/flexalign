@@ -1,0 +1,13 @@
+/target
+/data
+/analysis
+/results
+Cargo.lock
+classification.err
+classification.out
+flamegraph.svg
+perf.data
+perf.data.old
+run_debug.sh
+run_default.sh
+run_default_single.sh
