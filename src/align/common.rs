@@ -2,7 +2,7 @@ use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use flexmap::values::{VData, VRange};
 use kmerrs::consecutive::kmer::Kmer;
 
-use super::{data_structures::{anchor::Anchor, common::{Alignments, Seed}}, process::{anchor_extractor::{SeedGroupPair, SeedGroupPaired}, range_extractor::Range}, sam::Cigar, stats::Stats};
+use super::{data_structures::{anchor::{Anchor, SeedGroupPair, SeedGroupPaired}, common::{Alignments, Seed}}, process::{anchor_extender::FixAnchorError, range_extractor::Range}, sam::Cigar, stats::Stats};
 
 
 #[derive(Debug)]
@@ -122,7 +122,7 @@ pub trait KmerExtractor<const K: usize> {
 }
 
 pub trait RangeExtractor<const C: usize, const F: usize> {
-    fn generate(&mut self, kmers: &[(usize, Kmer<C>)], stats: &mut Stats) -> &[Range<F>];
+    fn generate(&mut self, kmers: &[(usize, Kmer<C>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<F>];
     fn retrieve(&self) -> &[Range<F>];
 }
 
@@ -156,6 +156,12 @@ impl AnchorPair {
     pub fn reference(&self) -> u64 {
         if self.0.is_some() { return self.0.as_ref().unwrap().reference } else { return self.1.as_ref().unwrap().reference }
     }
+
+    pub fn validate(&self) -> Result<(), FixAnchorError> {
+        let ok1 = self.0.as_ref().map_or(Ok(()), |a| a.validate());
+        let ok2 = self.1.as_ref().map_or(Ok(()), |a| a.validate());
+        ok1.and(ok2)
+    }
 }
 
 
@@ -167,6 +173,11 @@ pub trait PairedAnchorExtractor {
 pub trait PairedAnchorSorter {
     fn sort(&self, anchors: &mut [AnchorPair], rec_fwd: &RefFastqRecord, rec_fwd_revc: &OwnedFastqRecord,
         rec_rev: &RefFastqRecord, rec_rev_revc: &OwnedFastqRecord, stats: &mut Stats);
+}
+
+pub trait PairedAnchorExtender {
+    fn extend(&self, anchors: &mut [AnchorPair], rec_fwd: &RefFastqRecord, rec_fwd_revc: &OwnedFastqRecord,
+        rec_rev: &RefFastqRecord, rec_rev_revc: &OwnedFastqRecord, stats: &mut Stats) -> usize;
 }
 
 
@@ -204,6 +215,16 @@ impl StdPairedAnchorMAPQ {
             None => 0,
         })
     }
+
+    fn score_paired_ext(a: &AnchorPair) -> i32 {
+        (match &a.0 {
+            Some(a) => a.score,
+            None => 0,
+        }) + (match &a.1 {
+            Some(a) => a.score,
+            None => 0,
+        })
+    }
 }
 impl PairedAnchorMAPQ for StdPairedAnchorMAPQ {
     fn anchor_mapq(anchors: &mut [AnchorPair]) -> u8 {
@@ -214,7 +235,7 @@ impl PairedAnchorMAPQ for StdPairedAnchorMAPQ {
         let best = &anchors[0];
         let second = &anchors[1];
 
-        (Self::score_paired(&best) - Self::score_paired(&second)) as u8
+        (Self::score_paired_ext(&best) - Self::score_paired_ext(&second)) as u8
     }
 }
 

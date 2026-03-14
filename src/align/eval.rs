@@ -1,6 +1,8 @@
-use std::{cmp::{max, min}, fmt::Display};
+use std::{cmp::{max, min}, fmt::Display, sync::{Arc, Mutex}};
 
 use bioreader::parallel::fastq::Merge;
+
+use crate::io::output_buffer::{OutputBuffer, OutputTarget};
 
 #[derive(Clone, Debug)]
 pub struct BinaryEvaluator {
@@ -91,6 +93,9 @@ impl Default for BinaryEvaluator {
 pub struct MapqEvaluation {
     pub mapq_correct: Vec<u64>,
     pub mapq_incorrect: Vec<u64>,
+    pub total_fn: u64,
+    pub output_read1: Option<OutputBuffer>,
+    pub output_read2: Option<OutputBuffer>,
 }
 
 impl Display for MapqEvaluation {
@@ -100,15 +105,17 @@ impl Display for MapqEvaluation {
 
         let max_display = 10;
         let mut str = String::default();
-        str.push_str("MAPQ\tTP\tFP\tFN\tTN\tSensitivity\tPrecision\tF1\tSpecificity\tAccuracy\n");
+        str.push_str("MAPQ\tTP\tFP\tFN\tTN\tTotal\tSensitivity\tPrecision\tF1\tSpecificity\tAccuracy\n");
         for mapq_threshold in 0..min(max(self.mapq_correct.len(), self.mapq_incorrect.len()), max_display) {
-            let binary_eval = self.binary_evaluator(mapq_threshold);
-            str.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
+            let mut binary_eval = self.binary_evaluator(mapq_threshold);
+            binary_eval.fns += self.total_fn;
+            str.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\n",
                 mapq_threshold,
                 binary_eval.tps,
                 binary_eval.fps,
                 binary_eval.fns,
                 binary_eval.tns,
+                binary_eval.total(),
                 binary_eval.sensitivity(),
                 binary_eval.precision(),
                 binary_eval.f1_score(),
@@ -120,22 +127,6 @@ impl Display for MapqEvaluation {
         }
 
         write!(f, "{}", str)
-
-        // write!(f,
-        //     "TP:           {}\n\
-        //     FP:            {}\n\
-        //     FN:            {}\n\
-        //     TN:            {}\n\
-        //     Sensitivity:   {}\n\
-        //     Precision:     {}\n\
-        //     F1-Score:      {}",
-        //     binary_eval.tps, 
-        //     binary_eval.fps, 
-        //     binary_eval.fns, 
-        //     binary_eval.tns,
-        //     binary_eval.sensitivity(),
-        //     binary_eval.precision(),
-        //     binary_eval.f1_score())
     }
 }
 
@@ -165,11 +156,30 @@ impl MapqEvaluation {
             },
         }
     }
+
+    pub fn count_fn(&mut self) {
+        self.total_fn += 1;
+    }
+
+    pub fn set_fp_read_output(&mut self, output_read1: Option<Arc<Mutex<OutputTarget>>>, output_read2: Option<Arc<Mutex<OutputTarget>>>) {
+        if let Some(or1) = output_read1 {
+            self.output_read1 = Some(OutputBuffer::new(or1, 1_000_000));
+        }
+        if let Some(or2) = output_read2 {
+            self.output_read2 = Some(OutputBuffer::new(or2, 1_000_000));
+        }
+    }
 }
 
 impl Default for MapqEvaluation {
     fn default() -> Self {
-        Self { mapq_correct: Vec::new(), mapq_incorrect: Vec::new() }
+        Self { 
+            mapq_correct: Vec::new(),
+            mapq_incorrect: Vec::new(),
+            total_fn: 0u64,
+            output_read1: None,
+            output_read2: None
+        }
     }
 }
 
@@ -188,6 +198,7 @@ impl Merge for MapqEvaluation {
         for i in 0..other.mapq_incorrect.len() {
             self.mapq_incorrect[i] += other.mapq_incorrect[i];
         }
+        self.total_fn += other.total_fn;
     }
 }
 

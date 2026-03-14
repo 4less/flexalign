@@ -1,4 +1,4 @@
-use std::{fs::File, io::{self}, sync::{Arc, Mutex}};
+use std::{fs::File, io::{self}, path::PathBuf, process::exit, str::FromStr, sync::{Arc, Mutex}};
 
 use bioreader::{parallel::fastq::{read_fastq_paired_end_state_par, read_fastq_single_end_state_par}, sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord}, utils::is_gzip};
 use flate2::read::GzDecoder;
@@ -10,17 +10,12 @@ use crate::{
         common::{NoSAMOutput, Or},
         modular_workflow::{Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, 
-            anchor_sorter::PairedAnchorHeuristicSorter, 
-            kmer_extractor::StdKmerExtractor, 
-            output::StdPAFOutput, 
-            range_extractor::StdRangeExtractor, 
-            seed_extractor::StdSeedExtractor
+            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, anchor_sorter::PairedAnchorHeuristicSorter, kmer_extractor::StdKmerExtractor, output::StdPAFOutput, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
         }, 
         stats::Stats, 
         workflow
     }, 
-    database::common::FlexalignDatabase, io::output_buffer::{OutputBuffer, OutputTarget}, options::Options};
+    database::common::FlexalignDatabase, io::output_buffer::{OutputBuffer, OutputTarget}, options::Options, GOLDSTD_EVAL};
 
 
 pub fn process_fastq_wrapper<
@@ -55,6 +50,7 @@ pub fn process_fastq_wrapper<
         match rev_option {
             // Paired-end reads
             Some(rev) => { 
+                log::info!("Paired-end processing");
                 info!("Iterate {} {}", &fwd.to_str().unwrap(), &rev.to_str().unwrap());
                 let file_rev = match File::open(rev) {
                     Err(why) => panic!("couldn't open {}: {}", &rev.to_str().unwrap(), why),
@@ -77,12 +73,34 @@ pub fn process_fastq_wrapper<
                     handler_rev.run(rec_rev, stats);
                 };
                 
+                let mut state = Stats::default();
+                
+                eprintln!("GOLD STANDARD {}", GOLDSTD_EVAL);
+                if GOLDSTD_EVAL {
+                    let mapqeval = state.gold_std_evaluation.as_mut().unwrap();
+
+                    let fp_read1_outpath = PathBuf::from_str(&format!("{}.fp", fwd.to_str().unwrap())).unwrap();
+                    let fp_read1_file = File::create_new(fp_read1_outpath.clone()).unwrap();
+                    let fp_read1_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read1_file)));
+                    
+                    // let fp_read2_outpath = PathBuf::from_str(&format!("{}.fp", rev.to_str().unwrap())).unwrap();
+                    // let fp_read2_file = File::create_new(fp_read2_outpath.clone()).unwrap();
+                    // let fp_read2_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read2_file)));
+                    
+                    // eprintln!("Set false reads outpt path {:?} {:?}", fp_read1_outpath, fp_read2_outpath);
+                    // mapqeval.set_fp_read_output(Some(fp_read1_writer), Some(fp_read2_writer));
+
+                    // exit(9);
+                    mapqeval.set_fp_read_output(Some(fp_read1_writer), None); 
+                }
+
                 if fwd_gzip {
                     stats = read_fastq_paired_end_state_par(
                         GzDecoder::new(file_fwd),
                         GzDecoder::new(file_rev),
                         usize::pow(2, 24),
                         options.args.threads,
+                        state,
                         worker,
                     );
                 } else {
@@ -91,12 +109,14 @@ pub fn process_fastq_wrapper<
                         file_rev,
                         usize::pow(2, 24),
                         options.args.threads,
+                        state,
                         worker,
                     );
                 }
             },
             // Single-end read
             None => {
+                log::info!("Single-end processing");
 
                 let worker = move |rec: &RefFastqRecord, stats: &mut Stats| {
                     handler_fwd.run(rec, stats);
@@ -175,7 +195,8 @@ pub fn process_fastq_wrapper_modular<
             seed_extractor: StdSeedExtractor::<K, C, F>::new(
                 options.args.max_best_flex,
                 options.args.max_range_size,
-                options.args.min_ranges
+                options.args.min_ranges,
+                options.args.ranges,
             ),
             anchor_extractor: StdAnchorExtractor::new(),
             rec_rev: OwnedFastqRecord::new(),
@@ -186,6 +207,7 @@ pub fn process_fastq_wrapper_modular<
         let fwd_gzip = is_gzip(fwd).expect(format!("Cannot check if file is gzipped. Check file: {}", fwd.to_str().unwrap()).as_str());
 
         let stats;
+
 
         // Distinguish between single- and paired-end reads
         match rev_option {
@@ -212,7 +234,8 @@ pub fn process_fastq_wrapper_modular<
                     seed_extractor: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,
-                        options.args.min_ranges
+                        options.args.min_ranges,
+                        options.args.ranges,
                     ),
                     anchor_extractor: StdAnchorExtractor::new(),
                     rec_rev: OwnedFastqRecord::new(),
@@ -232,15 +255,17 @@ pub fn process_fastq_wrapper_modular<
                     seed_extractor_fwd: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,
-                        options.args.min_ranges
+                        options.args.min_ranges,
+                        options.args.ranges,
                     ),
                     seed_extractor_rev: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,
-                        options.args.min_ranges
+                        options.args.min_ranges,
+                        options.args.ranges,
                     ),
                     anchor_extractor: StdPairedAnchorExtractor::new(),
-                    anchor_sorter: PairedAnchorHeuristicSorter::new(db),
+                    anchor_extender: StdPairedAnchorExtender::new(db),
                     align: LIBWFA2Alignment::default(),
                     output: output,
                     rec_fwd_revc: OwnedFastqRecord::new(),
@@ -248,21 +273,44 @@ pub fn process_fastq_wrapper_modular<
                 };  
 
 
-                let worker = move |rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats| {
+                let _worker = move |rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats| {
                     modular_fwd.run(rec_fwd, stats);
                     modular_rev.run(rec_rev, stats);
                 };
 
                 let worker_pe = move |rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats| {
+                    
                     modular_pe.run(rec_fwd, rec_rev, stats);
                 };
+
                 
+                let mut state = Stats::default();
+                
+                eprintln!("GOLD STANDARD {}", GOLDSTD_EVAL);
+                if GOLDSTD_EVAL {
+                    let mapqeval = state.gold_std_evaluation.as_mut().unwrap();
+
+                    let fp_read1_outpath = PathBuf::from_str(&format!("{}.fp", fwd.to_str().unwrap())).unwrap();
+                    let fp_read1_file = File::create(fp_read1_outpath.clone()).unwrap();
+                    let fp_read1_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read1_file)));
+                    
+                    let fp_read2_outpath = PathBuf::from_str(&format!("{}.fp", rev.to_str().unwrap())).unwrap();
+                    let fp_read2_file = File::create(fp_read2_outpath.clone()).unwrap();
+                    let fp_read2_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read2_file)));
+                    
+                    // eprintln!("Set false reads outpt path {:?} {:?}", fp_read1_outpath, fp_read2_outpath);
+                    // mapqeval.set_fp_read_output(None, Some(fp_read2_writer)); 
+                    mapqeval.set_fp_read_output(Some(fp_read1_writer), Some(fp_read2_writer)); 
+                }
+
+
                 if fwd_gzip {
                     stats = read_fastq_paired_end_state_par(
                         GzDecoder::new(file_fwd),
                         GzDecoder::new(file_rev),
                         usize::pow(2, 24),
                         options.args.threads,
+                        state,
                         worker_pe,//worker,
                     );
                 } else {
@@ -271,6 +319,7 @@ pub fn process_fastq_wrapper_modular<
                         file_rev,
                         usize::pow(2, 24),
                         options.args.threads,
+                        state,
                         worker_pe,//worker,
                     );
                 }

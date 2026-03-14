@@ -38,18 +38,18 @@ pub fn run(args: Args) {
     const K: usize = 31;
     const C: usize = 15;
     const F: usize = 16; 
-    const S: usize = 7; // 7 0.34 //8 0.37 //6 0.31 //5  0.29 //4 0.289 //3 0.413  //2  0.413
+    const S: usize = 4; // 7 0.34 //8 0.37 //6 0.31 //5  0.29 //4 0.289 //3 0.413  //2  0.413
     const L: usize = C - S + 1; //1
     const CELLS_PER_BODY: u64 = 16;
     const HEADER_THRESHOLD: usize = 2;
     
+    // Build or load database
     let db: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = match build {
         true => {
             
             let (_duration, result) = 
                 time(|| DB::build(&options));
             let _ = result.save(&db_paths, GLOBAL_VERSION);
-
             result
 
         },
@@ -68,6 +68,7 @@ pub fn run(args: Args) {
             panic!("File passed with --rev does not exist: \n{}", file.to_str().unwrap());
         }
     }
+
     for file_option in &options.rev {
         match file_option {
             Some(file) => if !file.exists() {
@@ -78,11 +79,6 @@ pub fn run(args: Args) {
     }
 
     let (duration, _result) = time(|| process_fastq_wrapper_modular::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db));
-    eprintln!("Modular: Process reads: {:?}", duration);
-
-    // let (duration, _result) = time(|| process_fastq_wrapper::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db));
-    // eprintln!("Naive: Process reads: {:?}", duration);
-
-
+    log::info!("Modular: Process reads: {:?}", duration);
 }
 

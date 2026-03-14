@@ -1,8 +1,11 @@
+#![feature(test)]
 #![feature(slice_internals)]
 #![feature(generic_const_exprs)]
 #![allow(incomplete_features)]
 #![feature(map_try_insert)]
 #![feature(fn_traits, unboxed_closures)]
+
+extern crate test;
 
 #[macro_use]
 extern crate savefile_derive;
@@ -14,6 +17,7 @@ pub mod options;
 pub mod io;
 pub mod misc;
 pub mod utils;
+pub mod distance;
 
 const GLOBAL_VERSION: u32 = 1;
 

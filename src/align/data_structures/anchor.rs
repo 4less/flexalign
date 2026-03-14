@@ -1,9 +1,10 @@
-use std::{cmp::{max, min}, fmt::Display, iter::zip, ops::Range};
+use std::{cmp::{max, min}, fmt::Display, iter::zip, ops::Range, process::exit};
 
 use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use colored::{Color, Colorize};
+use itertools::Itertools;
 
-use crate::align::{common::{Align, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, sam::Cigar};
+use crate::align::{common::{Align, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
 
 use super::common::{hamming, Seed};
 
@@ -26,6 +27,72 @@ impl Default for AnchorStatus {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SeedMatch {
+    pub offset: i64,
+    pub forward: bool
+}
+
+#[derive(Clone, Debug)]
+pub enum SeedMatchEnum {
+    MatchInitDirection(SeedMatch), // Any
+    MatchAgreeDirection(SeedMatch),
+    MatchDisagreeDirection(SeedMatch),
+    NoMatch(),
+}
+
+
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct SeedGroupPaired {
+    pub(crate) reference: u64,
+    pub(crate) start: u32,
+    pub(crate) size: u16,
+    pub(crate) forward: bool,
+    pub(crate) _dummy: bool, // For memory layout
+}
+
+impl SeedGroupPaired {
+    pub fn range(&self) -> Range<usize> {
+        self.start as usize..(self.start as usize + self.size as usize)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Debug)]
+pub struct SeedGroupPair {
+    pub(crate) reference: u64,
+    pub(crate) start_fwd: u32,
+    pub(crate) size_fwd: u16,
+    pub(crate) size_rev: u16,
+    pub(crate) start_rev: u32,
+}
+
+impl Display for SeedGroupPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} + {} = {})",
+            self.reference,
+            self.size_fwd,
+            self.size_rev,
+            self.size_fwd + self.size_rev
+        )
+    }
+}
+
+impl Display for SeedGroupPaired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} ({})",
+            self.reference,
+            if self.forward { "forward" } else { "reverse" },
+            self.size
+        )
+    }
+}
 
 //                       overlap                      containment  
 //        OFFSET_FWD_OTHER     OFFSET_FWD_SELF   CONTAINED_OTHER    CONTAINED_SELF
@@ -97,6 +164,36 @@ impl AnchorSeed {
         self.length = other.length
     }
 
+    pub fn has_overlap(&self, other: &Self) -> bool {
+        !(self.qbegin() > other.qend() || other.qbegin() > self.qend())
+    }
+    
+    pub fn no_overlap(&self, other: &Self) -> bool {
+        self.qbegin() > other.qend() || other.qbegin() > self.qend()
+    }
+
+    pub fn overlap(&self, other: &Self) -> SeedOverlap {
+        if self.qbegin() > other.qend() || other.qbegin() > self.qend() {
+            return SeedOverlap::NoOverlap;
+        }
+        if self.qbegin() >= other.qbegin() {
+            if self.qend() <= other.qend() {
+                return SeedOverlap::ContainedSelf;
+            }
+            if self.qend() > other.qend() {
+                return SeedOverlap::OffsetFwdSelf;
+            }
+        } else {
+            if self.qend() >= other.qend() {
+                return SeedOverlap::ContainedOther;
+            }
+            if self.qend() < other.qend() {
+                return SeedOverlap::OffsetFwdOther;
+            } 
+        }
+        return SeedOverlap::NoOverlap;
+    }
+
     pub fn merge_into(&mut self, other: &Self) -> bool {
         let self_start = self.qpos;
         let self_end = self.qpos + self.length;
@@ -141,6 +238,7 @@ impl AnchorSeed {
 
         if other.qpos < self.qpos {
             eprintln!("Weird!!!");
+            eprintln!("Self: {}\nOther: {}", self, other);
         }
         
         assert!(other.qpos >= self.qpos || other.length > self.length);
@@ -180,8 +278,8 @@ impl AnchorSeed {
         // eprintln!("Reverse: -> {}", self.qpos);
     }
     
-    pub fn offset(&self) -> i32 {
-        (self.qbegin() as i64 - self.rbegin() as i64) as i32
+    pub fn offset(&self) -> i64 {
+        (self.rbegin() as i64 - self.qbegin() as i64)
     }
 
     pub fn offsets(&self,  read_length: usize) -> (i64, i64) {
@@ -239,6 +337,156 @@ impl Anchor {
             seed_status: AnchorStatus(false),
         }
     }
+    
+    pub fn deinitialize_anchor(&self) -> Self {
+        let mut new_anchor = self.clone();
+
+        let mut new_first = new_anchor.seeds[0].clone();
+        new_first.length = 15;
+
+        new_anchor.seeds = vec![new_first];
+        new_anchor.orientation_set = false;
+        new_anchor.flagged_for_indel = false;
+        new_anchor.cigar = None;
+
+        new_anchor
+    }
+
+    pub fn try_merge(&self, other: &Self, max_indel: usize, read_length: usize) -> Option<(Anchor, i64)> {
+        match (self.query_reference_alignment(), other.query_reference_alignment()) {
+            (None, None) => {
+
+                let (offset,fwd, indel) = self.closest_offset(other, read_length);
+
+                if indel < (max_indel as u64) {
+                    let mut newa: Anchor = self.clone();
+                    newa.set_forward(fwd, read_length);
+                    if !newa.first_seed().has_overlap(&other.first_seed()) {
+                        newa.seed_count += 1;
+                        newa.seeds.push(other.first_seed().clone());
+                        newa.seeds.sort_by_key(|s| s.qbegin());
+                        return Some((newa, indel as i64));
+                    }
+                }
+
+                // eprintln!("Both unitialized");
+                // eprintln!("{}", self);
+                // eprintln!("{}", other);
+                // exit(9);
+
+            },
+            (None, Some((other_offset, other_fwd))) => {
+                let mut self_seed = self.first_seed().clone();
+                // let self_offset = self_seed.offset();
+
+
+                // eprintln!("None Some Before One uninitialized {} {} {} ... ({:?})", 
+                //     self_offset.abs_diff(other_offset), other_offset, 
+                //     self_offset, self_seed.offsets(read_length));
+                
+                // eprintln!("Self Offset Options: {:?}", self_seed.offsets(read_length));
+                // eprintln!("Self Offset Before: {}", self_offset);
+
+                if !other_fwd { self_seed.reverse(read_length) };
+
+                let self_offset = self_seed.offset();
+                // eprintln!("Self Offset After:  {}", self_offset);
+                // eprintln!("One uninitialized {} {} {}", 
+                //     self_offset.abs_diff(other_offset), self_offset, other_offset);
+
+                let indel = (self_offset.abs_diff(other_offset) as usize);
+                if indel < max_indel {
+                    let merge_possible = other.seeds.iter().all(|s| !s.has_overlap(&self_seed));
+
+                    if merge_possible {
+                        let mut newa = other.clone();
+                        let mut newseeds = self.seeds.clone();
+                        if !newa.forward { 
+                            newseeds.iter_mut().map(|s| s.reverse(read_length));
+                        }
+                        newa.seed_count += newseeds.len() as u32;
+                        newa.seeds.extend(newseeds);
+                        newa.seeds.sort_by_key(|s| s.qbegin());
+                        return Some((newa, indel as i64));
+                    }
+                } 
+
+            },
+            (Some((self_offset, self_fwd)), None) => {
+                let mut other_seed = other.first_seed().clone();
+                // let other_offset = other_seed.offset();
+                
+                // eprintln!("Some None Before One uninitialized {} {} {} ... ({:?})", 
+                //     self_offset.abs_diff(other_offset), self_offset, 
+                //     other_offset, other_seed.offsets(read_length));
+
+                if !self_fwd { other_seed.reverse(read_length) };
+
+                let other_offset = other_seed.offset();
+                // eprintln!("One uninitialized {} {} {}", self_offset.abs_diff(other_offset), self_offset, other_offset);
+
+                let indel = (self_offset.abs_diff(other_offset) as usize);
+                if indel < max_indel {
+                    let merge_possible = other.seeds.iter().all(|s| !s.has_overlap(&other_seed));
+
+                    if merge_possible {
+                        let mut newa = self.clone();
+                        let mut newseeds = other.seeds.clone();
+                        if !newa.forward { 
+                            newseeds.iter_mut().for_each(|s| s.reverse(read_length));
+                        }
+                        newa.seed_count += newseeds.len() as u32;
+                        newa.seeds.extend(newseeds);
+                        newa.seeds.sort_by_key(|s| s.qbegin());
+                        return Some((newa, indel as i64));
+                    }
+                } 
+            },
+            (Some((self_offset, self_fwd)), Some((other_offset, other_fwd))) => {
+
+                let indel = (self_offset.abs_diff(other_offset) as usize);
+                if self_fwd == other_fwd && indel < max_indel {
+                    let mut self_iter =  self.seeds.iter();
+                    let mut other_iter =  other.seeds.iter();
+
+                    let mut self_item = self_iter.next();
+                    let mut other_item = other_iter.next();
+
+                    let merge_possible = loop {
+                        if self_item.is_none_or(|_| other_item.is_none()) {
+                            break true;
+                        }
+
+                        let self_seed = self_item.unwrap();
+                        let other_seed = other_item.unwrap();
+
+                        if self_seed.has_overlap(other_seed) {
+                            break false;
+                        }
+
+                        if self_seed.qbegin() > other_seed.qbegin() {
+                            other_item = other_iter.next();
+                        } else {
+                            self_item = self_iter.next();
+                        }
+                    };
+                    
+                    if merge_possible {
+                        let mut newa = self.clone();
+                        let mut newseeds = other.seeds.clone();
+                        
+                        newa.seed_count += newseeds.len() as u32;
+                        newa.seeds.extend(newseeds);
+                        newa.seeds.sort_by_key(|s| s.qbegin());
+                        return Some((newa, indel as i64));
+                    }
+                }
+            },
+        }
+
+        None
+    }
+
 
     pub fn whole_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32) -> Status {
         let (mut qr, mut rr) = self.whole(query.len(), reference.len());
@@ -299,7 +547,6 @@ impl Anchor {
         }
     }
     
-
     pub fn smart_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32) -> Status {
         assert!(self.seed_status.0);
         
@@ -329,33 +576,60 @@ impl Anchor {
         alignment_score += score;
 
         // eprintln!("Max score before middle: {}", max_score);
-        let (score, status) = match self.align_middle(query, reference, &mut max_score) {
-            Ok(res) => res,
-            Err(ar) => {
-                match ar {
-                    AlignmentError::QueryRangeError(s) => {
-                        println!("Error: {}", s);
-                        println!("Q: {}", String::from_utf8_lossy(query));
-                        println!("Self: {}", self);
-                    },
-                    AlignmentError::ReferenceRangeError(s) => {
-                        println!("Error: {}", s);
-                        println!("Q: {}", String::from_utf8_lossy(query));
-                        println!("Self: {}", self);
-                    },
-                    AlignmentError::InvalidAlignmentError(s) => {
-                        println!("Error: {}", s);
-                        println!("Q: {}", String::from_utf8_lossy(query));
-                        println!("Self: {}", self);
-                    },
-                    AlignmentError::InvalidRangeError(s) => {
-                        println!("Error: {}", s);
-                        println!("Q: {}", String::from_utf8_lossy(query));
-                        println!("Self: {}", self);
-                    },
-                };
-                panic!("Non recoverable error")
-            },
+        let (score, status) = if !self.flagged_for_indel {
+            match self.align_middle(query, reference, &mut max_score) {
+                Ok(res) => res,
+                Err(ar) => {
+                    match ar {
+                        AlignmentError::QueryRangeError(s) => {
+                            eprintln!("QueryRangeError");
+                            eprintln!("Error: {}", s);
+                            eprintln!("Q: {}", String::from_utf8_lossy(query));
+                            eprintln!("Self: {}", self);
+                        },
+                        AlignmentError::ReferenceRangeError(s) => {
+                            eprintln!("ReferenceRangeError");
+                            eprintln!("Error: {}", s);
+                            eprintln!("Q: {}", String::from_utf8_lossy(query));
+                            eprintln!("Self: {}", self);
+                        },
+                        AlignmentError::QueryRangeIndelError(s) => {
+                            eprintln!("QueryRangeError");
+                            eprintln!("Error: {}", s);
+                            eprintln!("Q: {}", String::from_utf8_lossy(query));
+                            eprintln!("Self: {}", self);
+                        },
+                        AlignmentError::ReferenceRangeIndelError(s) => {
+                            eprintln!("ReferenceRangeError");
+                            eprintln!("Error: {}", s);
+                            eprintln!("Q: {}", String::from_utf8_lossy(query));
+                            eprintln!("Self: {}", self);
+                        },
+                        AlignmentError::InvalidAlignmentError(s) => {
+                            eprintln!("InvalidAlignmentError");
+                            eprintln!("Error: {}", s);
+                            eprintln!("Q: {}", String::from_utf8_lossy(query));
+                            eprintln!("Self: {}", self);
+                        },
+                    };
+                    panic!("Non recoverable error")
+                },
+            }
+        } else {
+            aligner.set_max_alignment_score(max_score + 1);
+            let (qrange, rrange) = self.complete_middle();
+            let q = &query[qrange];
+            let r = &reference[rrange];
+
+            let (score, cigar, status) = aligner.align(q, r);
+            if !matches!(status, Status::OK) { 
+                (std::i32::MIN, status) 
+            } else {
+                let lcigar = self.cigar.as_mut().unwrap();
+                lcigar.0.extend_from_slice(&cigar.0);
+    
+                (score, Status::OK)
+            }
         };
         alignment_score += score;
 
@@ -389,7 +663,6 @@ impl Anchor {
         
         Status::OK
     }
-
 
     pub fn align_left_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize) -> (i32, Status, usize, usize) {
         
@@ -525,7 +798,6 @@ impl Anchor {
         (score, status)
     }
 
-
     pub fn align_middle(&mut self, query: &[u8], reference: &[u8], max_score: &mut i32) -> AlignmentResult {
         let mut current_i = 0;
         let mut next_i = 1;
@@ -538,12 +810,18 @@ impl Anchor {
         while next_i < self.seeds.len() {
             let middle_range = self.between(&self.seeds[current_i], &self.seeds[next_i]);
 
-            if middle_range.0.start > middle_range.0.end {
-                return Err(AlignmentError::InvalidRangeError(format!("Invalid Range {:?}", middle_range.0)));
+            if middle_range.0.start >= middle_range.0.end {
+                if middle_range.1.start > middle_range.1.end {
+                    return Err(AlignmentError::ReferenceRangeIndelError(format!("Query Invalid Range {:?} (Q, R)", middle_range)));
+                }
+
             }
-            if middle_range.1.start > middle_range.1.end {
-                return Err(AlignmentError::InvalidRangeError(format!("Invalid Range {:?}", middle_range.0)));
+            if middle_range.1.start >= middle_range.1.end {
+                if middle_range.0.start > middle_range.0.end {
+                    return Err(AlignmentError::QueryRangeIndelError(format!("Query Invalid Range {:?} (Q, R)", middle_range)));
+                }
             }
+
             if middle_range.0.end >= query.len() {
                 return Err(AlignmentError::QueryRangeError(format!("MRange {:?}.. Q len {} R len {}", middle_range, query.len(), reference.len())));
             }        
@@ -625,6 +903,14 @@ impl Anchor {
             let between_seeds = self.between(&self.seeds[current_i], &self.seeds[next_i]);
             
             let middle_q = &query[between_seeds.0.clone()];
+
+            if between_seeds.1.start >= between_seeds.1.end || between_seeds.0.start >= between_seeds.0.end {
+                // Only needed when allowing for indels between seeds of an anchor
+                current_i += 1;
+                next_i += 1;
+                continue
+            }
+
             let middle_r = &reference[between_seeds.1.clone()];
 
             // First extend from right to left to see if we can merge
@@ -699,7 +985,72 @@ impl Anchor {
             panic!("R: {}, \n{:?}, {}", self, rr, reference.len())
         }
 
+
+        // eprintln!("Query:       {}\t{}", String::from_utf8_lossy(&query[qr.clone()]), query.len());
+        // eprintln!("Reference:   {}\t{}", String::from_utf8_lossy(&reference[rr.clone()]), reference.len()); 
+
         triple_accel::hamming(&query[qr], &reference[rr]) as u64
+    }
+
+    pub fn indel_hamming(&self, query: &[u8], reference: &[u8]) -> u64 {
+        let (qr, rr) = self.whole(query.len(), reference.len());
+
+        if qr.end > query.len() {
+            panic!("Q: {}, \n{:?}, {}", self, qr, query.len())
+        }
+        if rr.end > reference.len() {
+            panic!("R: {}, \n{:?}, {}", self, rr, reference.len())
+        }
+
+
+        // eprintln!("Query:       {}\t{}", String::from_utf8_lossy(&query[qr.clone()]), query.len());
+        // eprintln!("Reference:   {}\t{}", String::from_utf8_lossy(&reference[rr.clone()]), reference.len()); 
+
+        let offsets = [-3, -2, -1, 0, 1, 2, 3];
+
+
+
+        // eprintln!("Q BASE:   {} {}", 0, String::from_utf8_lossy(&query[qr.clone()]));
+        // eprintln!("R BASE:   {} {}", 0, String::from_utf8_lossy(&reference[rr.clone()]));
+        // let qi = (&query[qr.clone()]).iter();
+        // let ri = (&reference[rr.clone()]).iter();
+        // eprintln!("C OFFSET: {} {}", 0, zip(qi, ri).map(|(a,b)| {
+        //     if a == b { "M" } else { "X" }
+        // }).join(""));
+        let mut indel_hammings = offsets.iter().map(|offset| {
+            let mut qr_offset = qr.clone();
+            let mut rr_offset = (max(rr.start as i64 + offset, 0) as usize)..(min(rr.end + (*offset as usize), reference.len()));
+            if qr_offset.len() != rr_offset.len() {
+                let shared_len = min(qr_offset.len(), rr_offset.len());
+                qr_offset.end = qr_offset.start + shared_len;
+                rr_offset.end = rr_offset.start + shared_len;
+            }
+
+            let hamming = triple_accel::hamming(&query[qr_offset.clone()], &reference[rr_offset.clone()]);
+            // eprintln!("-- {} Hamming {}, Similarity {}", offset, hamming, qr_offset.len() - hamming as usize);
+            // eprintln!("Q OFFSET: {} {}", offset, String::from_utf8_lossy(&query[qr_offset.clone()]));
+            // eprintln!("R OFFSET: {} {}", offset, String::from_utf8_lossy(&reference[rr_offset.clone()]));
+            // let qi = (&query[qr_offset.clone()]).iter();
+            // let ri = (&reference[rr_offset.clone()]).iter();
+            // eprintln!("C OFFSET: {} {}", offset, zip(qi, ri).map(|(a,b)| {
+            //     if a == b { "M" } else { "X" }
+            // }).join(""));
+            hamming
+        }).collect_vec();
+
+        let hamming = triple_accel::hamming(&query[qr.clone()], &reference[rr.clone()]) as u64;
+
+        // eprintln!("INDEL HAMMING 0: {} -> INDEL {:?}", hamming, indel_hammings);
+
+
+        indel_hammings.sort();
+        let hamming = indel_hammings
+            .iter()
+            .take(2) // Take the best 2
+            .fold(0f64, |acc, h| acc + ((*h as f64) * 0.75f64)) - 0.5 * (qr.len() as f64);
+
+
+        hamming as u64
     }
 
     pub fn gap_iter(&self) -> impl Iterator<Item = (Range<usize>, Range<usize>)> + '_ {
@@ -719,7 +1070,7 @@ impl Anchor {
         } else {
             let offset1 = seed_self.offset();
             let offset2 = seed_other.offset();
-            (offset1 - offset2) as i64
+            (offset1 - offset2)
         };
         
         // if offset.abs() < 10 {
@@ -776,6 +1127,17 @@ impl Anchor {
 
     pub fn between(&self, s1: &AnchorSeed, s2: &AnchorSeed) -> (Range<usize>, Range<usize>) {
         ((s1.qend()..s2.qbegin()), (s1.rend()..s2.rbegin()))
+    }
+
+    pub fn complete_middle(&self) -> (Range<usize>, Range<usize>) {
+        let first = self.first_seed();
+        if self.seeds.len() == 1 {
+            return (first.qrange(), first.rrange())
+        }
+        
+        let last = self.seeds.last().unwrap();
+
+        ((first.qbegin()..last.qend()), (first.rbegin()..last.rend()))
     }
 
     pub fn all_seeds_valid(&self, query: &[u8], reference: &[u8]) -> bool {
@@ -868,36 +1230,19 @@ impl Anchor {
         return false
     }
     
-    // pub fn resolve_orientation(&mut self, rec: &RefFastqRecord, rec_rc: &OwnedFastqRecord, reference: &[u8]) -> Result<()> {
-    //     if self.validate_seeds(rec.seq(), reference) {
-    //         //TODO: Code here is janky.
-    //         return true 
-    //     };
-    //     if self.validate_seeds(rec_rc.seq(), reference) {
-    //         eprintln!("Validate 2");
-    //         return true 
-    //     };
-    //     self.seeds.first_mut().unwrap().reverse(rec.seq().len());
-    //     if self.validate_seeds(rec.seq(), reference) {
-    //         eprintln!("Validate 3");
-    //         return true 
-    //     };
-    //     if self.validate_seeds(rec_rc.seq(), reference) {
-    //         eprintln!("Validate 4");
-    //         return true 
-    //     };
-        
-    //     Error
-    // }
-
+    pub fn validate(&self) -> Result<(), FixAnchorError> {
+        if self.seed_status.is_valid() && self.seeds.len() > 1 && self.seeds[0].qbegin() > self.seeds[1].qbegin() {
+            // panic!("U 1  {}", a);
+            return Err(FixAnchorError::UnresolvableOrientation(format!("No likey {}", self)))
+        }
+        Ok(())
+    }
 
     pub fn set_config(&mut self, config: &AnchorSeedConfig, read_length: usize) {
         type ASC = AnchorSeedConfig;
         match config {
             ASC::QueryRCSeedRC => {
-                if self.seeds.len() > 1 {
-                    println!("QueryRCSeedRC {}", self);
-                }
+                log::trace!("QueryRCSeedRC {}", self);
                 self.set_forward(false, read_length);
             },
             ASC::QuerySeedRC => {
@@ -919,15 +1264,15 @@ impl Anchor {
         self.forward = forward;
         if !forward {
             if self.seeds.len() > 1 {
-                eprintln!("MARKER REVERSE MULTIPLE SEEDS");
+                log::debug!("MARKER REVERSE MULTIPLE SEEDS");
                 self.seeds.iter_mut().for_each(|s| {
                     s.reverse(read_length);
                 });
-                eprintln!("Sort by key....");
+                log::debug!("Sort by key....");
                 self.seeds.sort_by_key(|s| {
                     s.qbegin()
                 });
-                eprintln!("{}", self);
+                log::debug!("{}", self);
             } else {
                 self.seeds.first_mut().unwrap().reverse(read_length);
             }
@@ -1021,13 +1366,12 @@ impl Anchor {
 
         if !self.orientation_set {
             if aseed.contains(s) {
-                eprintln!("Return1");
                 s.set(&mut aseed);
                 return
             }
 
             self.forward = seed.qpos > s.qpos && seed.rpos > s.rpos;
-            eprintln!("Set direction ->> qpos {} rpos {} len {}\n{}\n--->  Forward? {}", s.qpos, s.rpos, s.length, seed.to_string(), self.forward);
+            // eprintln!("Set direction ->> qpos {} rpos {} len {}\n{}\n--->  Forward? {}", s.qpos, s.rpos, s.length, seed.to_string(), self.forward);
             self.orientation_set = true;
             if !self.forward {
                 s.reverse(read_length as usize);
@@ -1065,7 +1409,6 @@ impl Anchor {
         }
     }
 
-
     pub fn core_matches(&self) -> usize {
         self.seeds.iter().fold(0, |acc, seed| acc + seed.length as usize)
     }
@@ -1077,6 +1420,74 @@ impl Anchor {
             .fold(0, |acc, (seed1, seed2)| {
                 acc + (seed2.qpos as usize - seed1.qpos as usize).abs_diff(seed2.rpos as usize - seed1.rpos as usize)
             })
+    }
+
+    pub fn closest_offset_seed(&self, other: &Seed, read_length: usize) -> (i64, bool, u64) {
+        let (self_fwd, self_rev) = self.seeds.first().as_ref().unwrap().offsets(read_length);
+        let (other_fwd, other_rev) = other.offsets(read_length);
+
+        let diff_fwd = self_fwd.abs_diff(other_fwd);
+        let diff_rev = self_rev.abs_diff(other_rev);
+
+        if diff_fwd < diff_rev {
+            (self_fwd, true, diff_fwd)
+        } else {
+            (self_rev, false, diff_rev)
+        }
+    }
+
+
+    pub fn closest_offset(&self, other: &Anchor, read_length: usize) -> (i64, bool, u64) {
+        let (self_fwd, self_rev) = self.seeds.first().as_ref().unwrap().offsets(read_length);
+        let (other_fwd, other_rev) = other.seeds.first().as_ref().unwrap().offsets(read_length);
+
+        let diff_fwd = self_fwd.abs_diff(other_fwd);
+        let diff_rev = self_rev.abs_diff(other_rev);
+
+        if diff_fwd < diff_rev {
+            (self_fwd, true, diff_fwd)
+        } else {
+            (self_rev, false, diff_rev)
+        }
+    }
+
+    pub fn match_seed(&self, seed: &Seed, read_length: usize) -> Option<SeedMatch> {
+        let (seed_fwd, seed_rev) = seed.offsets(read_length);
+
+        if let Some((offset, fwd)) = self.query_reference_alignment() {
+            if fwd && offset == seed_fwd {
+                return Some(SeedMatch { offset: offset, forward: true })
+            } else if (!fwd && offset == seed_rev) {
+                return Some(SeedMatch { offset: offset, forward: false })
+            }
+        } else {
+            let (self_fwd, self_rev) = self.seeds.first().as_ref().unwrap().offsets(read_length);
+    
+            let diff_fwd = self_fwd.abs_diff(seed_fwd);
+            let diff_rev = self_rev.abs_diff(seed_rev);
+    
+            // eprintln!("Match seed..\nFwd Offset: {} ({})\nRev Offset: {} ({})", self_fwd, diff_fwd, self_rev, diff_rev);
+    
+            if diff_fwd == 0 {
+                return Some(SeedMatch { offset: self_fwd, forward: true })
+            } else if diff_rev == 0 {
+                return Some(SeedMatch { offset: self_rev, forward: false })
+            }
+        }
+
+        None
+    }
+    
+
+    pub fn first_seed<'a>(&'a self) -> &'a AnchorSeed {
+        self.seeds.first().as_ref().unwrap()
+    }
+
+    pub fn query_reference_alignment(&self) -> Option<(i64, bool)> {
+        if !self.orientation_set { return None }
+
+        let first = self.seeds.first().unwrap();
+        Some((first.rpos as i64 - first.qpos as i64, self.forward))
     }
 }
 
@@ -1101,19 +1512,22 @@ impl Display for Anchor {
             seeds_str += &format!(" (qpos {} rpos {} len {})", seed.qpos, seed.rpos, seed.length);
         }
 
-        write!(f, "{} --- Ref: {}, qpos: {}, rpos: {}, seed_count {}, mismatches: {}, core_matches: {} -- offset: {}\n{}\n{}",
+        write!(f, "{}  Score: {} return Ref: {}, qpos: {}, rpos: {}, indel: {}, seed_count {}, mismatches: {}, core_matches: {} -- offset: {}\n{}\n{}\n{}",
             if self.orientation_set { 
                 if self.forward { ">>>>>" } else { "<<<<<" }
             } else { "XXXXX" },
+            self.score,
             self.reference,
             first.qpos,
             first.rpos,
+            self.flagged_for_indel,
             self.seed_count,
             self.mismatches,
             self.seeds.iter().fold(0, |acc, seed| acc + seed.length),
             first.rpos as i64 - first.qpos as i64,
             seeds_vstr,
-            seeds_str)
+            seeds_str,
+            self.cigar.as_ref().map_or("No Cigar".to_string(), |c| c.to_string()))
     }
 }
 

@@ -52,10 +52,6 @@ impl Seed {
         }
     }
 
-    pub fn offset(&self) -> u64 {
-        self.rpos as u64 - self.qpos as u64
-    }
-
     pub fn offsets(&self,  read_length: usize) -> (i64, i64) {
         // ((self.rpos as u64 - self.qpos as u64) | (1 << 62), self.rpos as u64 + self.qpos as u64)
 
@@ -82,6 +78,19 @@ impl Seed {
         } else {
             (self_rev, false, diff_rev)
         }
+    }
+
+    pub fn offset_with_other(&self, other: &Self, read_length: usize) -> ((i64, bool, u64), (i64, bool, u64)) {
+        let (self_fwd, self_rev) = self.offsets(read_length);
+        let (other_fwd, other_rev) = other.offsets(read_length);
+
+        let diff_fwd = self_fwd.abs_diff(other_fwd);
+        let diff_rev = self_rev.abs_diff(other_rev);
+
+        (
+            (self_fwd, true, diff_fwd),
+            (self_rev, true, diff_rev),
+        )
     }
 
     pub fn reverse(&self, read_length: usize) -> Seed {
@@ -128,6 +137,14 @@ impl Seed {
         output += &xes;
 
         output
+    }
+
+    pub fn query_range(&self) -> Range<usize> {
+        (self.qpos as usize)..(self.qpos as usize + self.length as usize)
+    }
+
+    pub fn reference_range(&self) -> Range<usize> {
+        (self.rpos as usize)..(self.rpos as usize + self.length as usize)
     }
 }
 

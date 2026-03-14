@@ -470,6 +470,7 @@ impl<
             ranges: usize, 
             stats: &mut Stats) -> (usize, usize) {
 
+        eprintln!("Retrieve seeds");
         let mut matches = 0;
         let mut discarded_max_flex_count = 0;
         for (qpos, flex, range, _range_size) in &self.ranges {
@@ -486,6 +487,7 @@ impl<
                     let take = count <= max_best_flex;
                     // eprintln!("{} Range count = {}/{} < {}", if take { "X".green() } else { "O".red() }, count, range.positions.len(), self.options.args.max_best_flex);
                     if !take {
+                        log::info!("byby {} {}", count, max_best_flex);
                         discarded_max_flex_count += 1;
                         continue;
                     }
@@ -517,6 +519,7 @@ impl<
                 },
             };
             matches += 1;
+            log::info!("{} {}", matches, ranges);
             if matches >= ranges { break }
         }
         (matches, discarded_max_flex_count)
@@ -525,6 +528,7 @@ impl<
     pub fn get_seeds(
         &mut self, stats: &mut Stats
     ) -> () {
+        eprintln!("Get seeds");
         let (duration, _) = time(|| {
             // eprintln!("----------------- Get Ranges....");
             let (ranges, discarded_max_flex_count) = self.retrieve_seeds(
@@ -534,16 +538,16 @@ impl<
             );
             // eprintln!("Ranges: {}/{}, Discarded: {} ({})", ranges, self.ranges.len(), discarded_max_flex_count, self.options.args.max_best_flex);
     
-            if ranges < self.options.args.min_ranges && discarded_max_flex_count > 0  {
-                // eprintln!("----------------- Recover Ranges....");
-                let old_ranges = ranges;
-                let (ranges, discarded_max_flex_count) = self.retrieve_seeds(
-                    128,
-                    self.options.args.ranges as usize,
-                    stats
-                );
-                // eprintln!("{} -> {} (Still discarded: {})", old_ranges, ranges, discarded_max_flex_count);
-            }
+            // if ranges < self.options.args.min_ranges && discarded_max_flex_count > 0  {
+            //     // eprintln!("----------------- Recover Ranges....");
+            //     let old_ranges = ranges;
+            //     let (ranges, discarded_max_flex_count) = self.retrieve_seeds(
+            //         128,
+            //         self.options.args.ranges as usize,
+            //         stats
+            //     );
+            //     // eprintln!("{} -> {} (Still discarded: {})", old_ranges, ranges, discarded_max_flex_count);
+            // }
     
         });
         

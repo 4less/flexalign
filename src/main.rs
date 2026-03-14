@@ -1,4 +1,4 @@
-
+#![feature(test)]
 #![feature(map_try_insert)]
 #![feature(const_option)]
 #![feature(const_trait_impl)]
@@ -6,6 +6,8 @@
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
+use std::process::exit;
+use std::str::FromStr;
 
 use clap::Parser;
 #[allow(unused_parens)]
@@ -17,6 +19,7 @@ use flexalign::flexalign::{run, time};
 use flexalign::misc::test2;
 use flexalign::options::Args;
 use flexmap::keys::{FMKeysHash, KHashEntry};
+use log::{Level, LevelFilter};
 use savefile::{load, save};
 use savefile_derive::Savefile;
 
@@ -54,10 +57,27 @@ fn main() {
     // otherwise the resulting sam files will be broken.
     SHOULD_COLORIZE.set_override(true);
 
+    let args: Args = Args::parse();
+    let level = log::LevelFilter::from_str(&args.log_level.to_string());
+
+    let level = match args.log_level {
+        val if val == 0usize => LevelFilter::Off,
+        val if val == 1usize => LevelFilter::Error,
+        val if val == 2usize => LevelFilter::Warn,
+        val if val == 3usize => LevelFilter::Info,
+        val if val == 4usize => LevelFilter::Debug,
+        val if val == 5usize => LevelFilter::Trace,
+        _ => panic!("Invalid log level specified {}", &args.log_level)
+    };
+
+    simple_logger::SimpleLogger::new()
+        .with_level(level)
+        .init()
+        .unwrap();
+
     eprintln!("{}", logo());
 
-    let args: Args = Args::parse();
     let (duration, _) = time(|| run(args));
 
-    eprintln!("Flexalign took {:?}", duration);
+    log::info!("Flexalign took {:?}", duration);
 }

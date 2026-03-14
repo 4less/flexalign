@@ -1,7 +1,6 @@
 use std::{path::PathBuf, str::FromStr};
 
 use clap::Parser;
-use clap_derive::Args;
 
 use crate::utils::infer_output_prefix;
 
@@ -37,7 +36,7 @@ pub struct Args {
 
     /// How many minimizers should be looked at
     #[arg(short = 'a', long = "ranges", default_value_t = 15)]
-    pub ranges: u32,
+    pub ranges: usize,
 
     /// For a single minimizer, how many occurances may there be at max.
     #[arg(short = 'b', long = "max-range-size", default_value_t = 256)]
@@ -65,9 +64,17 @@ pub struct Args {
     #[arg(long = "force-build", action)]
     pub force_build: bool,
 
-    /// force_build
+    /// debug
     #[arg(long = "debug", action)]
     pub debug: bool,
+
+    /// align the top y anchors. This happens after anchor extension 
+    #[arg(long = "log-level", default_value_t = 3)]
+    pub log_level: usize,
+
+    /// Output reads that align to the wrong reference sequence. Does not check position of alignment. Requires env variable to be set. 
+    #[arg(long = "output-prefix-fp-reads")] // String::default()
+    pub output_prefix_fp_reads: Option<String>,
 }
 
 #[derive(Debug)]

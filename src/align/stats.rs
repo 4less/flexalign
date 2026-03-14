@@ -18,6 +18,7 @@ pub struct Stats {
     pub alignments_successful: usize,
     pub alignments_partial: usize,
     pub alignments_dropped: usize,
+    pub retrieved_ranges: usize,
 
     pub time_get_kmers: Duration,
     pub time_get_minimizer: Duration,
@@ -103,6 +104,7 @@ impl Merge for Stats {
         self.time_alignment += other.time_alignment;
 
         self.ranges += other.ranges;
+        self.retrieved_ranges += other.retrieved_ranges;
         self.seeds += other.seeds;
         self.anchors += other.anchors;
         self.alignments += other.alignments;
@@ -142,6 +144,7 @@ impl Display for Stats {
             Total Alignments dropped....................{:?}\n\
             Total Minimizers per read...................{:.2}x\n\
             Total Ranges per read.......................{:.2}x\n\
+            Total Retrieved Ranges per read.............{:.2}x\n\
             Total Seeds per read........................{:.2}x\n\
             Total Anchors per read......................{:.2}x\n\
             Total Alignments per read...................{:.2}x\n\
@@ -170,6 +173,7 @@ impl Display for Stats {
             self.alignments_dropped,
             self.minimizer as f64 / self.reads_processed as f64,
             self.ranges as f64 / self.reads_processed as f64,
+            self.retrieved_ranges as f64 / self.reads_processed as f64,
             self.seeds as f64 / self.reads_processed as f64,
             self.anchors as f64 / self.reads_processed as f64,
             self.alignments as f64 / self.reads_processed as f64,
@@ -197,6 +201,7 @@ impl Default for Stats {
             alignments_successful: 0,
             alignments_partial: 0,
             alignments_dropped: 0,
+            retrieved_ranges: 0,
 
             time_reverse_complement: Duration::default(),
             time_extend_anchors: Duration::default(),
