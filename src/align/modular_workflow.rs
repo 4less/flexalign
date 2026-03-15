@@ -678,7 +678,7 @@ impl<
 
         // Assumes sorted anchors !!
         let anchors_len: usize = extension_anchors.len();
-        let alignment_anchors =
+        let mut alignment_anchors =
             &mut extension_anchors[0..min(self.options.args.align_top_y, anchors_len)];
 
         let (duration, _) = time(|| {
@@ -845,18 +845,18 @@ impl<
                     };
                 });
 
-            // glidesort::sort_by_key(&mut extension_anchors,|AnchorPair(a1, a2)| {
-            //     let s1 = match a1 {
-            //         Some(a) => a.score,
-            //         None => 0,
-            //     };
-            //     let s2 = match a2 {
-            //         Some(a) => a.score,
-            //         None => 0,
-            //     };
+            glidesort::sort_by_key(&mut alignment_anchors,|AnchorPair(a1, a2)| {
+                let s1 = match a1 {
+                    Some(a) => a.score,
+                    None => 0,
+                };
+                let s2 = match a2 {
+                    Some(a) => a.score,
+                    None => 0,
+                };
 
-            //     - ((s1 + s2) as i64)
-            // });
+                - ((s1 + s2) as i64)
+            });
         });
         stats.time_alignment += duration;
 
@@ -1235,63 +1235,5 @@ impl<
             }
         }
 
-        // stats.time_reverse_complement += duration;
-        // stats.time_anchor_sorting += duration;
-        // let (duration, _) = time(|| {
-        //     rec_rev.reverse_complement(&mut self.rec_rev_revc);
-        // });
-        // stats.time_reverse_complement += duration;
-        // stats.time_anchor_sorting += duration;
-
-        // let best = anchors.first().unwrap();
-        // let ref_string = &self.db.get_rname(best.reference as usize).unwrap();
-        // let reference = &self.db.get_reference(best.reference as usize).unwrap();
-
-        // let best_corelen = best.core_matches() - best.mismatches as usize - best.indels();
-        // let second_best_corelen = if anchors.len() > 1 {
-        //     let second_best = anchors.get(1).unwrap();
-        //     second_best.core_matches() - second_best.mismatches as usize - second_best.indels()
-        // } else { 0 };
-
-        // let pseudo_mapq = best_corelen - second_best_corelen;
-
-        // Compile time switch
-        // if  {
-        // GOLDSTD_EVAL
-        //     // @NC_009436.1_4088855_4089351_1:2:0_1:5:2_2/1
-
-        //     let header_str = String::from_utf8_lossy(rec_fwd.head());
-        //     let first_part_a = header_str.split('-').next().unwrap_or("");
-        //     let first_part_b = header_str.splitn(3, '_').take(2).collect::<Vec<&str>>().join("_");
-        //     let mut true_id = *self.db.get_rid(first_part_a).unwrap_or(&0);
-
-        //     if true_id == 0 {
-        //         true_id = *self.db.get_rid(&first_part_b).unwrap_or(&0);
-        //     }
-
-        //     if true_id == 0 {
-        //         panic!("True id is {}", true_id);
-        //     }
-
-        //     let correct = &ref_string.as_bytes()[..min(ref_string.len(), rec_fwd.head().len())] == &rec_fwd.head()[..min(ref_string.len(), rec_fwd.head().len())];
-        //     // eprintln!("{}\t{}\t{}\t{}", ref_string, header_str, correct, pseudo_mapq);
-
-        //     stats.gold_std_evaluation.as_mut().unwrap().add(correct, pseudo_mapq as u64);
-
-        // }
-
-        // self.output_paf.as_mut().unwrap().write(
-        //     &String::from_utf8_lossy(rec_fwd.head()),
-        //     rec_fwd.seq().len(),
-        //     best.seeds.first().unwrap().qbegin() as i32,
-        //     best.seeds.last().unwrap().qend() as i32,
-        //     best.forward,
-        //     ref_string,
-        //     reference.len(),
-        //     best.seeds.first().unwrap().rbegin() as i32,
-        //     best.seeds.last().unwrap().rend() as i32,
-        //     best.seed_count,
-        //     0,
-        //     pseudo_mapq as u8);
     }
 }

@@ -6,16 +6,15 @@ use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 use log::info;
 
 use crate::{
-    align::{
+    GOLDSTD_EVAL, align::{
         common::{NoSAMOutput, Or},
         modular_workflow::{Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::StdPAFOutput, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
+            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::{StdPAFOutput, StdSAMOutput}, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
         }, 
         stats::Stats, 
         workflow
-    }, 
-    database::common::FlexalignDatabase, io::output_buffer::{OutputBuffer, OutputTarget}, options::Options, GOLDSTD_EVAL};
+    }, database::common::FlexalignDatabase, io::output_buffer::{OutputBuffer, OutputTarget}, options::Options};
 
 
 pub fn process_fastq_wrapper<
@@ -184,7 +183,6 @@ pub fn process_fastq_wrapper_modular<
             a: Some(StdPAFOutput::new(out_buffer)),
             b: None,
         };
-
 
 
         let mut modular_fwd = Modular {
