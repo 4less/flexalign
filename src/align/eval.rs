@@ -101,8 +101,6 @@ pub struct MapqEvaluation {
 impl Display for MapqEvaluation {
 
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let binary_eval = self.binary_evaluator(0);
-
         let max_display = 10;
         let mut str = String::default();
         str.push_str("MAPQ\tTP\tFP\tFN\tTN\tTotal\tSensitivity\tPrecision\tF1\tSpecificity\tAccuracy\n");
@@ -201,4 +199,3 @@ impl Merge for MapqEvaluation {
         self.total_fn += other.total_fn;
     }
 }
-

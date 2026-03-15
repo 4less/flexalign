@@ -81,7 +81,7 @@ pub fn hash<
 
     const GLOBAL_VERSION: u32 = 1;
 
-    let mut file: File = match File::create(&db_paths.index_path) {
+    let file: File = match File::create(&db_paths.index_path) {
         Err(why) => panic!("couldn't open {}: {}", db_paths.index_path.display(), why),
         Ok(file) => file,
     };
