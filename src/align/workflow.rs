@@ -440,7 +440,7 @@ impl<
                         }
 
                         // eprintln!("Add seed: {} ... {} == {} && {} == 0", next.to_string(), offset.unwrap(), offset_first, indel_first);
-                        let read_dummy = String::from_utf8(vec![b'X'; read_length as usize]).unwrap();
+                        let _read_dummy = String::from_utf8(vec![b'X'; read_length as usize]).unwrap();
                         // eprintln!("{}", next.to_visual_string(read_dummy.as_bytes()));
                         a.add_seed(&next, read_length as u32);
 

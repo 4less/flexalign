@@ -29,11 +29,11 @@ impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
         &mut self,
         ranges: &[Range<F>],
         max_best_flex: usize, 
-        max_ranges: usize, 
+        _max_ranges: usize, 
         stats: &mut Stats) -> (usize, usize) {
 
         let mut retrieved_matches = 0;
-        let mut discarded_matches = 0;
+        let _discarded_matches = 0;
 
         let mut discarded_max_flex_count = 0;
 
@@ -107,8 +107,8 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
         
         if retrieved_ranges < self.min_ranges && discarded_max_flex_count > 0  {
             // eprintln!("----------------- Recover Ranges....");
-            let old_ranges = ranges;
-            let (ranges, discarded_max_flex_count) = self.retrieve_seeds(
+            let _old_ranges = ranges;
+            let (_ranges, _discarded_max_flex_count) = self.retrieve_seeds(
                 ranges,
                 128,
                 self.max_range_size,
