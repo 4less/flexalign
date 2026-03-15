@@ -26,11 +26,11 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
-    fn retrieve(&self) -> &[Range<F>] {
+    fn retrieve(&self) -> &[Range<'_, F>] {
         &self.ranges
     }
     
-    fn generate(&mut self, kmers: &[(usize, Kmer<K>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<F>] {
+    fn generate(&mut self, kmers: &[(usize, Kmer<K>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>] {
         self.ranges.clear();
 
         for (pos, kmer) in kmers {

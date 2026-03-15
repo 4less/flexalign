@@ -279,7 +279,7 @@ impl AnchorSeed {
     }
     
     pub fn offset(&self) -> i64 {
-        (self.rbegin() as i64 - self.qbegin() as i64)
+        self.rbegin() as i64 - self.qbegin() as i64 
     }
 
     pub fn offsets(&self,  read_length: usize) -> (i64, i64) {
@@ -394,7 +394,7 @@ impl Anchor {
                 // eprintln!("One uninitialized {} {} {}", 
                 //     self_offset.abs_diff(other_offset), self_offset, other_offset);
 
-                let indel = (self_offset.abs_diff(other_offset) as usize);
+                let indel = self_offset.abs_diff(other_offset) as usize ;
                 if indel < max_indel {
                     let merge_possible = other.seeds.iter().all(|s| !s.has_overlap(&self_seed));
 
@@ -425,7 +425,7 @@ impl Anchor {
                 let other_offset = other_seed.offset();
                 // eprintln!("One uninitialized {} {} {}", self_offset.abs_diff(other_offset), self_offset, other_offset);
 
-                let indel = (self_offset.abs_diff(other_offset) as usize);
+                let indel = self_offset.abs_diff(other_offset) as usize ;
                 if indel < max_indel {
                     let merge_possible = other.seeds.iter().all(|s| !s.has_overlap(&other_seed));
 
@@ -444,7 +444,7 @@ impl Anchor {
             },
             (Some((self_offset, self_fwd)), Some((other_offset, other_fwd))) => {
 
-                let indel = (self_offset.abs_diff(other_offset) as usize);
+                let indel = self_offset.abs_diff(other_offset) as usize ;
                 if self_fwd == other_fwd && indel < max_indel {
                     let mut self_iter =  self.seeds.iter();
                     let mut other_iter =  other.seeds.iter();
@@ -473,7 +473,7 @@ impl Anchor {
                     
                     if merge_possible {
                         let mut newa = self.clone();
-                        let mut newseeds = other.seeds.clone();
+                        let newseeds = other.seeds.clone();
                         
                         newa.seed_count += newseeds.len() as u32;
                         newa.seeds.extend(newseeds);
@@ -1071,7 +1071,7 @@ impl Anchor {
         } else {
             let offset1 = seed_self.offset();
             let offset2 = seed_other.offset();
-            (offset1 - offset2)
+            offset1 - offset2 
         };
         
         // if offset.abs() < 10 {
@@ -1098,8 +1098,8 @@ impl Anchor {
 
         // eprintln!("Q {} - {} .. {} + {} (== min({} ({} - {}),{} ({} - {})))", s.qbegin(), left_overhang_length, s.qend(), right_overhang_length, q_overhang_length, read_length, s.qend(), r_overhang_length, ref_length, s.rend());
         // eprintln!("R {} - {} .. {} + {}", s.rbegin(), left_overhang_length, s.rend(), right_overhang_length);
-        let q = ((s.qbegin() - left_overhang_length)..s.qend() + right_overhang_length);
-        let r = ((s.rbegin() - left_overhang_length)..s.rend() + right_overhang_length);
+        let q = (s.qbegin() - left_overhang_length)..s.qend() + right_overhang_length ;
+        let r = (s.rbegin() - left_overhang_length)..s.rend() + right_overhang_length ;
 
         (q,r)
     }
@@ -1298,7 +1298,7 @@ impl Anchor {
 
         eprint!("Alignment Visualization:\n{}{}", qspace.ts().color(Color::Red), qseed.ts().color(Color::Green));
 
-        self.seeds.iter().skip(1).enumerate().for_each(|(i, s)| {
+        self.seeds.iter().skip(1).enumerate().for_each(|(_i, s)| {
             qspace = &query[old.qend()..s.qbegin()];
             qseed = &query[s.qrange()];
             eprint!("{}{}", qspace.ts().color(Color::Red), qseed.ts().color(Color::Green));
@@ -1320,7 +1320,7 @@ impl Anchor {
         let mut rseed = &reference[old.rrange()];
         eprint!("{}{}", rspace.ts().color(Color::Red), rseed.ts().color(Color::Green));
 
-        self.seeds.iter().skip(1).enumerate().for_each(|(i, s)| {
+        self.seeds.iter().skip(1).enumerate().for_each(|(_i, s)| {
             rspace = &reference[old.rend()..s.rbegin()];
             rseed = &reference[s.rrange()];
             eprint!("{}{}", rspace.ts().color(Color::Red), rseed.ts().color(Color::Green));
@@ -1328,7 +1328,7 @@ impl Anchor {
             old = s;
         });
         
-        rspace = &reference[old.rend()..min((old.rend() + qspace.len()), reference.len())];
+        rspace = &reference[old.rend()..min(old.rend() + qspace.len() , reference.len())];
         eprintln!("{}", rspace.ts().color(Color::Red));
 
         true
@@ -1458,7 +1458,7 @@ impl Anchor {
         if let Some((offset, fwd)) = self.query_reference_alignment() {
             if fwd && offset == seed_fwd {
                 return Some(SeedMatch { offset: offset, forward: true })
-            } else if (!fwd && offset == seed_rev) {
+            } else if !fwd && offset == seed_rev  {
                 return Some(SeedMatch { offset: offset, forward: false })
             }
         } else {

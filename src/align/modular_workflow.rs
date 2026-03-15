@@ -558,7 +558,7 @@ impl<
         }
 
         // eprintln!("Read: {}", String::from_utf8_lossy(rec_fwd.head()));
-        let best_before = anchors.first().as_mut().unwrap().clone();
+        let _best_before = anchors.first().as_mut().unwrap().clone();
 
         // ######################################################################################################
         // Now here starts the reference-based portion of the algorithm. Before, no sequence comparison
@@ -571,8 +571,8 @@ impl<
         });
         stats.time_reverse_complement += duration;
 
-        let anchors_len = anchors.len();
-        let max_hamming = 10;
+        let _anchors_len = anchors.len();
+        let _max_hamming = 10;
 
         // assert!(extension_anchors.iter().all(|pair| pair.validate().is_ok()));
 
@@ -596,7 +596,7 @@ impl<
         });
 
         // Assumes sorted anchors !!
-        let mut extension_anchors = &mut anchors[0..extended_count];
+        let extension_anchors = &mut anchors[0..extended_count];
 
         stats.time_extend_anchors += duration;
 
@@ -672,7 +672,7 @@ impl<
         //     });
 
         let pseudo_mapq = StdPairedAnchorMAPQ::anchor_mapq(extension_anchors);
-        let old_score = &extension_anchors[0].0.as_ref().map_or(0, |a| a.score)
+        let _old_score = &extension_anchors[0].0.as_ref().map_or(0, |a| a.score)
             + &extension_anchors[0].1.as_ref().map_or(0, |a| a.score);
 
 
@@ -688,7 +688,7 @@ impl<
             alignment_anchors
                 .iter_mut()
                 .enumerate()
-                .for_each(|(_i, (AnchorPair(a1, a2)))| {
+                .for_each(|(_i, AnchorPair(a1, a2) )| {
                     let reference = match a1 {
                         Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),
                         None => &self
@@ -743,7 +743,7 @@ impl<
                                 // stats.alignments += 1;
                                 // a.score = score / -4;
 
-                                let _ani = (1.0 - a.score as f64 / a.cigar().0.len() as f64);
+                                let _ani = 1.0 - a.score as f64 / a.cigar().0.len() as f64 ;
                                 // let ani: f64 = (1.0 - a.score as f64/cigar.0.len() as f64);
                                 // let ani: f64 = (1.0 - a.score as f64/a.cigar().0.len() as f64);
                                 // if score < -50 && score != std::i32::MIN {
@@ -827,7 +827,7 @@ impl<
                                 // stats.alignments += 1;
                                 // a.score = score / -4;
 
-                                let _ani = (1.0 - a.score as f64 / a.cigar().0.len() as f64);
+                                let _ani = 1.0 - a.score as f64 / a.cigar().0.len() as f64 ;
                                 // let ani = (1.0 - a.score as f64/cigar.0.len() as f64);
                                 // if score < -50 && score != std::i32::MIN {
                                 //     eprintln!("{}/2: {} ANI: {}", i, score, ani);
@@ -860,7 +860,7 @@ impl<
         });
         stats.time_alignment += duration;
 
-        let new_score = &extension_anchors[0].0.as_ref().map_or(0, |a| a.score)
+        let _new_score = &extension_anchors[0].0.as_ref().map_or(0, |a| a.score)
             + &extension_anchors[0].1.as_ref().map_or(0, |a| a.score);
 
         // eprintln!("SCORE  {} -> {}", old_score, new_score);
@@ -880,7 +880,7 @@ impl<
             &best_extended_anchor_pair.1.as_ref().unwrap().reference
         };
 
-        let reference = &self.db.get_reference(*reference_id as usize).unwrap();
+        let _reference = &self.db.get_reference(*reference_id as usize).unwrap();
 
         // if pseudo_mapq == 0 && extension_anchors.len() > 1 {
         //     let one = &extension_anchors[0];

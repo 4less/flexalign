@@ -46,7 +46,7 @@ pub trait FlexalignDatabase {
     fn get_rid(&self, reference: &str) -> Option<&usize>;
     fn get_rname(&self, id: usize) -> Option<&str>;
     fn get_reference(&self, id: usize) -> Option<&[u8]>;
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange>;
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>>;
     fn build(options: &Options) -> Self;
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error>;
     fn load(paths: &DBPaths, version: u32) -> Self;

@@ -121,8 +121,8 @@ pub trait KmerExtractor<const K: usize> {
 }
 
 pub trait RangeExtractor<const C: usize, const F: usize> {
-    fn generate(&mut self, kmers: &[(usize, Kmer<C>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<F>];
-    fn retrieve(&self) -> &[Range<F>];
+    fn generate(&mut self, kmers: &[(usize, Kmer<C>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>];
+    fn retrieve(&self) -> &[Range<'_, F>];
 }
 
 pub trait SeedExtractor<const F: usize> {
@@ -181,7 +181,7 @@ pub trait PairedAnchorExtender {
 
 
 pub trait AnchorAligner {
-    fn align(&mut self, anchor: &Anchor) -> Alignments;
+    fn align(&mut self, anchor: &Anchor) -> Alignments<'_>;
 }
 
 pub trait PairedAnchorMAPQ {

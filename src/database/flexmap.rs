@@ -47,7 +47,7 @@ impl<
         }
     }
 
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::values::VRange> {
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::values::VRange<'_>> {
         self.flexmap.get_vrange(canonical_kmer)
     }
 
@@ -192,7 +192,7 @@ impl<
         }
     }
 
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::values::VRange> {
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::values::VRange<'_>> {
         self.flexmap.get_vrange(canonical_kmer)
     }
 
