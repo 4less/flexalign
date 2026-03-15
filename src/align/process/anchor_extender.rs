@@ -131,7 +131,7 @@ impl<'a, D: FlexalignDatabase> StdPairedAnchorExtender<'a, D> {
 impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<'a, D> {
     fn extend(
         &self,
-        mut anchors: &mut [AnchorPair],
+        anchors: &mut [AnchorPair],
         rec_fwd: &RefFastqRecord,
         rec_fwd_revc: &OwnedFastqRecord,
         rec_rev: &RefFastqRecord,
@@ -140,7 +140,7 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
     ) -> usize {
         let _ = stats;
 
-        let mut previous_score = 0;
+        let mut _previous_score = 0;
         let mut extended_anchors = 0;
 
         for AnchorPair(a_fwd, a_rev) in anchors.iter_mut() {
@@ -161,7 +161,7 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
             // {
             //     break;
             // }
-            previous_score = current_score;
+            _previous_score = current_score;
 
             let reference: &&[u8] = match a_fwd {
                 Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),

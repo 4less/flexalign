@@ -70,7 +70,7 @@ pub fn print_alignment(query: &[u8], reference: &[u8], cigar: &[u8]) {
 pub fn is_alignment_valid(query: &[u8], reference: &[u8], cigar: &[u8]) -> bool {
     let mut qi = 0;
     let mut ri = 0;
-    let mut soft_counter = 0;
+    let mut _soft_counter = 0;
 
     for i in cigar {
         match i {
@@ -90,7 +90,7 @@ pub fn is_alignment_valid(query: &[u8], reference: &[u8], cigar: &[u8]) -> bool 
                 ri += 1;
             }
             c if *c == b'D' || *c == b'S' => {
-                soft_counter += (*c == b'S') as u32;
+                _soft_counter += (*c == b'S') as u32;
                 assert!(qi < query.len());
                 qi += 1;
             }

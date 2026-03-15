@@ -91,7 +91,7 @@ impl<
             return;
         }
 
-        let (duration, _) = time(|| {
+        let (_duration, _) = time(|| {
             anchors.sort_unstable_by_key(|a| {
                 -((a.core_matches() - a.mismatches as usize - a.indels()) as i64)
             });
@@ -688,7 +688,7 @@ impl<
             alignment_anchors
                 .iter_mut()
                 .enumerate()
-                .for_each(|(i, (AnchorPair(a1, a2)))| {
+                .for_each(|(_i, (AnchorPair(a1, a2)))| {
                     let reference = match a1 {
                         Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),
                         None => &self
@@ -743,7 +743,7 @@ impl<
                                 // stats.alignments += 1;
                                 // a.score = score / -4;
 
-                                let ani = (1.0 - a.score as f64 / a.cigar().0.len() as f64);
+                                let _ani = (1.0 - a.score as f64 / a.cigar().0.len() as f64);
                                 // let ani: f64 = (1.0 - a.score as f64/cigar.0.len() as f64);
                                 // let ani: f64 = (1.0 - a.score as f64/a.cigar().0.len() as f64);
                                 // if score < -50 && score != std::i32::MIN {
@@ -827,7 +827,7 @@ impl<
                                 // stats.alignments += 1;
                                 // a.score = score / -4;
 
-                                let ani = (1.0 - a.score as f64 / a.cigar().0.len() as f64);
+                                let _ani = (1.0 - a.score as f64 / a.cigar().0.len() as f64);
                                 // let ani = (1.0 - a.score as f64/cigar.0.len() as f64);
                                 // if score < -50 && score != std::i32::MIN {
                                 //     eprintln!("{}/2: {} ANI: {}", i, score, ani);

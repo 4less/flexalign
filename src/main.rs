@@ -1,8 +1,8 @@
 #![feature(test)]
 #![feature(map_try_insert)]
-#![feature(const_option)]
-#![feature(const_trait_impl)]
 // #![feature(effects)]
+
+use std::str::FromStr;
 
 use clap::Parser;
 #[allow(unused_parens)]
@@ -28,6 +28,7 @@ fn logo() -> String {
     )
 }
 
+#[warn(dead_code)]
 fn logo2() -> String {
     format!("\n{}{}\n{}{}\n{}{}\n{}{}\n{}{}\n{}{}\n{}{}\n{}{}\n{}\n{}\n{}\n",
         " .d888 888                    ","        888 d8b                   ".red().bold(),
@@ -49,6 +50,8 @@ fn main() {
     SHOULD_COLORIZE.set_override(true);
 
     let args: Args = Args::parse();
+    let _level = log::LevelFilter::from_str(&args.log_level.to_string());
+
     let level = match args.log_level {
         val if val == 0usize => LevelFilter::Off,
         val if val == 1usize => LevelFilter::Error,
