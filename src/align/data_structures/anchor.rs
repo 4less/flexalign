@@ -631,10 +631,9 @@ impl Anchor {
                 (score, Status::OK)
             }
         };
-        alignment_score += score;
-
         match status { 
             Status::OK => {
+                alignment_score += score;
             }, 
             _ => { 
                 // eprintln!("Drop after middle {}", score);
@@ -1019,7 +1018,9 @@ impl Anchor {
         // }).join(""));
         let mut indel_hammings = offsets.iter().map(|offset| {
             let mut qr_offset = qr.clone();
-            let mut rr_offset = (max(rr.start as i64 + offset, 0) as usize)..(min(rr.end + (*offset as usize), reference.len()));
+            let rr_start = max(rr.start as i64 + offset, 0) as usize;
+            let rr_end = min(max(rr.end as i64 + offset, 0) as usize, reference.len());
+            let mut rr_offset = rr_start..rr_end;
             if qr_offset.len() != rr_offset.len() {
                 let shared_len = min(qr_offset.len(), rr_offset.len());
                 qr_offset.end = qr_offset.start + shared_len;
@@ -1335,7 +1336,7 @@ impl Anchor {
 
     pub fn reference_pos(&self, read_length: usize) -> (u64, u64) {
         let seed = self.seeds.first().unwrap();
-        let start = seed.rpos - seed.qpos as u64;
+        let start = seed.rpos.saturating_sub(seed.qpos as u64);
         (start, start + read_length as u64)
     }
 
