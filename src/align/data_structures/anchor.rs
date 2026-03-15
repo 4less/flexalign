@@ -488,7 +488,7 @@ impl Anchor {
     }
 
 
-    pub fn whole_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32) -> Status {
+    pub fn whole_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, _max_score: i32) -> Status {
         let (mut qr, mut rr) = self.whole(query.len(), reference.len());
         
         self.cigar = Some(Cigar::new());
@@ -561,7 +561,7 @@ impl Anchor {
         aligner.set_max_alignment_score(max_score + 1);
 
         // eprintln!("Align with max score {}", max_score + 1);
-        let (score,  status, qs, rs) = self.align_left_flank(aligner, query, reference, free_ends);
+        let (score,  status, _qs, _rs) = self.align_left_flank(aligner, query, reference, free_ends);
         match status { 
             Status::OK => {
                 assert!(score != std::i32::MIN);

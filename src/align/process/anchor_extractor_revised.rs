@@ -130,7 +130,7 @@ pub fn group_into_anchor<'a>(
 
     for seed in &seeds[1..] {
         for a in &anchor_tmp {
-            let (offset_first, fwd, indel_first) = a.closest_offset_seed(&seed, read_length);
+            let (_offset_first, _fwd, _indel_first) = a.closest_offset_seed(&seed, read_length);
             // let (offset_first, fwd, indel_first) = first.closest_offset(&seed, read_length);
             //TODO
         }

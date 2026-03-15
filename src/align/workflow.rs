@@ -468,7 +468,7 @@ impl<
             &mut self, 
             max_best_flex: usize, 
             ranges: usize, 
-            stats: &mut Stats) -> (usize, usize) {
+            _stats: &mut Stats) -> (usize, usize) {
 
         eprintln!("Retrieve seeds");
         let mut matches = 0;
@@ -531,7 +531,7 @@ impl<
         eprintln!("Get seeds");
         let (duration, _) = time(|| {
             // eprintln!("----------------- Get Ranges....");
-            let (ranges, discarded_max_flex_count) = self.retrieve_seeds(
+            let (_ranges, _discarded_max_flex_count) = self.retrieve_seeds(
                 self.options.args.max_best_flex,
                 self.options.args.ranges as usize,
                 stats
