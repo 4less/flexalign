@@ -1,4 +1,4 @@
-use std::{fs::File, io::{self, Write}, process::Output, sync::{Arc, Mutex}};
+use std::{fs::File, io::{self, Write}, sync::{Arc, Mutex}};
 
 
 
@@ -58,4 +58,3 @@ impl Drop for OutputBuffer {
         let _ = wr.write_all(&self.buffer);
     }
 }
-

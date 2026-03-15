@@ -1,4 +1,4 @@
-use std::{cmp::{max, min}, fmt::Display, iter::zip, ops::Range, process::exit};
+use std::{cmp::{max, min}, fmt::Display, iter::zip, ops::Range};
 
 use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use colored::{Color, Colorize};

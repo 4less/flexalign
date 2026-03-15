@@ -1,5 +1,3 @@
-use std::thread::current;
-
 use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 
 use crate::{

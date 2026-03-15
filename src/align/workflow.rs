@@ -1,16 +1,16 @@
 
 use std::{cmp::{max, min}, io::stdin, mem::swap};
 
-use super::{super::GOLDSTD_EVAL, common::{KmerExtractor}, stats::Stats};
+use super::{super::GOLDSTD_EVAL, stats::Stats};
 use bioreader::sequence::fastq_record::{print_color_qualities, OwnedFastqRecord, RefFastqRecord};
-use flexmap::{values::{VData, VRange}, VD};
+use flexmap::{values::VRange, VD};
 use kmerrs::{consecutive::kmer::{Kmer, KmerIter}, minimizer::context_free::Minimizer};
 use colored::Colorize;
 
 use crate::{database::common::FlexalignDatabase, flexalign::time, io::output_buffer::OutputBuffer, options::Options};
 
 use super::data_structures::common::Seed;
-use super::data_structures::anchor::{Anchor, AnchorSeed};
+use super::data_structures::anchor::Anchor;
 
 
 #[derive(Clone)]
@@ -670,4 +670,3 @@ impl<
 
     }
 }
-

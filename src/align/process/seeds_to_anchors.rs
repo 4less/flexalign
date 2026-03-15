@@ -1,5 +1,3 @@
-use std::process::exit;
-
 use itertools::Itertools;
 
 use crate::align::data_structures::{anchor::Anchor, common::Seed};

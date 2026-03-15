@@ -2,7 +2,6 @@
 use flexmap::VD;
 
 use crate::{align::{common::SeedExtractor, data_structures::common::Seed, stats::Stats}, flexalign::time};
-use itertools::Itertools;
 
 use super::range_extractor::Range;
 

@@ -4,9 +4,6 @@
 #![feature(const_trait_impl)]
 // #![feature(effects)]
 
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::process::exit;
 use std::str::FromStr;
 
 use clap::Parser;
@@ -16,12 +13,8 @@ pub mod utils;
 use colored::control::SHOULD_COLORIZE;
 use colored::Colorize;
 use flexalign::flexalign::{run, time};
-use flexalign::misc::test2;
 use flexalign::options::Args;
-use flexmap::keys::{FMKeysHash, KHashEntry};
-use log::{Level, LevelFilter};
-use savefile::{load, save};
-use savefile_derive::Savefile;
+use log::LevelFilter;
 
 
 

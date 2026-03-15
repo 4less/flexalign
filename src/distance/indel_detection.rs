@@ -1,4 +1,4 @@
-use std::{cmp::{min, max}, ops::Range};
+use std::{cmp::{min}, ops::Range};
 
 use derive_builder::Builder;
 
@@ -347,4 +347,3 @@ mod tests {
         })
     }
 }
-

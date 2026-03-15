@@ -1,11 +1,8 @@
-use std::{cmp::{max, min}, fmt::Display, iter::{zip}, ops::Range};
+use std::{cmp::{min}, fmt::Display, iter::{zip}, ops::Range};
 
-use bioreader::sequence::{fastq_record::{OwnedFastqRecord, RefFastqRecord}};
 use thiserror::Error;
 
-use crate::align::{common::{Align, Heuristic, Status}, errors::{AlignmentError, AlignmentResult}, sam::Cigar};
-
-use super::anchor::AnchorSeed;
+use crate::align::{sam::Cigar};
 
 
 #[derive(Debug, Clone, Error)]

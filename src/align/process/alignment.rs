@@ -1,7 +1,7 @@
 
-use libwfa2::{affine_wavefront::{AffineWavefronts, AlignmentSpan, AlignmentStatus, HeuristicStrategy}, bindings::wfa::wavefront_aligner_set_heuristic_xdrop};
+use libwfa2::affine_wavefront::{AffineWavefronts, AlignmentSpan, AlignmentStatus};
 
-use crate::align::{common::{Align, Heuristic, Status}, sam::{Cigar, CigarRef}};
+use crate::align::{common::{Align, Heuristic, Status}, sam::Cigar};
 
 
 // pub struct FastAlignment {

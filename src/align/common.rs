@@ -1,5 +1,4 @@
 use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
-use flexmap::values::{VData, VRange};
 use kmerrs::consecutive::kmer::Kmer;
 
 use super::{data_structures::{anchor::{Anchor, SeedGroupPair, SeedGroupPaired}, common::{Alignments, Seed}}, process::{anchor_extender::FixAnchorError, range_extractor::Range}, sam::Cigar, stats::Stats};
@@ -360,4 +359,3 @@ impl Print for SeedGroupPairedList {
         eprintln!("----- Seed group print");
     }
 }
-

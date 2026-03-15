@@ -1,8 +1,8 @@
 use std::cmp::min;
 
-use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
+use bioreader::sequence::fastq_record::{RefFastqRecord};
 
-use crate::{align::eval::{BinaryEvaluator, MapqEvaluation}, database::common::FlexalignDatabase};
+use crate::{align::eval::{MapqEvaluation}, database::common::FlexalignDatabase};
 
 pub fn get_id_from_header(header_str: &str, db: &impl FlexalignDatabase) -> usize {
     let first_part_a = header_str.split('-').next().unwrap_or("");

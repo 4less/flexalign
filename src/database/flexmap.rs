@@ -3,7 +3,6 @@ use std::{collections::HashMap, fs::File, io::BufReader};
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
 use flexmap::flexmap::{Flexmap, FlexmapHash, VRangeGetter};
 use savefile::{load, save};
-use ser_raw::{storage, CompleteSerializer, PureCopySerializer, Serialize, SerializeWith, Serializer};
 
 use crate::flexalign::time;
 

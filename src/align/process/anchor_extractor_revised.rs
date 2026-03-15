@@ -1,18 +1,16 @@
 use std::{
     cmp::{max, min},
-    fmt::Display,
     mem::swap,
-    ops::Range,
 };
 
 use crate::{
     align::{
         common::{
             AnchorExtractor, AnchorPair, AnchorScore, PairedAnchorExtractor, SeedGroupPairList,
-            SeedGroupPairedList, StdAnchorScore, StdPairedAnchorMAPQ,
+            SeedGroupPairedList, StdAnchorScore,
         },
         data_structures::{anchor::{Anchor, SeedGroupPaired}, common::Seed},
-        stats::{self, Stats},
+        stats::{Stats},
     },
     flexalign::time,
 };

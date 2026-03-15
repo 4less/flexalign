@@ -1,16 +1,10 @@
-use std::{cmp::min, os::linux::raw::stat, process::exit};
+use std::cmp::min;
 
-use bioreader::sequence::fastq_record::{print_color_qualities, OwnedFastqRecord, RefFastqRecord};
-use colored::Colorize;
-use kmerrs::{
-    consecutive::kmer::{Kmer, KmerIter},
-    minimizer::context_free::Minimizer,
-};
+use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 
 use crate::{
     align::{
-        common::{AnchorScore, Print, StdAnchorScore},
-        data_structures::{anchor::AnchorSeed, common::ToString},
+        common::{Print},
     },
     database::common::FlexalignDatabase,
     flexalign::time,
@@ -20,14 +14,13 @@ use crate::{
 
 use super::{
     common::{
-        is_alignment_valid, print_alignment, Align, AnchorExtractor, AnchorPair, Heuristic,
+        Align, AnchorExtractor, AnchorPair, Heuristic,
         KmerExtractor, Or, PAFOutput, PairedAnchorExtender, PairedAnchorExtractor,
         PairedAnchorMAPQ, RangeExtractor, SAMOutput, SeedExtractor, StdPairedAnchorMAPQ,
     },
     process::{
         alignment::ani_abort_score,
-        evaluate::{self, correct, get_id_from_header},
-        output::StdPAFOutput,
+        evaluate::{self, get_id_from_header},
     },
     stats::Stats,
 };

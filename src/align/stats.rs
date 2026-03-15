@@ -1,7 +1,7 @@
-use std::{cmp::max, collections::HashMap, fmt::Display, time::Duration};
+use std::{fmt::Display, time::Duration};
 use rgb::RGB8;
 use bioreader::parallel::fastq::Merge;
-use textplots::{Chart, ColorPlot, Plot, Shape};
+use textplots::{Chart, ColorPlot, Shape};
 
 use crate::GOLDSTD_EVAL;
 

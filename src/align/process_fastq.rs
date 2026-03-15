@@ -1,4 +1,4 @@
-use std::{fs::File, io::{self}, path::PathBuf, process::exit, str::FromStr, sync::{Arc, Mutex}};
+use std::{fs::File, io::{self}, path::PathBuf, str::FromStr, sync::{Arc, Mutex}};
 
 use bioreader::{parallel::fastq::{read_fastq_paired_end_state_par, read_fastq_single_end_state_par}, sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord}, utils::is_gzip};
 use flate2::read::GzDecoder;
@@ -10,7 +10,7 @@ use crate::{
         common::{NoSAMOutput, Or},
         modular_workflow::{Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, anchor_sorter::PairedAnchorHeuristicSorter, kmer_extractor::StdKmerExtractor, output::StdPAFOutput, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
+            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::StdPAFOutput, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
         }, 
         stats::Stats, 
         workflow
@@ -355,5 +355,4 @@ pub fn process_fastq_wrapper_modular<
     };
 
 }
-
 

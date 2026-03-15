@@ -5,7 +5,7 @@ use bioreader::sequence::fastq_record::RefFastqRecord;
 use flexmap::values::VRange;
 use kmerrs::consecutive::kmer::Kmer;
 
-use crate::{align::{common::RangeExtractor, stats::Stats}, database::common::FlexalignDatabase, flexalign::time};
+use crate::{align::{common::RangeExtractor, stats::Stats}, database::common::FlexalignDatabase};
 
 // pub type Range<'a, const F: usize> = (usize, Kmer<F>, VRange<'a>, usize);
 
@@ -70,4 +70,3 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
         Self { ranges: Vec::new(), db }
     }
 }
-

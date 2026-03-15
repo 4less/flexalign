@@ -2,9 +2,8 @@ use std::{collections::HashMap, fs::File, io::BufWriter};
 
 use flexmap::flexmap::{Flexmap, FlexmapHash};
 use savefile::save;
-use bincode::{self, config};
 
-use crate::{database::common::DBPaths, flexalign::time, options::{self, Options}};
+use crate::{database::common::DBPaths, flexalign::time, options::Options};
 
 pub fn default<
     const K: usize,

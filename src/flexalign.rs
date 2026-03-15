@@ -1,12 +1,10 @@
 use std::time::{Duration, Instant};
 use std::process::exit;
-use log::info;
 
-use crate::align::process_fastq::{process_fastq_wrapper, process_fastq_wrapper_modular};
+use crate::align::process_fastq::process_fastq_wrapper_modular;
 use crate::database::flexmap::DB;
 use crate::database::common::{DBPaths, FlexalignDatabase};
 use crate::options::{Args, Options};
-use crate::utils::infer_output_prefix;
 use crate::GLOBAL_VERSION;
 
 
@@ -81,4 +79,3 @@ pub fn run(args: Args) {
     let (duration, _result) = time(|| process_fastq_wrapper_modular::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db));
     log::info!("Modular: Process reads: {:?}", duration);
 }
-
