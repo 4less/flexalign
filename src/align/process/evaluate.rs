@@ -20,7 +20,7 @@ pub fn correct(header_str: &[u8], reference: u64, db: &impl FlexalignDatabase) -
     correct
 }
 
-pub fn evaluate(eval: &mut MapqEvaluation, refstr: &str, pseudo_mapq: u64, rec: &RefFastqRecord, _db: &impl FlexalignDatabase, is_first_read: bool) -> bool {
+pub fn evaluate(eval: &mut MapqEvaluation, refstr: &str, pseudo_mapq: u64, rec: &RefFastqRecord, _db: &impl FlexalignDatabase, _is_first_read: bool) -> bool {
     let correct = &refstr.as_bytes()[..min(refstr.len(), rec.head().len())] == &rec.head()[..min(refstr.len(), rec.head().len())];
     eval.add(correct, pseudo_mapq);
     correct

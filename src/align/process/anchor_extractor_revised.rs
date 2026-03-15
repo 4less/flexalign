@@ -155,8 +155,8 @@ pub fn group_into_anchor_module<'a>(
     //     eprintln!("{} --- {}", seed, seed.reverse(read_length));
     // }
 
-    let anchor_group_index = anchors.len();
-    let mut added_anchors = 0;
+    let _anchor_group_index = anchors.len();
+    let mut _added_anchors = 0;
     let mut indel_flag = false;
 
     if !seeds.is_empty() {
@@ -201,7 +201,7 @@ pub fn group_into_anchor_module<'a>(
             }
 
             anchors.push(a);
-            added_anchors += 1;
+            _added_anchors += 1;
 
             indices.clear();
             swap(other_indices, indices);
@@ -332,7 +332,7 @@ impl AnchorExtractor for StdAnchorExtractor {
         //TODO: Revisit and check function
         let max_size = seed_group_indices_module(seeds, &mut self.groups);
 
-        let (duration, _) = time(|| {
+        let (_duration, _) = time(|| {
             glidesort::sort_by_key(&mut self.groups, |(start, end)| {
                 -1i32 * (end - start) as i32
             });
