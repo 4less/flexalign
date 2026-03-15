@@ -356,7 +356,7 @@ impl Anchor {
         match (self.query_reference_alignment(), other.query_reference_alignment()) {
             (None, None) => {
 
-                let (offset,fwd, indel) = self.closest_offset(other, read_length);
+                let (_offset,fwd, indel) = self.closest_offset(other, read_length);
 
                 if indel < (max_indel as u64) {
                     let mut newa: Anchor = self.clone();
@@ -933,7 +933,7 @@ impl Anchor {
             if by.is_some() {
                 let by = zip(middle_q, middle_r)
                     .enumerate()
-                    .find(|(i, (a, b))| a != b);
+                    .find(|(_i, (a, b))| a != b);
 
                 match by {
                     Some((by, _)) => self.seeds[current_i].extend_right(by),
@@ -954,7 +954,7 @@ impl Anchor {
 
         let by = zip(right_q, right_r)
             .enumerate()
-            .find(|(i, (a, b))| a != b);
+            .find(|(_i, (a, b))| a != b);
         
         match by {
             Some((by, _)) => {
@@ -1039,7 +1039,7 @@ impl Anchor {
             hamming
         }).collect_vec();
 
-        let hamming = triple_accel::hamming(&query[qr.clone()], &reference[rr.clone()]) as u64;
+        let _hamming = triple_accel::hamming(&query[qr.clone()], &reference[rr.clone()]) as u64;
 
         // eprintln!("INDEL HAMMING 0: {} -> INDEL {:?}", hamming, indel_hammings);
 

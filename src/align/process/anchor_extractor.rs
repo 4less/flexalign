@@ -130,7 +130,7 @@ pub fn group_into_anchor_module<'a>(
 
     let _anchor_group_index = anchors.len();
     let mut _added_anchors = 0;
-    let mut indel_flag = false;
+    let indel_flag = false;
 
     if !seeds.is_empty() {
         // Group by exact offset. If there are seeds left, distribute them onto

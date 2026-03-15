@@ -269,9 +269,9 @@ impl<
         );
 
         if false && GOLDSTD_EVAL {
-            let mut index = 0;
+            let mut _index = 0;
             let mut correct = false;
-            let mut correct_id = 0;
+            let mut _correct_id = 0;
             for (idx, range) in ranges_rev.iter().enumerate() {
                 let kmer_len = if range.vrange.header.is_some() {
                     31
@@ -297,7 +297,7 @@ impl<
 
                 if !correct {
                     let quals = rec_fwd.qual();
-                    let test = &quals[range.qpos..range.qpos + kmer_len];
+                    let _test = &quals[range.qpos..range.qpos + kmer_len];
                     let kmer_quals = &quals[range.qpos..range.qpos + kmer_len]
                         .iter()
                         .map(|q| q - 33);
@@ -320,7 +320,7 @@ impl<
                 // });
 
                 if correct {
-                    index = idx;
+                    _index = idx;
                     break;
                 }
             }
@@ -336,9 +336,9 @@ impl<
             //     exit(9);
             // }
 
-            let mut index = 0;
+            let mut _index = 0;
             let mut correct = false;
-            let mut correct_id = 0;
+            let mut _correct_id = 0;
             //(qpos, flex, vrange, len)
             for (idx, range) in ranges_rev.iter().enumerate() {
                 let kmer_len = if range.vrange.header.is_some() {
@@ -386,7 +386,7 @@ impl<
                 // });
 
                 if correct {
-                    index = idx;
+                    _index = idx;
                     break;
                 }
             }
