@@ -91,16 +91,11 @@ impl<
             return;
         }
 
-        let (_duration, _) = time(|| {
+        let (duration, _) = time(|| {
             anchors.sort_unstable_by_key(|a| {
                 -((a.core_matches() - a.mismatches as usize - a.indels()) as i64)
             });
         });
-
-        let (duration, _) = time(|| {
-            rec.reverse_complement(&mut self.rec_rev);
-        });
-        stats.time_reverse_complement += duration;
         stats.time_anchor_sorting += duration;
 
         let best = anchors.first().unwrap();
@@ -119,8 +114,8 @@ impl<
 
         // Compile time switch
         if GOLDSTD_EVAL {
-            let correct = &ref_string.as_bytes()[..min(ref_string.len(), rec.head().len())]
-                == &rec.head()[..min(ref_string.len(), rec.head().len())];
+            let cmp_len = min(ref_string.len(), rec.head().len());
+            let correct = &ref_string.as_bytes()[..cmp_len] == &rec.head()[..cmp_len];
             stats
                 .gold_std_evaluation
                 .as_mut()
@@ -697,6 +692,7 @@ impl<
                             .unwrap(),
                     };
 
+                    let min_ani = 0.9;
                     match a1 {
                         Some(a) => {
                             let query = if a.forward {
@@ -709,7 +705,7 @@ impl<
                             } else {
                                 if min_score_1.is_none() {
                                     min_score_1 =
-                                        Some(ani_abort_score(0.5, 4, query.len() as i32).abs());
+                                        Some(ani_abort_score(min_ani, 4, query.len() as i32).abs());
                                 }
                                 self.align.set_max_alignment_score(min_score_1.unwrap());
                                 // eprintln!("Align max score: {}", min_score_1.unwrap());
@@ -721,6 +717,7 @@ impl<
                                 // let status = a.smart_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
                                 // let status = a.whole_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
 
+                                println!("a.score:  {}", a.score);
                                 let status = a.align(
                                     &mut self.align,
                                     query,
@@ -739,6 +736,7 @@ impl<
                                 }
 
                                 let score = a.score;
+                                println!("a.score2: {}", score);
                                 // stats.time_offset += duration;
                                 // stats.alignments += 1;
                                 // a.score = score / -4;
@@ -772,7 +770,7 @@ impl<
                             } else {
                                 if min_score_2.is_none() {
                                     min_score_2 =
-                                        Some(ani_abort_score(0.5, 4, query.len() as i32).abs());
+                                        Some(ani_abort_score(min_ani, 4, query.len() as i32).abs());
                                 }
 
                                 if a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {

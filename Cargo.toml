@@ -13,7 +13,7 @@ channel = "nightly"
 
 [dependencies]
 kmerrs = { git = "https://github.com/4less/kmerr.git" }
-flexmap = { git = "https://github.com/4less/flexmap.git" }
+flexmap = { git = "https://github.com/4less/flexmap.git", branch = "zeroable_load" }
 bioreader = { git = "https://github.com/4less/bioreader.git" }
 libwfa2 = "0.1.1"
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
