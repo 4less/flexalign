@@ -1,8 +1,24 @@
 use std::{path::PathBuf, str::FromStr};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::utils::infer_output_prefix;
+
+/// Selects a fixed set of compile-time index/seeding parameters (const generics).
+/// Each variant is a fully monomorphized pipeline; the choice is made once per run.
+/// Further parameter sets can be added as variants here and in the `with_profile!`
+/// macro in `flexalign.rs`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    /// K=31 C=15 F=16 S=4
+    Default,
+    // Additional parameter sets, enable as needed (also uncomment the matching
+    // arm in `with_profile!` in flexalign.rs):
+    // /// K=25 C=13 F=14 S=3
+    // Mid,
+    // /// K=19 C=11 F=12 S=2
+    // Long,
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -72,9 +88,13 @@ pub struct Args {
     #[arg(long = "log-level", default_value_t = 3)]
     pub log_level: usize,
 
-    /// Output reads that align to the wrong reference sequence. Does not check position of alignment. Requires env variable to be set. 
+    /// Output reads that align to the wrong reference sequence. Does not check position of alignment. Requires env variable to be set.
     #[arg(long = "output-prefix-fp-reads")] // String::default()
     pub output_prefix_fp_reads: Option<String>,
+
+    /// Index/seeding parameter set.
+    #[arg(long = "profile", value_enum, default_value = "default", hide = true)]
+    pub profile: Profile,
 }
 
 #[derive(Debug)]

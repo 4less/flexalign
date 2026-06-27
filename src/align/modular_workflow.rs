@@ -717,7 +717,6 @@ impl<
                                 // let status = a.smart_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
                                 // let status = a.whole_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
 
-                                println!("a.score:  {}", a.score);
                                 let status = a.align(
                                     &mut self.align,
                                     query,
@@ -736,7 +735,6 @@ impl<
                                 }
 
                                 let score = a.score;
-                                println!("a.score2: {}", score);
                                 // stats.time_offset += duration;
                                 // stats.alignments += 1;
                                 // a.score = score / -4;
