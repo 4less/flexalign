@@ -18,6 +18,7 @@ pub mod io;
 pub mod misc;
 pub mod utils;
 pub mod distance;
+pub mod shard;
 
 const GLOBAL_VERSION: u32 = 1;
 

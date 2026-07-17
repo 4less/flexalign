@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::BufReader};
+use std::{collections::HashMap, fs::File, io::{BufReader, BufWriter}};
 
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
 use flexmap::flexmap::{Flexmap, FlexmapHash, VRangeGetter};
@@ -81,14 +81,14 @@ impl<
     }
 
     fn load(paths: &super::common::DBPaths, version: u32) -> Self {
-        let map_file = &mut File::open(&paths.index_path).expect("Working flexmap file");
-        let mut map_reader = BufReader::new(map_file);
+        let _ = version;
 
         let rid2rname_file = &mut File::open(&paths.id2reference_path).expect("Working id2ref file");
         let rname2rid_file = &mut File::open(&paths.reference2id_path).expect("Working ref2id file");
         let references_file = &mut File::open(&paths.reference_path).expect("Working references file");
 
-        let flexmap = load(&mut map_reader, version).expect("Valid reference database");
+        let index_path = paths.index_path.to_string_lossy().into_owned();
+        let flexmap = Flexmap::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&index_path);
 
         // let config = bincode::config::standard();
         // let flexmap = decode_from_reader(map_reader, config).expect("Valid reference database");
@@ -116,11 +116,9 @@ impl<
     }
     
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
-        let mut file = match File::create(&paths.index_path) {
-            Err(why) => panic!("couldn't open {}: {}", paths.index_path.display(), why),
-            Ok(file) => file,
-        };
-        let _ = save(&mut file, version, &self.flexmap);
+        let _ = version;
+        let index_path = paths.index_path.to_string_lossy().into_owned();
+        self.flexmap.save(&index_path);
     
         let mut file = match File::create(&paths.id2reference_path) {
             Err(why) => panic!(
@@ -226,14 +224,22 @@ impl<
     }
 
     fn load(paths: &super::common::DBPaths, version: u32) -> Self {
-        let map_file = &mut File::open(&paths.index_path).expect("Working flexmap file");
+        let map_file = File::open(&paths.index_path).expect("Working flexmap file");
         let mut map_reader = BufReader::new(map_file);
 
         let rid2rname_file = &mut File::open(&paths.id2reference_path).expect("Working id2ref file");
         let rname2rid_file = &mut File::open(&paths.reference2id_path).expect("Working ref2id file");
         let references_file = &mut File::open(&paths.reference_path).expect("Working references file");
 
-        let flexmap = load(&mut map_reader, version).expect("Valid reference database");
+        let _ = version;
+        let config = bincode::config::standard();
+        let flexmap: FlexmapHash<C, F, HEADER_THRESHOLD> = bincode::decode_from_std_read(&mut map_reader, config)
+            .expect("Valid reference database");
+
+        // WIP (parked on branch `shards` to unblock the build): FlexmapHash::load is still
+        // commented out upstream in the flexmap crate -- only Flexmap has save/load. Until it
+        // exists, this path stays on bincode above.
+        // let flexmap = FlexmapHash::<C, F, HEADER_THRESHOLD>::load(&paths.index_path.to_string_lossy().into_owned());
 
         // let config = bincode::config::standard();
         // let flexmap = decode_from_reader(map_reader, config).expect("Valid reference database");
@@ -258,11 +264,14 @@ impl<
     }
     
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
-        let mut file = match File::create(&paths.index_path) {
+        let _ = version;
+        let file = match File::create(&paths.index_path) {
             Err(why) => panic!("couldn't open {}: {}", paths.index_path.display(), why),
             Ok(file) => file,
         };
-        let _ = save(&mut file, version, &self.flexmap);
+        let mut writer = BufWriter::new(file);
+        let config = bincode::config::standard();
+        let _ = bincode::encode_into_std_write(&self.flexmap, &mut writer, config);
     
         let mut file = match File::create(&paths.id2reference_path) {
             Err(why) => panic!(

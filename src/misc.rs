@@ -1,7 +1,6 @@
 use std::{fs::File, io::{BufReader, BufWriter}};
 
 use flexmap::keys::KHashEntry;
-use savefile::{load, save};
 
 use crate::flexalign::time;
 
@@ -28,26 +27,31 @@ fn test() {
     let mut file_a = BufWriter::new(File::create("data/large_data/fasta/test_a.bin").unwrap());
     let mut file_b = BufWriter::new(File::create("data/large_data/fasta/test_b.bin").unwrap());
 
-    let _ = save(&mut file_a, 1, &test_a);
-    let _ = save(&mut file_b, 1, &test_b);
+    let config = bincode::config::standard();
+    let _ = bincode::encode_into_std_write(&test_a, &mut file_a, config);
+    let _ = bincode::encode_into_std_write(&test_b, &mut file_b, config);
 
 
     let mut file_a = BufReader::new(File::open("data/large_data/fasta/test_a.bin").unwrap());
     let mut file_b = BufReader::new(File::open("data/large_data/fasta/test_b.bin").unwrap());
 
-    let (duration, result) = time(|| load::<Vec<KHashEntry>>(&mut file_b, 1));
+    let config = bincode::config::standard();
+    let (duration, result) = time(|| bincode::decode_from_std_read::<Vec<KHashEntry>, _, _>(&mut file_b, config));
     eprintln!("Load B took {:?} : {}", duration, result.unwrap().len());
 
-    let (duration, result) = time(|| load::<Vec<u64>>(&mut file_a, 1));
+    let config = bincode::config::standard();
+    let (duration, result) = time(|| bincode::decode_from_std_read::<Vec<u64>, _, _>(&mut file_a, config));
     eprintln!("Load A took {:?} : {}", duration, result.unwrap().len());
 
     let mut file_a = File::open("data/large_data/fasta/test_a.bin").unwrap();
     let mut file_b = File::open("data/large_data/fasta/test_b.bin").unwrap();
 
-    let (duration, result) = time(|| load::<Vec<u64>>(&mut file_a, 1));
+    let config = bincode::config::standard();
+    let (duration, result) = time(|| bincode::decode_from_std_read::<Vec<u64>, _, _>(&mut file_a, config));
     eprintln!("Load A took {:?} : {}", duration, result.unwrap().len());
 
-    let (duration, result) = time(|| load::<Vec<KHashEntry>>(&mut file_b, 1));
+    let config = bincode::config::standard();
+    let (duration, result) = time(|| bincode::decode_from_std_read::<Vec<KHashEntry>, _, _>(&mut file_b, config));
     eprintln!("Load B took {:?} : {}", duration, result.unwrap().len());
 
 }

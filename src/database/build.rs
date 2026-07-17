@@ -26,12 +26,10 @@ pub fn default<
 
     let (flexmap, reference2id, id2reference) = result.expect("Building database works");
 
+    let index_path = db_paths.index_path.to_string_lossy().into_owned();
+    flexmap.save(&index_path);
+
     const GLOBAL_VERSION: u32 = 1;
-    let mut file = match File::create(&db_paths.index_path) {
-        Err(why) => panic!("couldn't open {}: {}", db_paths.index_path.display(), why),
-        Ok(file) => file,
-    };
-    let _ = save(&mut file, GLOBAL_VERSION, &flexmap);
 
     let mut file = match File::create(&db_paths.id2reference_path) {
         Err(why) => panic!(
@@ -79,21 +77,19 @@ pub fn hash<
 
     let (flexmap, reference2id, id2reference) = result.expect("Building database works");
 
-    const GLOBAL_VERSION: u32 = 1;
-
     let file: File = match File::create(&db_paths.index_path) {
         Err(why) => panic!("couldn't open {}: {}", db_paths.index_path.display(), why),
         Ok(file) => file,
     };
 
     let mut writer = BufWriter::new(file);
-    // let config = bincode::config::standard();
-    // let _ = bincode::encode_into_std_write(&flexmap, &mut writer, config);
-
-    let _ = save(&mut writer, GLOBAL_VERSION, &flexmap);
+    let config = bincode::config::standard();
+    let _ = bincode::encode_into_std_write(&flexmap, &mut writer, config);
 
 
     eprintln!("Done saving..");
+
+    const GLOBAL_VERSION: u32 = 1;
 
     let mut file = match File::create(&db_paths.id2reference_path) {
         Err(why) => panic!(
