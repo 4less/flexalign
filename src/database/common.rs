@@ -34,9 +34,21 @@ impl DBPaths {
         }
     }
 
+    /// The `Flexmap` index is stored as two files (keys + values); flexmap's
+    /// `Flexmap::save`/`load` take them separately. Both are derived from
+    /// `index_path` by suffix so the `.flex.index` naming stays the base.
+    pub fn index_keys_file(&self) -> String {
+        format!("{}.keys", self.index_path.to_string_lossy())
+    }
+
+    pub fn index_values_file(&self) -> String {
+        format!("{}.values", self.index_path.to_string_lossy())
+    }
+
     pub fn valid_paths(&self) -> bool {
         Path::exists(&self.reference_path) &
-        Path::exists(&self.index_path) &
+        Path::exists(Path::new(&self.index_keys_file())) &
+        Path::exists(Path::new(&self.index_values_file())) &
         Path::exists(&self.reference2id_path) &
         Path::exists(&self.id2reference_path)
     }

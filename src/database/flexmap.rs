@@ -87,8 +87,10 @@ impl<
         let rname2rid_file = &mut File::open(&paths.reference2id_path).expect("Working ref2id file");
         let references_file = &mut File::open(&paths.reference_path).expect("Working references file");
 
-        let index_path = paths.index_path.to_string_lossy().into_owned();
-        let flexmap = Flexmap::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&index_path);
+        let flexmap = Flexmap::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(
+            &paths.index_keys_file(),
+            &paths.index_values_file(),
+        );
 
         // let config = bincode::config::standard();
         // let flexmap = decode_from_reader(map_reader, config).expect("Valid reference database");
@@ -117,8 +119,7 @@ impl<
     
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
         let _ = version;
-        let index_path = paths.index_path.to_string_lossy().into_owned();
-        self.flexmap.save(&index_path);
+        self.flexmap.save(&paths.index_keys_file(), &paths.index_values_file());
     
         let mut file = match File::create(&paths.id2reference_path) {
             Err(why) => panic!(

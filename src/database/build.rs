@@ -26,8 +26,7 @@ pub fn default<
 
     let (flexmap, reference2id, id2reference) = result.expect("Building database works");
 
-    let index_path = db_paths.index_path.to_string_lossy().into_owned();
-    flexmap.save(&index_path);
+    flexmap.save(&db_paths.index_keys_file(), &db_paths.index_values_file());
 
     const GLOBAL_VERSION: u32 = 1;
 

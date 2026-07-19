@@ -2,6 +2,7 @@
 /data
 /analysis
 /results
+/.cargo/config.toml
 Cargo.lock
 classification.err
 classification.out

@@ -15,5 +15,10 @@ pub mod chunkfile;
 pub mod db;
 pub mod emit;
 pub mod manifest;
+pub mod pass;
 pub mod record;
+pub mod rejoin;
 pub mod replay;
+
+#[cfg(test)]
+pub(crate) mod test_util;
