@@ -18,6 +18,7 @@ use super::{
         KmerExtractor, Or, PAFOutput, PairedAnchorExtender, PairedAnchorExtractor,
         PairedAnchorMAPQ, RangeExtractor, SAMOutput, SeedExtractor, StdPairedAnchorMAPQ,
     },
+    data_structures::common::Seed,
     process::{
         alignment::ani_abort_score,
         evaluate::{self, get_id_from_header},
@@ -421,14 +422,31 @@ impl<
         //     assert!(qend as usize <= rec_rev.seq().len());
         // });
 
-        // Get Seeds from ranges
-        let (duration, seeds_fwd) = time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats));
+        // Get Seeds from ranges. Own them so the reference-comparison half can run behind a
+        // `&mut self` call, and so the sharded rejoin can feed it replayed seeds through the very
+        // same path.
+        let (duration, seeds_fwd) = time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats).to_vec());
         stats.time_range_header += duration;
         stats.seeds += seeds_fwd.len();
-        let (duration, seeds_rev) = time(|| self.seed_extractor_rev.generate(ranges_rev, stats));
+        let (duration, seeds_rev) = time(|| self.seed_extractor_rev.generate(ranges_rev, stats).to_vec());
         stats.time_range_header += duration;
         stats.seeds += seeds_rev.len();
 
+        self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats);
+    }
+
+    /// The reference-comparison half of the pipeline: seeds -> anchors -> extend -> gapped align ->
+    /// output (and gold-standard bookkeeping). Split out of [`run`](Self::run) at the seed boundary
+    /// so the normal path and the sharded rejoin, which supplies replayed seeds, run identical code
+    /// from here on.
+    pub fn align_from_seeds(
+        &mut self,
+        rec_fwd: &RefFastqRecord,
+        rec_rev: &RefFastqRecord,
+        seeds_fwd: &[Seed],
+        seeds_rev: &[Seed],
+        stats: &mut Stats,
+    ) {
         // seeds_fwd.iter().for_each(|s| {
         //     let qend = s.qpos + s.length as u32;
         //     if qend as usize > rec_fwd.seq().len() {
@@ -505,6 +523,24 @@ impl<
         });
         stats.time_get_anchors += duration;
         stats.anchors += anchors.len();
+
+        // --debug: is the *true* anchor (matching the reference encoded in the read header) present
+        // among all anchors, before any pruning/extension/alignment? Distinguishes a seeding/anchor
+        // problem (true anchor absent) from a selection problem (present but not chosen).
+        if self.options.args.debug {
+            let header = String::from_utf8_lossy(rec_fwd.head());
+            let true_rid = get_id_from_header(&header, self.db);
+            if true_rid != 0 {
+                stats.dbg_checked += 1;
+                let present = anchors.iter().any(|AnchorPair(a1, a2)| {
+                    a1.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+                        || a2.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+                });
+                if present {
+                    stats.dbg_true_anchor_present += 1;
+                }
+            }
+        }
 
         log::trace!(
             "\n#################################################\n##### Anchors\n#################################################\n{}",
@@ -597,6 +633,23 @@ impl<
 
         // Assumes sorted anchors !!
         let extension_anchors = &mut anchors[0..extended_count];
+
+        // --debug: after extension + score-sort, is the best anchor the true one? Together with
+        // dbg_true_anchor_present this pinpoints the stage: present but not best => extension/scoring
+        // ranks a homolog above the truth; not present => the true anchor is never formed (seeding).
+        if self.options.args.debug {
+            let header = String::from_utf8_lossy(rec_fwd.head());
+            let true_rid = get_id_from_header(&header, self.db);
+            if true_rid != 0 {
+                if let Some(AnchorPair(a1, a2)) = extension_anchors.first() {
+                    let best_is_true = a1.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+                        || a2.as_ref().is_some_and(|a| a.reference as usize == true_rid);
+                    if best_is_true {
+                        stats.dbg_true_anchor_best += 1;
+                    }
+                }
+            }
+        }
 
         stats.time_extend_anchors += duration;
 
@@ -734,7 +787,16 @@ impl<
 
                                 match status {
                                     super::common::Status::OK => stats.alignments_successful += 1,
-                                    super::common::Status::Dropped => stats.alignments_dropped += 1,
+                                    super::common::Status::Dropped => {
+                                        stats.alignments_dropped += 1;
+                                        // A dropped alignment otherwise keeps its (large, positive)
+                                        // pre-alignment extension score, which the score-descending
+                                        // re-sort below would then rank ABOVE cleanly-aligned anchors
+                                        // (whose scores are <= 0) -- so a divergent homolog that drops
+                                        // beats the true locus that aligned. Sink it. (Kept well above
+                                        // i32::MIN so the sort's `s1 + s2` cannot overflow.)
+                                        a.score = -1_000_000;
+                                    }
                                     super::common::Status::Partial => stats.alignments_partial += 1,
                                 }
 
@@ -796,7 +858,16 @@ impl<
 
                                 match status {
                                     super::common::Status::OK => stats.alignments_successful += 1,
-                                    super::common::Status::Dropped => stats.alignments_dropped += 1,
+                                    super::common::Status::Dropped => {
+                                        stats.alignments_dropped += 1;
+                                        // A dropped alignment otherwise keeps its (large, positive)
+                                        // pre-alignment extension score, which the score-descending
+                                        // re-sort below would then rank ABOVE cleanly-aligned anchors
+                                        // (whose scores are <= 0) -- so a divergent homolog that drops
+                                        // beats the true locus that aligned. Sink it. (Kept well above
+                                        // i32::MIN so the sort's `s1 + s2` cannot overflow.)
+                                        a.score = -1_000_000;
+                                    }
                                     super::common::Status::Partial => stats.alignments_partial += 1,
                                 }
 

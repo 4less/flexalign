@@ -140,6 +140,18 @@ pub fn process_fastq_wrapper<
         }
 
         eprintln!("{}", stats.as_ref().unwrap());
+        if options.args.debug {
+            let s = stats.as_ref().unwrap();
+            let pc = |n: usize| if s.dbg_checked > 0 { 100.0 * n as f64 / s.dbg_checked as f64 } else { 0.0 };
+            eprintln!(
+                "[debug] reads checked (true ref known): {}\n\
+                 [debug] true anchor present among all anchors: {} ({:.2}%)\n\
+                 [debug] true anchor is best after extension:   {} ({:.2}%)",
+                s.dbg_checked,
+                s.dbg_true_anchor_present, pc(s.dbg_true_anchor_present),
+                s.dbg_true_anchor_best, pc(s.dbg_true_anchor_best),
+            );
+        }
         // stats.as_ref().unwrap().plot_mapq();
         // dbg!(stats);
     };
@@ -195,6 +207,7 @@ pub fn process_fastq_wrapper_modular<
                 options.args.max_range_size,
                 options.args.min_ranges,
                 options.args.ranges,
+                options.args.mask_flank_mult,
             ),
             anchor_extractor: StdAnchorExtractor::new(),
             rec_rev: OwnedFastqRecord::new(),
@@ -234,6 +247,7 @@ pub fn process_fastq_wrapper_modular<
                         options.args.max_range_size,
                         options.args.min_ranges,
                         options.args.ranges,
+                        options.args.mask_flank_mult,
                     ),
                     anchor_extractor: StdAnchorExtractor::new(),
                     rec_rev: OwnedFastqRecord::new(),
@@ -255,12 +269,14 @@ pub fn process_fastq_wrapper_modular<
                         options.args.max_range_size,
                         options.args.min_ranges,
                         options.args.ranges,
+                        options.args.mask_flank_mult,
                     ),
                     seed_extractor_rev: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,
                         options.args.min_ranges,
                         options.args.ranges,
+                        options.args.mask_flank_mult,
                     ),
                     anchor_extractor: StdPairedAnchorExtractor::new(),
                     anchor_extender: StdPairedAnchorExtender::new(db),
@@ -348,6 +364,18 @@ pub fn process_fastq_wrapper_modular<
         }
 
         eprintln!("{}", stats.as_ref().unwrap());
+        if options.args.debug {
+            let s = stats.as_ref().unwrap();
+            let pc = |n: usize| if s.dbg_checked > 0 { 100.0 * n as f64 / s.dbg_checked as f64 } else { 0.0 };
+            eprintln!(
+                "[debug] reads checked (true ref known): {}\n\
+                 [debug] true anchor present among all anchors: {} ({:.2}%)\n\
+                 [debug] true anchor is best after extension:   {} ({:.2}%)",
+                s.dbg_checked,
+                s.dbg_true_anchor_present, pc(s.dbg_true_anchor_present),
+                s.dbg_true_anchor_best, pc(s.dbg_true_anchor_best),
+            );
+        }
         // stats.as_ref().unwrap().plot_mapq();
         // dbg!(stats);
     };

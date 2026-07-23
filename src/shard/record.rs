@@ -108,6 +108,7 @@ fn get_varint(buf: &[u8], pos: &mut usize) -> Result<u32, RecordError> {
 ///
 /// Groups must be pushed in ascending `(idx, mate)` -- the rejoin relies on it to advance its
 /// cursors monotonically, and nothing downstream re-sorts.
+#[derive(Clone)]
 pub struct GroupWriter {
     buf: Vec<u8>,
     prev_idx: u32,

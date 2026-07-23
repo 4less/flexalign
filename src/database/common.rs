@@ -45,8 +45,14 @@ impl DBPaths {
         format!("{}.values", self.index_path.to_string_lossy())
     }
 
+    /// Single-file, memory-mappable index blob (keys + values). This is what full-mode loads.
+    pub fn index_blob_file(&self) -> String {
+        format!("{}.blob", self.index_path.to_string_lossy())
+    }
+
     pub fn valid_paths(&self) -> bool {
         Path::exists(&self.reference_path) &
+        Path::exists(Path::new(&self.index_blob_file())) &
         Path::exists(Path::new(&self.index_keys_file())) &
         Path::exists(Path::new(&self.index_values_file())) &
         Path::exists(&self.reference2id_path) &
@@ -62,6 +68,34 @@ pub trait FlexalignDatabase {
     fn build(options: &Options) -> Self;
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error>;
     fn load(paths: &DBPaths, version: u32) -> Self;
+}
+
+/// A shared reference to a database is itself a read-only database. This lets key-range views such
+/// as `ShardedDB<&DB>` borrow one built index across many shards instead of cloning it -- essential
+/// for sharding a multi-GB index without N copies of it in RAM. The mutating/persisting methods are
+/// unreachable through a shared reference and panic; a shard pass only ever reads.
+impl<D: FlexalignDatabase> FlexalignDatabase for &D {
+    fn get_rid(&self, reference: &str) -> Option<&usize> {
+        (**self).get_rid(reference)
+    }
+    fn get_rname(&self, id: usize) -> Option<&str> {
+        (**self).get_rname(id)
+    }
+    fn get_reference(&self, id: usize) -> Option<&[u8]> {
+        (**self).get_reference(id)
+    }
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>> {
+        (**self).get_vrange(canonical_kmer)
+    }
+    fn build(_options: &Options) -> Self {
+        unimplemented!("&DB is a borrowed read-only view; build the owned database instead")
+    }
+    fn save(&self, _paths: &DBPaths, _version: u32) -> Result<(), std::io::Error> {
+        unimplemented!("&DB is a borrowed read-only view")
+    }
+    fn load(_paths: &DBPaths, _version: u32) -> Self {
+        unimplemented!("&DB is a borrowed read-only view; load the owned database instead")
+    }
 }
 
 

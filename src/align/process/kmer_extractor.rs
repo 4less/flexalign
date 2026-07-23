@@ -34,10 +34,8 @@ impl<
             let kmer = if cmer_fwd < cmer_rev { kmer_fwd } else { kmer_rev };
             let cmer = min(cmer_fwd, cmer_rev);
 
-
-            // let (duration, is_minimizer) = time(|| );
-            // stats.time_get_minimizer += duration;
-            // timing the minimizer takes like 5 more seconds.
+            // Selection is on the raw canonical core-mer (unchanged); the de-biasing mix is applied
+            // only to the KEY, at lookup time in the range extractor.
             if !self.minimizer.is_minimizer(cmer.0) {
                 continue;
             };

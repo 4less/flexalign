@@ -46,3 +46,7 @@ install:
 # Remove build artifacts.
 clean:
     {{cargo}} clean
+
+# NOTE: the alignment benchmark (flexalign vs strobealign, correctness + speed) lives in its own
+# repo — ../flexalign_benchmark — managed with pixi. Run `pixi run setup` then `pixi run bench`
+# there. This crate only provides the aligner binaries it drives (flexalign, examples/shard_align).

@@ -4,6 +4,7 @@ use std::cmp::min;
 use bioreader::sequence::fastq_record::RefFastqRecord;
 use flexmap::values::VRange;
 use kmerrs::consecutive::kmer::Kmer;
+use kmerrs::kmer_utils::mask_coremer;
 
 use crate::{align::{common::RangeExtractor, stats::Stats}, database::common::FlexalignDatabase};
 
@@ -37,7 +38,8 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
             let cmer = kmer.middle::<C>();
             let fmer = kmer.flanks::<F>();
 
-            let result = self.db.get_vrange(cmer.0);
+            // Look up under the same de-biasing mix used at index build and syncmer selection.
+            let result = self.db.get_vrange(mask_coremer::<C>(cmer.0));
 
             // eprintln!("{} {} -> {}", pos, kmer.to_string().unwrap(), result.is_some());
             let range: VRange<'a> = match result {

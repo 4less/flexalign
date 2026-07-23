@@ -146,17 +146,27 @@ pub struct StdSeedExtractor<const K: usize, const C: usize, const F: usize> {
     pub max_range_size: usize,
     pub min_ranges: usize,
     pub max_ranges: usize,
+    /// Hard ceiling on the min-distance flank tie count (`--mask-flank-mult`); 0 = disabled.
+    /// Applied on top of `max_best_flex` in every pass, so — unlike `max_best_flex` — the
+    /// recovery pass below cannot relax it.
+    pub mask_flank_mult: usize,
 }
 
 impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
-    pub fn new(max_best_flex: usize, max_range_size: usize, min_ranges: usize, max_ranges: usize) -> Self {
+    pub fn new(max_best_flex: usize, max_range_size: usize, min_ranges: usize, max_ranges: usize, mask_flank_mult: usize) -> Self {
         Self {
             seeds: Vec::new(),
             max_best_flex,
             max_range_size,
             min_ranges,
             max_ranges,
+            mask_flank_mult,
         }
+    }
+
+    /// The mask as an inclusive upper bound on the tie count: 0 means "no ceiling".
+    fn flank_cap(&self) -> usize {
+        if self.mask_flank_mult == 0 { usize::MAX } else { self.mask_flank_mult }
     }
 
     pub fn retrieve_seeds(
@@ -184,19 +194,23 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
     fn generate(&mut self, ranges: &[Range<F>], stats: &mut crate::align::stats::Stats) -> &[Seed] {
         self.seeds.clear();
 
+        // `--mask-flank-mult` is a hard ceiling: cap the flank-tie cutoff in *both* passes so a
+        // repetitive flank stays masked even when the recovery pass relaxes `max_best_flex`.
+        let cap = self.flank_cap();
+
         let (retrieved_ranges, discarded_max_flex_count) = self.retrieve_seeds(
-            ranges, 
-            self.max_best_flex,
+            ranges,
+            self.max_best_flex.min(cap),
             self.max_range_size,
             stats
         );
-        
+
         if retrieved_ranges < self.min_ranges && discarded_max_flex_count > 0  {
             // eprintln!("----------------- Recover Ranges....");
             let _old_ranges = ranges;
             let (_ranges, _discarded_max_flex_count) = self.retrieve_seeds(
                 ranges,
-                128,
+                128.min(cap),
                 self.max_range_size,
                 stats
             );

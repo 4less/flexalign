@@ -51,6 +51,7 @@ impl<const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for Rang
 ///
 /// Shaped like `StdSeedExtractor` but not implementing `SeedExtractor`: that trait takes
 /// `&[Range<F>]`, a live borrow of the map, which is precisely what the rejoin does not have.
+#[derive(Clone)]
 pub struct ReplaySeedExtractor<const K: usize, const C: usize, const F: usize> {
     seeds: Vec<Seed>,
     ranges: Vec<RangeRecord>,

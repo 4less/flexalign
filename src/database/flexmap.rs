@@ -1,12 +1,35 @@
 use std::{collections::HashMap, fs::File, io::{BufReader, BufWriter}};
 
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
-use flexmap::flexmap::{Flexmap, FlexmapHash, VRangeGetter};
+use flexmap::flexmap::{Flexmap, FlexmapBlob, FlexmapHash, VRangeGetter};
 use savefile::{load, save};
 
 use crate::flexalign::time;
 
 use super::common::{DBPaths, load_references, FlexalignDatabase};
+
+
+/// The full-mode index. `Owned` is a freshly built map still on the heap (build-then-align in one
+/// run); `Mmap` is the memory-mapped blob loaded from disk -- open is near-instant and only the
+/// keys/values actually queried are paged in, so a cold multi-GB index no longer costs a full read.
+/// Both answer `get_vrange`.
+#[derive(Clone)]
+pub enum FlexmapStore<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THRESHOLD: usize> {
+    Owned(Flexmap<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>),
+    Mmap(FlexmapBlob<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>),
+}
+
+impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THRESHOLD: usize>
+    FlexmapStore<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>
+{
+    #[inline]
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::values::VRange<'_>> {
+        match self {
+            FlexmapStore::Owned(f) => f.get_vrange(canonical_kmer),
+            FlexmapStore::Mmap(b) => b.get_vrange(canonical_kmer),
+        }
+    }
+}
 
 
 #[repr(C)]
@@ -20,7 +43,7 @@ pub struct DB<
     const CELLS_PER_BODY: u64,
     const HEADER_THRESHOLD: usize,
 > {
-    flexmap: Flexmap<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>,
+    flexmap: FlexmapStore<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>,
     rid_to_rname: Vec<String>,
     rname_to_rid: HashMap<String, usize>,
     references: Vec<OwnedFastaRecord>,
@@ -73,7 +96,7 @@ impl<
             Err(why) => panic!("Could not load references {}", why),
         };
         Self {
-            flexmap,
+            flexmap: FlexmapStore::Owned(flexmap),
             rid_to_rname,
             rname_to_rid,
             references,
@@ -87,10 +110,14 @@ impl<
         let rname2rid_file = &mut File::open(&paths.reference2id_path).expect("Working ref2id file");
         let references_file = &mut File::open(&paths.reference_path).expect("Working references file");
 
-        let flexmap = Flexmap::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(
-            &paths.index_keys_file(),
-            &paths.index_values_file(),
-        );
+        // Memory-map the single-file blob: open is near-instant and only the queried keys/values
+        // are paged in, instead of reading the whole multi-GB index into the heap.
+        let (duration, flexmap) = time(|| {
+            FlexmapStore::Mmap(
+                FlexmapBlob::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::mmap_from_file(&paths.index_blob_file()),
+            )
+        });
+        eprintln!("Memory-mapping index took {:?}", duration);
 
         // let config = bincode::config::standard();
         // let flexmap = decode_from_reader(map_reader, config).expect("Valid reference database");
@@ -119,8 +146,19 @@ impl<
     
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
         let _ = version;
-        self.flexmap.save(&paths.index_keys_file(), &paths.index_values_file());
-    
+        match &self.flexmap {
+            // A freshly built map: write the single-file blob (mmap-loaded next run) and, for the
+            // shard slicer which still reads the split key array, the two-file form as well.
+            FlexmapStore::Owned(f) => {
+                f.save_blob(&paths.index_blob_file());
+                f.save(&paths.index_keys_file(), &paths.index_values_file());
+            }
+            // Already a blob (e.g. re-saving a loaded index): copy its bytes back out.
+            FlexmapStore::Mmap(b) => {
+                std::fs::write(paths.index_blob_file(), b.backing_bytes())?;
+            }
+        }
+
         let mut file = match File::create(&paths.id2reference_path) {
             Err(why) => panic!(
                 "couldn't open {}: {}",

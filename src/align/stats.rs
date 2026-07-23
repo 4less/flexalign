@@ -20,6 +20,13 @@ pub struct Stats {
     pub alignments_dropped: usize,
     pub retrieved_ranges: usize,
 
+    // --debug diagnostics: for simulated reads whose true reference is encoded in the header,
+    // whether the true anchor is present among all anchors / is the best anchor / the best anchor
+    // is the true one after alignment.
+    pub dbg_checked: usize,
+    pub dbg_true_anchor_present: usize,
+    pub dbg_true_anchor_best: usize,
+
     pub time_get_kmers: Duration,
     pub time_get_minimizer: Duration,
     pub time_get_vranges: Duration,
@@ -105,6 +112,9 @@ impl Merge for Stats {
 
         self.ranges += other.ranges;
         self.retrieved_ranges += other.retrieved_ranges;
+        self.dbg_checked += other.dbg_checked;
+        self.dbg_true_anchor_present += other.dbg_true_anchor_present;
+        self.dbg_true_anchor_best += other.dbg_true_anchor_best;
         self.seeds += other.seeds;
         self.anchors += other.anchors;
         self.alignments += other.alignments;
@@ -202,6 +212,9 @@ impl Default for Stats {
             alignments_partial: 0,
             alignments_dropped: 0,
             retrieved_ranges: 0,
+            dbg_checked: 0,
+            dbg_true_anchor_present: 0,
+            dbg_true_anchor_best: 0,
 
             time_reverse_complement: Duration::default(),
             time_extend_anchors: Duration::default(),

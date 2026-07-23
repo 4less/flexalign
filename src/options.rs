@@ -43,9 +43,16 @@ pub struct Args {
     pub max_range_size: usize,
 
     /// For all occurrences of a key, flexalign only takes the seeds with the highest matching flanking region.
-    /// This limits the number of values to be retrieved in this scenario. 
+    /// This limits the number of values to be retrieved in this scenario.
     #[arg(short = 'f', long = "max-best-flex", default_value_t = 16)]
     pub max_best_flex: usize,
+
+    /// Hard ceiling on flank multiplicity. If more than this many flank headers tie at the best
+    /// (minimum) Hamming distance to the read's flank, the range emits no seeds — a repetitive
+    /// flank context that cannot be localized. Unlike --max-best-flex, this ceiling is NOT relaxed
+    /// by the min-ranges recovery pass, so masked ranges stay masked. 0 disables it (default).
+    #[arg(long = "mask-flank-mult", default_value_t = 0)]
+    pub mask_flank_mult: usize,
 
     /// After the seeds are grouped into anchors, the top x will be extended with the use of hamming distance.
     /// This affects speed negatively but sensitivity and precision positively
@@ -72,9 +79,14 @@ pub struct Args {
     #[arg(long = "log-level", default_value_t = 3)]
     pub log_level: usize,
 
-    /// Output reads that align to the wrong reference sequence. Does not check position of alignment. Requires env variable to be set. 
+    /// Output reads that align to the wrong reference sequence. Does not check position of alignment. Requires env variable to be set.
     #[arg(long = "output-prefix-fp-reads")] // String::default()
     pub output_prefix_fp_reads: Option<String>,
+
+    /// Slice the (built) index into N physical shard files + a manifest, then exit. Enables
+    /// RAM-bounded shard passes: each shard loads only its slice of the keys array.
+    #[arg(long = "shard-slice", value_name = "N")]
+    pub shard_slice: Option<usize>,
 }
 
 #[derive(Debug)]

@@ -53,12 +53,29 @@ pub fn run(args: Args) {
         },
         false => {
             eprintln!("Load index.");
-            let (duration, result) = 
+            let (duration, result) =
                 time(|| DB::load(&db_paths, GLOBAL_VERSION));
             eprintln!("Loading index took: {:?}", duration);
             result
         },
     };
+
+    // Shard-slicing mode: cut the built index into N physical shard files + a manifest, then exit.
+    // The index is already built/loaded above, so `.flex.index.keys` exists for the slicer to read.
+    if let Some(n_shards) = options.args.shard_slice {
+        drop(db); // the slicer re-reads the keys file; free the in-RAM copy first
+        let (duration, manifest) = time(|| {
+            crate::shard::slice::slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, n_shards)
+                .expect("slicing the index")
+        });
+        eprintln!(
+            "Sliced index into {} shard(s) in {:?}: {}",
+            manifest.shards.len(),
+            duration,
+            crate::shard::slice::SliceManifest::path_for(&db_paths)
+        );
+        return;
+    }
 
     // Check if all files exist
     for file in &options.fwd {
