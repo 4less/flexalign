@@ -140,6 +140,12 @@ pub fn process_fastq_wrapper<
         }
 
         eprintln!("{}", stats.as_ref().unwrap());
+        if let Some(path) = &options.args.time_log {
+            let input = fwd.to_str().unwrap_or("input");
+            if let Err(e) = stats.as_ref().unwrap().append_time_log(path, input) {
+                eprintln!("warning: could not write --time-log {}: {}", path, e);
+            }
+        }
         if options.args.debug {
             let s = stats.as_ref().unwrap();
             let pc = |n: usize| if s.dbg_checked > 0 { 100.0 * n as f64 / s.dbg_checked as f64 } else { 0.0 };
@@ -207,7 +213,7 @@ pub fn process_fastq_wrapper_modular<
                 options.args.max_range_size,
                 options.args.min_ranges,
                 options.args.ranges,
-                options.args.mask_flank_mult,
+                options.args.mask_flank_mult, options.args.flank_slack,
             ),
             anchor_extractor: StdAnchorExtractor::new(),
             rec_rev: OwnedFastqRecord::new(),
@@ -247,7 +253,7 @@ pub fn process_fastq_wrapper_modular<
                         options.args.max_range_size,
                         options.args.min_ranges,
                         options.args.ranges,
-                        options.args.mask_flank_mult,
+                        options.args.mask_flank_mult, options.args.flank_slack,
                     ),
                     anchor_extractor: StdAnchorExtractor::new(),
                     rec_rev: OwnedFastqRecord::new(),
@@ -269,14 +275,14 @@ pub fn process_fastq_wrapper_modular<
                         options.args.max_range_size,
                         options.args.min_ranges,
                         options.args.ranges,
-                        options.args.mask_flank_mult,
+                        options.args.mask_flank_mult, options.args.flank_slack,
                     ),
                     seed_extractor_rev: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,
                         options.args.min_ranges,
                         options.args.ranges,
-                        options.args.mask_flank_mult,
+                        options.args.mask_flank_mult, options.args.flank_slack,
                     ),
                     anchor_extractor: StdPairedAnchorExtractor::new(),
                     anchor_extender: StdPairedAnchorExtender::new(db),
@@ -364,6 +370,12 @@ pub fn process_fastq_wrapper_modular<
         }
 
         eprintln!("{}", stats.as_ref().unwrap());
+        if let Some(path) = &options.args.time_log {
+            let input = fwd.to_str().unwrap_or("input");
+            if let Err(e) = stats.as_ref().unwrap().append_time_log(path, input) {
+                eprintln!("warning: could not write --time-log {}: {}", path, e);
+            }
+        }
         if options.args.debug {
             let s = stats.as_ref().unwrap();
             let pc = |n: usize| if s.dbg_checked > 0 { 100.0 * n as f64 / s.dbg_checked as f64 } else { 0.0 };

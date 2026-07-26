@@ -93,6 +93,13 @@ pub fn run(args: Args) {
         }
     }
 
+    // Prepare the --time-log TSV (truncate + header) before the per-input loop appends sections.
+    if let Some(path) = &options.args.time_log {
+        if let Err(e) = crate::align::stats::Stats::init_time_log(path) {
+            eprintln!("warning: could not create --time-log {}: {}", path, e);
+        }
+    }
+
     let (duration, _result) = time(|| process_fastq_wrapper_modular::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db));
     log::info!("Modular: Process reads: {:?}", duration);
 }

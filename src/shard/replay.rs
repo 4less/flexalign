@@ -25,7 +25,13 @@ impl<const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for Rang
     ///
     /// The rejoin does not get to re-decide this. `Manifest::verify_compatible` is what stops a
     /// run from replaying flex=16 evidence while believing it was written at flex=32.
-    fn emit_seeds(&self, _max_best_flex: usize, seeds: &mut Vec<Seed>) -> RangeVerdict {
+    fn emit_seeds(
+        &self,
+        _max_best_flex: usize,
+        _flank_slack: u32,
+        _dist_buf: &mut Vec<u8>,
+        seeds: &mut Vec<Seed>,
+    ) -> RangeVerdict {
         if self.headered {
             for cell in &self.cells {
                 let (value, rpos) = VD::get(*cell);
@@ -56,11 +62,14 @@ pub struct ReplaySeedExtractor<const K: usize, const C: usize, const F: usize> {
     seeds: Vec<Seed>,
     ranges: Vec<RangeRecord>,
     max_ranges: usize,
+    /// Unused scratch to satisfy `walk_ranges` (the replay carries pre-resolved cells and never
+    /// scans flanks); kept as a field so the call allocates nothing.
+    flex_scratch: Vec<u8>,
 }
 
 impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F> {
     pub fn new(max_ranges: usize) -> Self {
-        Self { seeds: Vec::new(), ranges: Vec::new(), max_ranges }
+        Self { seeds: Vec::new(), ranges: Vec::new(), max_ranges, flex_scratch: Vec::new() }
     }
 
     /// Collects one mate's ranges out of the groups the N shard cursors yielded for this read.
@@ -87,8 +96,16 @@ impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F
 
         self.ranges.sort_unstable_by_key(|r| (r.n_positions, r.qpos));
 
-        // usize::MAX: the flex filter lives in the shard pass. See `emit_seeds` above.
-        let _ = walk_ranges::<K, C, F, _>(&self.ranges, usize::MAX, self.max_ranges, &mut self.seeds);
+        // usize::MAX: the flex filter lives in the shard pass. See `emit_seeds` above. flank_slack
+        // is irrelevant here for the same reason (cells are pre-resolved on the wire).
+        let _: (usize, usize, usize) = walk_ranges::<K, C, F, _>(
+            &self.ranges,
+            usize::MAX,
+            0,
+            self.max_ranges,
+            &mut self.flex_scratch,
+            &mut self.seeds,
+        );
 
         let (duration, _) = time(|| {
             glidesort::sort_by_key(&mut self.seeds, |seed: &Seed| (seed.rval, seed.rpos));

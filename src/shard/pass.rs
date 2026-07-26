@@ -118,6 +118,7 @@ pub fn run_shard_pass<
     let mut kmer_extractor = kmer_extractor;
     let mut range_extractor = range_extractor;
     let mut scratch = Stats::default();
+    let mut dist_buf: Vec<u8> = Vec::new();
 
     let worker = move |rec1: &RefFastqRecord,
                        rec2: &RefFastqRecord,
@@ -128,7 +129,7 @@ pub fn run_shard_pass<
             let ranges = range_extractor.generate(kmers, rec, &mut scratch);
 
             let mut records = Vec::new();
-            let est = emit_ranges::<F>(ranges, max_best_flex, max_headered, &mut records);
+            let est = emit_ranges::<F>(ranges, max_best_flex, max_headered, &mut dist_buf, &mut records);
 
             state.emit.headered += est.headered;
             state.emit.headerless += est.headerless;

@@ -87,6 +87,21 @@ pub struct Args {
     /// RAM-bounded shard passes: each shard loads only its slice of the keys array.
     #[arg(long = "shard-slice", value_name = "N")]
     pub shard_slice: Option<usize>,
+
+    /// Write the per-stage timing block as a machine-readable TSV to this path (one row per
+    /// metric: `input\tmetric\tvalue\tunit`), in addition to the human-readable stderr block.
+    /// The file is truncated on open; one section is appended per input file processed.
+    #[arg(long = "time-log", value_name = "FILE")]
+    pub time_log: Option<String>,
+
+    /// Widen flank-seed selection: keep every flank cell whose distance to the read's flank is
+    /// within this many mismatches of the *best* (minimum) distance, not only the exact minimum.
+    /// 0 (default) reproduces the old behaviour (best-distance ties only); 1 also keeps cells one
+    /// mismatch worse, etc. Widening still respects `--max-best-flex` on the resulting set. Applies
+    /// to the unsharded path; the sharded wire format carries a single per-range distance, so the
+    /// sharded path stays at 0.
+    #[arg(long = "flank-slack", value_name = "N", default_value_t = 0)]
+    pub flank_slack: u32,
 }
 
 #[derive(Debug)]

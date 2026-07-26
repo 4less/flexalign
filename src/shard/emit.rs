@@ -16,12 +16,13 @@
 //! on every read touching a repetitive k-mer, to be discarded unread except on the rare read that
 //! triggers recovery.
 //!
-//! The min-distance resolution is *not* reimplemented here -- it comes from `Range::min_flank_dist`
-//! and `Range::cells_at_dist`, the same helpers the unsharded walk uses, so both modes select the
-//! same cells by construction (hurdle 11).
+//! The min-distance resolution is *not* reimplemented here -- it comes from `Range::resolve_flex`,
+//! the same one-pass helper the unsharded walk uses, so both modes select the same cells by
+//! construction (hurdle 11). The wire carries one distance per range, so the shard always resolves
+//! at `flank_slack = 0` (the widened window is an unsharded-only option).
 
 use crate::align::process::range_extractor::Range;
-use crate::align::process::seed_extractor::RangeVerdict;
+use crate::align::process::seed_extractor::{RangeVerdict, MAX_KEPT_TIES};
 
 use super::record::RangeRecord;
 
@@ -60,9 +61,11 @@ pub fn emit_ranges<const F: usize>(
     ranges: &[Range<F>],
     max_best_flex: usize,
     max_headered: usize,
+    dist_buf: &mut Vec<u8>,
     out: &mut Vec<RangeRecord>,
 ) -> EmitStats {
     let mut stats = EmitStats::default();
+    let mut idx = [0u32; MAX_KEPT_TIES];
 
     for range in ranges {
         match range.vrange.header {
@@ -72,18 +75,22 @@ pub fn emit_ranges<const F: usize>(
                     "a headered block has size > HEADER_THRESHOLD, so it always has a header"
                 );
 
-                let (min_dist, count) = range.min_flank_dist(headers);
-                if count > max_best_flex {
-                    stats.discarded += 1;
-                    continue;
-                }
+                // flank_slack = 0: the sharded record stores one distance per range.
+                let (min_dist, count) = match range.resolve_flex(headers, max_best_flex, 0, dist_buf, &mut idx) {
+                    None => {
+                        stats.discarded += 1;
+                        continue;
+                    }
+                    Some(mc) => mc,
+                };
                 if stats.headered >= max_headered {
                     stats.capped += 1;
                     continue;
                 }
 
                 debug_assert!(min_dist <= F as u32, "dist {} exceeds {} flank bases", min_dist, F);
-                let cells: Vec<u64> = range.cells_at_dist(headers, min_dist).collect();
+                let cells: Vec<u64> =
+                    idx[..count].iter().map(|&i| range.vrange.positions[i as usize].0).collect();
 
                 stats.headered += 1;
                 stats.cells += cells.len();

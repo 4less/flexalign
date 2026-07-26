@@ -129,7 +129,7 @@ mod tests {
         let db = MockDb::new();
         let mut kmer = StdKmerExtractor::<K, C, ClosedSyncmer<C, S, L>>::default();
         let mut range = StdRangeExtractor::<K, C, F, MockDb>::new(&db);
-        let mut seed = StdSeedExtractor::<K, C, F>::new(32, 1 << 20, 0, MAX_RANGES, 0);
+        let mut seed = StdSeedExtractor::<K, C, F>::new(32, 1 << 20, 0, MAX_RANGES, 0, 0);
         let mut scratch = Stats::default();
 
         let collected = read_fastq_paired_end_state_par_ids(

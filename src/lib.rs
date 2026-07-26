@@ -15,7 +15,8 @@ pub mod align;
 pub mod flexalign;
 pub mod options;
 pub mod io;
-pub mod misc;
+// `misc` was a KHashEntry (de)serialization micro-benchmark; flexmap dropped the hash key type.
+// Dead and uncompiled — retained on disk. // pub mod misc;
 pub mod utils;
 pub mod distance;
 pub mod shard;

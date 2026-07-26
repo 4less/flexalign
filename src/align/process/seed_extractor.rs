@@ -31,9 +31,25 @@ pub enum RangeVerdict {
 /// ProjectShard.md hurdle 11: two copies of this walk would drift the first time anyone tuned the
 /// heuristic, and since sharded output is not bit-compared against unsharded (§4 relaxes
 /// exactness), nothing would catch it. So it exists once.
+/// Upper bound on the flank ties a *surviving* range can carry: the recovery pass relaxes
+/// `max_best_flex` to 128, and nothing above the active `max_best_flex` is ever kept, so a
+/// stack buffer of this size holds every kept range's survivor indices without allocating.
+pub const MAX_KEPT_TIES: usize = 128;
+
 pub trait SeedRange<const K: usize, const C: usize, const F: usize> {
     /// Pushes this range's seeds onto `seeds` and reports what it did.
-    fn emit_seeds(&self, max_best_flex: usize, seeds: &mut Vec<Seed>) -> RangeVerdict;
+    ///
+    /// `flank_slack` widens the kept flank set to every cell within that many mismatches of the
+    /// best (minimum) distance (0 = best-distance ties only). `dist_buf` is a reused scratch the
+    /// header-scanning implementation caches per-flank distances in; implementations that carry
+    /// pre-resolved cells ignore both.
+    fn emit_seeds(
+        &self,
+        max_best_flex: usize,
+        flank_slack: u32,
+        dist_buf: &mut Vec<u8>,
+        seeds: &mut Vec<Seed>,
+    ) -> RangeVerdict;
 }
 
 /// Walks ranges in order, emitting seeds until the `--ranges` budget is spent.
@@ -43,21 +59,29 @@ pub trait SeedRange<const K: usize, const C: usize, const F: usize> {
 /// after merging shards (§3.3). The cutoff is a **global rank**, so this order is load-bearing --
 /// it is the one real cross-key dependency in the design (§5).
 ///
-/// Returns `(retrieved, discarded)`.
+/// Returns `(retrieved, discarded, headers_scanned)`.
 pub fn walk_ranges<const K: usize, const C: usize, const F: usize, R>(
     ranges: &[R],
     max_best_flex: usize,
+    flank_slack: u32,
     max_ranges: usize,
+    dist_buf: &mut Vec<u8>,
     seeds: &mut Vec<Seed>,
-) -> (usize, usize)
+) -> (usize, usize, usize)
 where
     R: SeedRange<K, C, F>,
 {
     let mut retrieved_matches = 0;
     let mut discarded_max_flex_count = 0;
+    let mut headers_scanned = 0usize;
 
     for range in ranges {
-        match range.emit_seeds(max_best_flex, seeds) {
+        let verdict = range.emit_seeds(max_best_flex, flank_slack, dist_buf, seeds);
+        // `resolve_flex` leaves one cached distance per scanned flank in `dist_buf`, so its length
+        // is exactly this range's header-scan count (0 for headerless ranges and for the replay,
+        // which pre-resolves cells and never touches `dist_buf`).
+        headers_scanned += dist_buf.len();
+        match verdict {
             RangeVerdict::Discarded => {
                 discarded_max_flex_count += 1;
                 // Note: skips the cutoff check below, matching the original `continue`.
@@ -73,62 +97,94 @@ where
         }
     }
 
-    (retrieved_matches, discarded_max_flex_count)
+    (retrieved_matches, discarded_max_flex_count, headers_scanned)
 }
 
 impl<'a, const F: usize> Range<'a, F> {
-    /// The distance to the closest flank header, and how many headers tie at it.
+    /// One-pass flex resolution: computes each flank distance **exactly once** (cached into
+    /// `dist_buf`), finds the minimum, then selects the header indices whose distance is within
+    /// `flank_slack` of it into `out[..n]`.
     ///
-    /// `count` -- not `positions.len()` -- is what the flex filter tests: a block can hold many
-    /// positions while only a few flanks actually match the read.
-    pub fn min_flank_dist(&self, headers: &[HeaderSeq]) -> (u32, usize) {
+    /// Returns `Some((min_dist, n))`, or `None` if the surviving set exceeds `max_best_flex` (the
+    /// range is discarded -- and, crucially, its `positions` are never read, so a repetitive range
+    /// costs no access to the cold blob pages the positions live in). After the call `dist_buf[i]`
+    /// holds header `i`'s distance, so the caller tags each surviving seed with its *own* distance
+    /// (which matters: `Seed::from_flexmer` shifts and lengths the seed by it).
+    ///
+    /// Replaces the old two-pass `min_flank_dist` + `cells_at_dist` (which walked the flanks twice
+    /// and recomputed every distance). Shared by the unsharded walk and the shard emitter, so both
+    /// still select identical cells by construction (hurdle 11). `out.len()` must be
+    /// >= `max_best_flex`; [`MAX_KEPT_TIES`] is the standard size.
+    pub fn resolve_flex(
+        &self,
+        headers: &[HeaderSeq],
+        max_best_flex: usize,
+        flank_slack: u32,
+        dist_buf: &mut Vec<u8>,
+        out: &mut [u32],
+    ) -> Option<(u32, usize)> {
+        debug_assert!(max_best_flex <= out.len(), "out[] must hold a full kept set");
+        dist_buf.clear();
+        if headers.is_empty() {
+            return Some((0, 0));
+        }
+        dist_buf.reserve(headers.len());
+        let flex = self.fmer.0 as u32;
         let mut min_dist = u32::MAX;
-        let mut count = 0;
         for header in headers {
-            let dist = header.dist(self.fmer.0 as u32);
-            if dist < min_dist {
-                min_dist = dist;
-                count = 0;
-            }
-            if dist == min_dist {
-                count += 1
+            let d = header.dist(flex);
+            dist_buf.push(d as u8); // dist is a hamming distance over F<=16 flank bases, fits u8
+            if d < min_dist {
+                min_dist = d;
             }
         }
-        (min_dist, count)
-    }
-
-    /// The cells whose flank header ties at `min_dist`, paired with that header's index.
-    ///
-    /// Shared with the shard emitter, which writes exactly these cells to the wire instead of
-    /// turning them into seeds -- so the two modes select the same cells by construction.
-    pub fn cells_at_dist<'r>(
-        &'r self,
-        headers: &'r [HeaderSeq],
-        min_dist: u32,
-    ) -> impl Iterator<Item = u64> + 'r {
-        headers
-            .iter()
-            .enumerate()
-            .filter(move |(_, header)| header.dist(self.fmer.0 as u32) == min_dist)
-            .map(move |(index, _)| self.vrange.positions[index].0)
+        let threshold = min_dist + flank_slack;
+        let mut count = 0usize;
+        let mut stored = 0usize;
+        for (i, &d) in dist_buf.iter().enumerate() {
+            if d as u32 <= threshold {
+                count += 1;
+                if stored < out.len() {
+                    out[stored] = i as u32;
+                    stored += 1;
+                }
+            }
+        }
+        if count > max_best_flex {
+            None
+        } else {
+            debug_assert_eq!(stored, count, "a kept set must fit entirely in out[]");
+            Some((min_dist, count))
+        }
     }
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for Range<'a, F> {
-    fn emit_seeds(&self, max_best_flex: usize, seeds: &mut Vec<Seed>) -> RangeVerdict {
+    fn emit_seeds(
+        &self,
+        max_best_flex: usize,
+        flank_slack: u32,
+        dist_buf: &mut Vec<u8>,
+        seeds: &mut Vec<Seed>,
+    ) -> RangeVerdict {
         match self.vrange.header {
             Some(headers) => {
-                let (min_dist, count) = self.min_flank_dist(headers);
-                if count > max_best_flex {
-                    return RangeVerdict::Discarded;
+                let mut idx = [0u32; MAX_KEPT_TIES];
+                match self.resolve_flex(headers, max_best_flex, flank_slack, dist_buf, &mut idx) {
+                    None => RangeVerdict::Discarded,
+                    Some((_min_dist, n)) => {
+                        for &i in &idx[..n] {
+                            let (value, rpos) = VD::get(self.vrange.positions[i as usize].0);
+                            // Each seed carries its own flank distance, not the range minimum.
+                            let dist = dist_buf[i as usize] as u32;
+                            seeds.push(Seed::from_flexmer::<K, C, F>(self.qpos, rpos, value, dist));
+                        }
+                        RangeVerdict::Headered
+                    }
                 }
-                for cell in self.cells_at_dist(headers, min_dist) {
-                    let (value, rpos) = VD::get(cell);
-                    seeds.push(Seed::from_flexmer::<K, C, F>(self.qpos, rpos, value, min_dist));
-                }
-                RangeVerdict::Headered
             }
             None => {
+                dist_buf.clear(); // no flanks scanned; keep dist_buf.len() an honest scan count
                 for cell in self.vrange.positions {
                     let (value, rpos) = VD::get(cell.0);
                     seeds.push(Seed::from_coremer::<K, C, F>(self.qpos, rpos, value));
@@ -150,10 +206,15 @@ pub struct StdSeedExtractor<const K: usize, const C: usize, const F: usize> {
     /// Applied on top of `max_best_flex` in every pass, so — unlike `max_best_flex` — the
     /// recovery pass below cannot relax it.
     pub mask_flank_mult: usize,
+    /// `--flank-slack`: keep flank cells within this many mismatches of the best distance.
+    pub flank_slack: u32,
+    /// Reused per-flank distance scratch for the single-pass flex resolution (avoids reallocating
+    /// per range/read).
+    flex_scratch: Vec<u8>,
 }
 
 impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
-    pub fn new(max_best_flex: usize, max_range_size: usize, min_ranges: usize, max_ranges: usize, mask_flank_mult: usize) -> Self {
+    pub fn new(max_best_flex: usize, max_range_size: usize, min_ranges: usize, max_ranges: usize, mask_flank_mult: usize, flank_slack: u32) -> Self {
         Self {
             seeds: Vec::new(),
             max_best_flex,
@@ -161,6 +222,8 @@ impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
             min_ranges,
             max_ranges,
             mask_flank_mult,
+            flank_slack,
+            flex_scratch: Vec::new(),
         }
     }
 
@@ -176,13 +239,16 @@ impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
         _max_ranges: usize,
         stats: &mut Stats) -> (usize, usize) {
 
-        let (retrieved_matches, discarded_max_flex_count) = walk_ranges::<K, C, F, _>(
+        let (retrieved_matches, discarded_max_flex_count, headers_scanned) = walk_ranges::<K, C, F, _>(
             ranges,
             max_best_flex,
+            self.flank_slack,
             self.max_ranges,
+            &mut self.flex_scratch,
             &mut self.seeds,
         );
         stats.retrieved_ranges += retrieved_matches;
+        stats.header_elements += headers_scanned;
 
         (retrieved_matches, discarded_max_flex_count)
     }

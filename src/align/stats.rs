@@ -19,6 +19,10 @@ pub struct Stats {
     pub alignments_partial: usize,
     pub alignments_dropped: usize,
     pub retrieved_ranges: usize,
+    /// Total flank-header elements scanned during seed extraction (sum of N over every headered or
+    /// discarded range walked, including the recovery pass). Lets us report seed-extraction time
+    /// per range and per header element.
+    pub header_elements: usize,
 
     // --debug diagnostics: for simulated reads whose true reference is encoded in the header,
     // whether the true anchor is present among all anchors / is the best anchor / the best anchor
@@ -61,6 +65,74 @@ impl<'a> EDisplay for Chart<'a> {
 }
 
 impl Stats {
+    /// Per-thread divisor used by the human-readable `Display` (durations are summed across threads
+    /// during `Merge`, so the reported per-stage time is the sum divided by the thread count).
+    fn thread_divisor(&self) -> u32 {
+        (self.threads as u32).max(1)
+    }
+
+    /// Truncate `path` and write the `--time-log` TSV header. Call once before processing; each
+    /// input then appends a section via [`append_time_log`](Self::append_time_log).
+    pub fn init_time_log(path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        writeln!(f, "input\tmetric\tvalue\tunit")
+    }
+
+    /// Append this input's timing block to a TSV `--time-log` file as tidy rows
+    /// (`input\tmetric\tvalue\tunit`), so a multi-input run yields one file with one section per
+    /// input. Times are the same per-thread-averaged seconds shown in the stderr block; counts and
+    /// per-read rates are also emitted.
+    pub fn append_time_log(&self, path: &str, input: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let td = self.thread_divisor();
+        let secs = |d: Duration| (d / td).as_secs_f64();
+        let reads = self.reads_processed.max(1) as f64;
+
+        // (metric, value, unit). Order mirrors the stderr block, then counts, then per-read rates.
+        let rows: Vec<(&str, f64, &str)> = vec![
+            ("reverse_complement", secs(self.time_reverse_complement), "s"),
+            ("kmers",              secs(self.time_get_kmers), "s"),
+            ("minimizers",         secs(self.time_get_minimizer), "s"),
+            ("ranges",             secs(self.time_get_ranges), "s"),
+            ("vranges",            secs(self.time_get_vranges), "s"),
+            ("range_sorting",      secs(self.time_range_sorting), "s"),
+            ("range_headers",      secs(self.time_range_header), "s"),
+            ("seed_sorting",       secs(self.time_seed_sorting), "s"),
+            ("anchors",            secs(self.time_get_anchors), "s"),
+            ("anchor_sorting",     secs(self.time_anchor_sorting), "s"),
+            ("extend_anchors",     secs(self.time_extend_anchors), "s"),
+            ("offsets",            secs(self.time_offset), "s"),
+            ("checking_anchors",   secs(self.time_checking_anchors), "s"),
+            ("alignment",          secs(self.time_alignment), "s"),
+            ("header_elements",         self.header_elements as f64, "count"),
+            // Total (thread-summed) seed-extraction time over total counts -- CPU time per unit.
+            ("seedext_s_per_range",     self.time_range_header.as_secs_f64() / self.ranges.max(1) as f64, "s"),
+            ("seedext_s_per_header",    self.time_range_header.as_secs_f64() / self.header_elements.max(1) as f64, "s"),
+            ("reads",                   self.reads_processed as f64, "count"),
+            ("alignments",              self.alignments as f64, "count"),
+            ("alignments_successful",   self.alignments_successful as f64, "count"),
+            ("alignments_partial",      self.alignments_partial as f64, "count"),
+            ("alignments_dropped",      self.alignments_dropped as f64, "count"),
+            ("threads",                 self.threads as f64, "count"),
+            ("minimizers_per_read",     self.minimizer as f64 / reads, "rate"),
+            ("ranges_per_read",         self.ranges as f64 / reads, "rate"),
+            ("retrieved_ranges_per_read", self.retrieved_ranges as f64 / reads, "rate"),
+            ("seeds_per_read",          self.seeds as f64 / reads, "rate"),
+            ("anchors_per_read",        self.anchors as f64 / reads, "rate"),
+        ];
+
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        for (metric, value, unit) in rows {
+            if unit == "s" || unit == "rate" {
+                writeln!(f, "{input}\t{metric}\t{value:.9}\t{unit}")?;
+            } else {
+                writeln!(f, "{input}\t{metric}\t{value:.0}\t{unit}")?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn plot_mapq(&self) {
         if self.gold_std_evaluation.is_none() { return };
         
@@ -112,6 +184,7 @@ impl Merge for Stats {
 
         self.ranges += other.ranges;
         self.retrieved_ranges += other.retrieved_ranges;
+        self.header_elements += other.header_elements;
         self.dbg_checked += other.dbg_checked;
         self.dbg_true_anchor_present += other.dbg_true_anchor_present;
         self.dbg_true_anchor_best += other.dbg_true_anchor_best;
@@ -140,6 +213,9 @@ impl Display for Stats {
             ....Time for getting vranges................{:?}\n\
             Time for sorting ranges.....................{:?}\n\
             Time for getting range headers..............{:?}\n\
+            ....Header elements scanned.................{}\n\
+            ....Seed-extraction time per range..........{:?}\n\
+            ....Seed-extraction time per header elem....{:?}\n\
             Time for sorting seeds......................{:?}\n\
             Time for getting anchors....................{:?}\n\
             Time for sorting anchors....................{:?}\n\
@@ -169,6 +245,10 @@ impl Display for Stats {
             self.time_get_vranges / self.threads as u32,
             self.time_range_sorting / self.threads as u32,
             self.time_range_header / self.threads as u32,
+            self.header_elements,
+            // Per-range / per-header: total (thread-summed) seed-extraction time over total counts.
+            self.time_range_header / (self.ranges.min(u32::MAX as usize).max(1) as u32),
+            self.time_range_header / (self.header_elements.min(u32::MAX as usize).max(1) as u32),
             self.time_seed_sorting / self.threads as u32,
             self.time_get_anchors / self.threads as u32,
             self.time_anchor_sorting / self.threads as u32,
@@ -212,6 +292,7 @@ impl Default for Stats {
             alignments_partial: 0,
             alignments_dropped: 0,
             retrieved_ranges: 0,
+            header_elements: 0,
             dbg_checked: 0,
             dbg_true_anchor_present: 0,
             dbg_true_anchor_best: 0,
