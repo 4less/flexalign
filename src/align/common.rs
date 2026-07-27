@@ -10,6 +10,39 @@ pub enum Status {
 }
 
 
+/// Alignment penalties, in WFA2's *cost* space -- costs are minimised and a match always costs 0
+/// (the wavefront recurrence requires it), so bwa's scoring scheme cannot be passed through as-is.
+///
+/// These are bwa-mem's defaults -- match `+1`, mismatch `-4`, gap open `-6`, gap extend `-1` -- put
+/// through the standard score-to-cost transform. For an alignment with `M` matches, `X` mismatches,
+/// `G` gaps spanning `I+D` bases, bwa maximises
+///
+/// ```text
+/// S = a*M - b*X - G*o - e*(I+D)
+/// ```
+///
+/// and since `2M + 2X + I + D = |query| + |reference|`, substituting `M` out gives
+///
+/// ```text
+/// S = a*(|query|+|reference|)/2 - (a+b)*X - o*G - (a/2 + e)*(I+D)
+/// ```
+///
+/// Maximising that is the same as minimising `2(a+b)*X + 2o*G + (a+2e)*(I+D)`; the leading term is a
+/// constant for a fixed pair of sequences and drops out, and the factor 2 keeps the values integral
+/// (`a + 2e` is odd). So the ranking of alignments here is identical to bwa-mem's, on a scale
+/// stretched by 2.
+pub mod penalties {
+    /// Always 0 -- WFA is a cost model, not a score model.
+    pub const MATCH: i32 = 0;
+    /// `2 * (a + b)` = `2 * (1 + 4)`.
+    pub const MISMATCH: i32 = 10;
+    /// `2 * o` = `2 * 6`.
+    pub const GAP_OPENING: i32 = 12;
+    /// `a + 2 * e` = `1 + 2 * 1`.
+    pub const GAP_EXTENSION: i32 = 3;
+}
+
+
 pub trait Align {
     fn align(&mut self, q: &[u8], r: &[u8]) -> (i32, &Cigar, Status);
     fn align_into(&mut self, q: &[u8], r: &[u8], cigar: &mut Cigar) -> (i32, Status);
@@ -226,15 +259,35 @@ impl StdPairedAnchorMAPQ {
     }
 }
 impl PairedAnchorMAPQ for StdPairedAnchorMAPQ {
+    /// Phred-style pseudo-MAPQ in the SAM range `[0, 60]`.
+    ///
+    /// Confidence is the *relative* margin between the best and second-best anchor pair --
+    /// `1 - score2/score1` -- rather than a raw score gap. The relative form is scale-invariant
+    /// (independent of read length / penalties), so it spreads reads smoothly across the range
+    /// instead of piling into the bimodal clusters a raw gap produces, and the explicit clamp means
+    /// it can never wrap a `u8` (the old `(gap) as u8` folded any gap > 255 back down to a small
+    /// value, scrambling the most confident reads).
+    ///
+    /// Requires `anchors` sorted best-first. A read with no competing pair has no margin evidence at
+    /// all -- neither a decisive win nor a tie -- so it is given a fixed *middle* confidence rather
+    /// than the maximum: on a marker DB a lone hit is empirically less reliable than a decisive
+    /// margin over a real competitor, so it must not sit at the top of the MAPQ sweep.
     fn anchor_mapq(anchors: &mut [AnchorPair]) -> u8 {
         assert!(!anchors.is_empty());
-        if anchors.len() <= 1 { return 0 };
 
-        // Requires anchors being sorted from best to worst anchor
-        let best = &anchors[0];
-        let second = &anchors[1];
+        const MAPQ_MAX: f64 = 60.0;
+        const MAPQ_UNIQUE: u8 = 30;
 
-        (Self::score_paired_ext(&best) - Self::score_paired_ext(&second)) as u8
+        let s1 = Self::score_paired(&anchors[0]).max(0);
+        if s1 == 0 {
+            return 0;
+        }
+        if anchors.len() <= 1 {
+            return MAPQ_UNIQUE;
+        }
+        let s2 = Self::score_paired(&anchors[1]).max(0);
+        let rel_margin = 1.0 - (s2 as f64 / s1 as f64); // in [0, 1]
+        (MAPQ_MAX * rel_margin).round().clamp(0.0, MAPQ_MAX) as u8
     }
 }
 
@@ -294,16 +347,51 @@ impl<A,B> Or<A,B> {
     );
  }
 
+ /// SAM record sink, shaped like [`PAFOutput`] so the two can sit side by side in an [`Or`].
+ ///
+ /// Only mapped records are written -- see `--min-ani`. `reference_start` is 0-based (the
+ /// implementation converts to SAM's 1-based POS), and `cigar` carries the internal
+ /// WFA-convention CIGAR, which the implementation translates and run-length encodes.
  pub trait SAMOutput {
-    fn write();
+    /// Emits `@HD` and one `@SQ` per reference. Must be called once, before any record.
+    fn write_header(&mut self, references: &[(&str, usize)]);
+
+    fn write(
+        &mut self,
+        query_name: &str,
+        flag: u16,
+        reference_name: &str,
+        reference_start: usize,
+        mapping_quality: u8,
+        cigar: &Cigar,
+        mate_reference_name: Option<&str>,
+        mate_reference_start: usize,
+        template_length: i64,
+        seq: &[u8],
+        qual: &[u8],
+    );
  }
 
  #[derive(Clone)]
  pub struct NoSAMOutput;
 
  impl SAMOutput for NoSAMOutput {
-    fn write() {
-        todo!()
+    fn write_header(&mut self, _references: &[(&str, usize)]) {}
+
+    fn write(
+        &mut self,
+        _query_name: &str,
+        _flag: u16,
+        _reference_name: &str,
+        _reference_start: usize,
+        _mapping_quality: u8,
+        _cigar: &Cigar,
+        _mate_reference_name: Option<&str>,
+        _mate_reference_start: usize,
+        _template_length: i64,
+        _seq: &[u8],
+        _qual: &[u8],
+    ) {
     }
  }
  

@@ -57,6 +57,24 @@ impl<
     const L: usize,
     const CELLS_PER_BODY: u64,
     const HEADER_THRESHOLD: usize,
+> DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> {
+    /// Whether an existing on-disk index blob can be loaded by this build with these const params.
+    /// `false` (e.g. after a flexmap key-format change bumped the blob version, or a C/F/params
+    /// change) means the index must be rebuilt rather than loaded silently against a mismatched
+    /// format -- callers OR this into their build-vs-load decision. Cheap: reads only the header.
+    pub fn index_compatible(paths: &DBPaths) -> bool {
+        FlexmapBlob::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::is_compatible(&paths.index_blob_file())
+    }
+}
+
+impl<
+    const K: usize,
+    const C: usize,
+    const F: usize,
+    const S: usize,
+    const L: usize,
+    const CELLS_PER_BODY: u64,
+    const HEADER_THRESHOLD: usize,
 >  FlexalignDatabase for DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> {
     fn get_rid(&self, reference: &str) -> Option<&usize> {
         self.rname_to_rid.get(reference)

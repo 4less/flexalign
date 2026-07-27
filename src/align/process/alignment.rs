@@ -1,7 +1,7 @@
 
 use libwfa2::affine_wavefront::{AffineWavefronts, AlignmentSpan, AlignmentStatus};
 
-use crate::align::{common::{Align, Heuristic, Status}, sam::Cigar};
+use crate::align::{common::{penalties, Align, Heuristic, Status}, sam::Cigar};
 
 
 // pub struct FastAlignment {
@@ -22,11 +22,54 @@ pub fn ani_abort_score(min_ani: f64, mismatch: i32, overlap_length: i32) -> i32 
 }
 
 
+/// The approximate ANI an alignment cost implies -- the inverse of [`ani_abort_score`].
+///
+/// `score` is the aligner's score as stored on an anchor, i.e. negative or zero; `length` is the
+/// query length the alignment covers. The approximation prices gap cost as though it were mismatch
+/// cost, so an indel-rich alignment reads lower than its true identity. That is the same
+/// simplification `ani_abort_score` makes in the other direction, which is what keeps the abort
+/// threshold and the output filter consistent: an alignment that survives the abort budget derived
+/// from `min_ani` also passes `approx_ani(..) >= min_ani`.
+///
+/// Returns 0.0 for a zero-length query and clamps at 0.0, so a dropped alignment (whose score is
+/// hugely negative) reports as 0.0 identity rather than a negative number.
+pub fn approx_ani(score: i32, mismatch: i32, length: usize) -> f64 {
+    if length == 0 || mismatch == 0 {
+        return 0.0;
+    }
+    let cost = (-score) as f64;
+    (1.0 - cost / (length as f64 * mismatch as f64)).max(0.0)
+}
+
+
+/// The approximate ANI implied by a Hamming distance over `length` query bases -- the fallback for
+/// an anchor that never went through gapped alignment (so has no cost to invert).
+pub fn hamming_ani(hamming: u64, length: usize) -> f64 {
+    if length == 0 {
+        return 0.0;
+    }
+    1.0 - (hamming as f64 / length as f64)
+}
+
+
 unsafe impl Send for LIBWFA2Alignment{}
 
 impl Clone for LIBWFA2Alignment {
     fn clone(&self) -> Self {
-        let mut new_aligner = AffineWavefronts::default();
+        // Penalties must be carried over explicitly. `AffineWavefronts::default()` comes up with
+        // WFA2-lib's built-in scheme (mismatch 4, gap 6/2), *not* ours -- and since the whole
+        // pipeline struct is cloned once per worker thread, a clone that forgets them leaves every
+        // thread but one scoring on a different scale than `align_middle`, which charges
+        // `penalties::MISMATCH` in Rust. That produced per-thread-varying scores for identical
+        // alignments. It went unnoticed while the configured penalties happened to equal WFA2-lib's
+        // defaults; it stops being invisible the moment they differ.
+        let p = unsafe { *self.aligner.aligner() }.penalties;
+        let mut new_aligner = AffineWavefronts::with_penalties(
+            p.match_,
+            p.mismatch,
+            p.gap_opening1,
+            p.gap_extension1,
+        );
 
         new_aligner.set_alignment_scope(self.aligner.get_alignment_scope());
         new_aligner.set_alignment_span(self.aligner.get_alignment_span());
@@ -131,7 +174,12 @@ impl Heuristic for LIBWFA2Alignment {
 
 impl Default for LIBWFA2Alignment {
     fn default() -> Self {
-        let mut aligner = AffineWavefronts::with_penalties(0, 4, 6, 2);
+        let mut aligner = AffineWavefronts::with_penalties(
+            penalties::MATCH,
+            penalties::MISMATCH,
+            penalties::GAP_OPENING,
+            penalties::GAP_EXTENSION,
+        );
         // aligner.set_heuristic(&HeuristicStrategy::XDrop { xdrop: std::i32::MIN, score_steps: 2 });
         // aligner.set_heuristic(&HeuristicStrategy::BandedStatic { band_min_k: -1, band_max_k: 1 });
         aligner.set_alignment_scope(libwfa2::affine_wavefront::AlignmentScope::Alignment);
@@ -143,5 +191,63 @@ impl Default for LIBWFA2Alignment {
             aligner: aligner,
             cigar: Cigar(Vec::new()),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::common::penalties;
+
+    /// The penalties the pipeline scores with must be the penalties the aligner actually charges.
+    /// `libwfa2` 0.1.1 builds its aligner from WFA2-lib's compiled-in defaults and then writes into
+    /// the derived `penalties` struct, which is not necessarily what the alignment kernel reads --
+    /// so this asserts on observed cost, not on the field we set.
+    #[test]
+    fn aligner_charges_the_configured_mismatch_penalty() {
+        let mut a = LIBWFA2Alignment::default();
+        //                    v one mismatch, nothing else
+        let q = b"ACGTACGTACGTACGT";
+        let r = b"ACGTACGTTCGTACGT";
+        let (score, _cigar, _status) = a.align(q, r);
+        assert_eq!(
+            -score,
+            penalties::MISMATCH,
+            "one mismatch should cost exactly penalties::MISMATCH"
+        );
+    }
+
+    /// Regression: `clone()` used to start from `AffineWavefronts::default()` and drop the
+    /// penalties, so worker threads (which each get a clone of the pipeline) scored mismatches at
+    /// WFA2-lib's built-in 4 while the original scored at ours. Identical alignments then got
+    /// different scores depending on which thread happened to handle the read.
+    #[test]
+    fn clone_preserves_penalties() {
+        let original = LIBWFA2Alignment::default();
+        let mut cloned = original.clone();
+
+        let q = b"ACGTACGTACGTACGT";
+        let r = b"ACGTACGTTCGTACGT";
+        let (score, _cigar, _status) = cloned.align(q, r);
+        assert_eq!(-score, penalties::MISMATCH, "a cloned aligner must charge the same mismatch penalty");
+
+        let mut twice_cloned = cloned.clone();
+        let (score, _cigar, _status) = twice_cloned.align(q, r);
+        assert_eq!(-score, penalties::MISMATCH, "penalties must survive repeated cloning");
+    }
+
+    #[test]
+    fn aligner_charges_the_configured_gap_penalty() {
+        let mut a = LIBWFA2Alignment::default();
+        // One single-base deletion.
+        let q = b"ACGTACGTACGTACGT";
+        let r = b"ACGTACGTCGTACGT";
+        let (score, _cigar, _status) = a.align(q, r);
+        assert_eq!(
+            -score,
+            penalties::GAP_OPENING + penalties::GAP_EXTENSION,
+            "a 1bp gap should cost gap_opening + gap_extension"
+        );
     }
 }

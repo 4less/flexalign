@@ -10,7 +10,7 @@ use crate::{
         common::{NoSAMOutput, Or},
         modular_workflow::{Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::{StdPAFOutput, StdSAMOutput}, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
+            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
         }, 
         stats::Stats, 
         workflow
@@ -197,10 +197,7 @@ pub fn process_fastq_wrapper_modular<
         };
 
         // let output: StdPAFOutput = StdPAFOutput::new(stdout_buffer);
-        let output: Or<StdPAFOutput, NoSAMOutput> = Or::<StdPAFOutput, NoSAMOutput> {
-            a: Some(StdPAFOutput::new(out_buffer)),
-            b: None,
-        };
+        let output = make_output(options, out_buffer, db);
 
 
         let mut modular_fwd = Modular {
@@ -346,6 +343,12 @@ pub fn process_fastq_wrapper_modular<
             },
             // Single-end read
             None => {
+                // The single-end path runs `Modular`, which stops at anchors and never aligns, so
+                // it has no CIGAR to put in a SAM record. Fail loudly rather than write a header
+                // with no records under it.
+                if options.args.sam {
+                    panic!("--sam is only supported for paired-end input; the single-end pipeline does not run gapped alignment");
+                }
 
                 let worker = move |rec: &RefFastqRecord, stats: &mut Stats| {
                     modular_fwd.run(rec, stats);

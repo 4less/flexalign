@@ -16,14 +16,13 @@ use bioreader::parallel::fastq::read_fastq_paired_end_state_par_ids;
 use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 
-use crate::align::common::{NoSAMOutput, Or};
 
 use crate::align::modular_workflow::ModularPE;
 use crate::align::process::alignment::LIBWFA2Alignment;
 use crate::align::process::anchor_extender::StdPairedAnchorExtender;
 use crate::align::process::anchor_extractor::StdPairedAnchorExtractor;
 use crate::align::process::kmer_extractor::StdKmerExtractor;
-use crate::align::process::output::StdPAFOutput;
+use crate::align::process::output::make_output;
 use crate::align::process::range_extractor::StdRangeExtractor;
 use crate::align::process::seed_extractor::StdSeedExtractor;
 use crate::align::stats::Stats;
@@ -56,8 +55,7 @@ pub fn run_rejoin_align<
     buffer_size: usize,
     threads: u32,
 ) -> Stats {
-    let output: Or<StdPAFOutput, NoSAMOutput> =
-        Or { a: Some(StdPAFOutput::new(out_buffer)), b: None };
+    let output = make_output(options, out_buffer, db);
 
     // The front-half stages are unused by `align_from_seeds` but are structural fields of
     // `ModularPE`; constructing them is cheap. The align half uses the anchor extractor/extender,

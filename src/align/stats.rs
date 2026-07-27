@@ -31,6 +31,13 @@ pub struct Stats {
     pub dbg_true_anchor_present: usize,
     pub dbg_true_anchor_best: usize,
 
+    /// Records dropped by the `--min-ani` output filter, and records that passed the filter but
+    /// could not be written as SAM because the anchor carried no usable CIGAR / reference span
+    /// (an anchor that went through `whole_align`, which does not set `reference_cigar_range`).
+    /// Both are silent losses otherwise, so they are counted here.
+    pub filtered_below_min_ani: usize,
+    pub sam_records_skipped: usize,
+
     pub time_get_kmers: Duration,
     pub time_get_minimizer: Duration,
     pub time_get_vranges: Duration,
@@ -114,6 +121,8 @@ impl Stats {
             ("alignments_successful",   self.alignments_successful as f64, "count"),
             ("alignments_partial",      self.alignments_partial as f64, "count"),
             ("alignments_dropped",      self.alignments_dropped as f64, "count"),
+            ("filtered_below_min_ani",  self.filtered_below_min_ani as f64, "count"),
+            ("sam_records_skipped",     self.sam_records_skipped as f64, "count"),
             ("threads",                 self.threads as f64, "count"),
             ("minimizers_per_read",     self.minimizer as f64 / reads, "rate"),
             ("ranges_per_read",         self.ranges as f64 / reads, "rate"),
@@ -188,6 +197,8 @@ impl Merge for Stats {
         self.dbg_checked += other.dbg_checked;
         self.dbg_true_anchor_present += other.dbg_true_anchor_present;
         self.dbg_true_anchor_best += other.dbg_true_anchor_best;
+        self.filtered_below_min_ani += other.filtered_below_min_ani;
+        self.sam_records_skipped += other.sam_records_skipped;
         self.seeds += other.seeds;
         self.anchors += other.anchors;
         self.alignments += other.alignments;
@@ -296,6 +307,8 @@ impl Default for Stats {
             dbg_checked: 0,
             dbg_true_anchor_present: 0,
             dbg_true_anchor_best: 0,
+            filtered_below_min_ani: 0,
+            sam_records_skipped: 0,
 
             time_reverse_complement: Duration::default(),
             time_extend_anchors: Duration::default(),

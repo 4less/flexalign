@@ -4,7 +4,7 @@ use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use colored::{Color, Colorize};
 use itertools::Itertools;
 
-use crate::align::{common::{Align, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
+use crate::align::{common::{penalties, Align, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
 
 use super::common::{hamming, Seed};
 
@@ -835,8 +835,10 @@ impl Anchor {
             zip(middle_q, middle_r).for_each(|(q,r)| {
                 self.cigar().0.push(if *q == *r { b'M' } else { mismatches += 1; b'X' });
             });
-            *max_score -= mismatches * 4;
-            score -= mismatches * 4;
+            // The interior between two seeds is a fixed-length, gapless stretch, so its cost is
+            // exactly the mismatch penalty per mismatch -- the same tally WFA would produce.
+            *max_score -= mismatches * penalties::MISMATCH;
+            score -= mismatches * penalties::MISMATCH;
 
             // eprintln!("Score align middle iter:  {} ... mismatches {}", *max_score, mismatches);
 

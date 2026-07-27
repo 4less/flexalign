@@ -30,17 +30,26 @@ pub fn run(args: Args) {
     }
 
     let db_paths = DBPaths::new(&options.reference);
-    
-    let build = !db_paths.valid_paths() || options.args.force_build;
-    
+
     const K: usize = 31;
     const C: usize = 15;
-    const F: usize = 16; 
+    const F: usize = 16;
     const S: usize = 4; // 7 0.34 //8 0.37 //6 0.31 //5  0.29 //4 0.289 //3 0.413  //2  0.413
     const L: usize = C - S + 1; //1
     const CELLS_PER_BODY: u64 = 16;
     const HEADER_THRESHOLD: usize = 2;
-    
+
+    // Build if the index is missing, if forced, OR if the on-disk blob is incompatible with this
+    // build (wrong blob version / const params). The last check is what stops a stale index -- e.g.
+    // one written before a flexmap key-format change -- from being memory-mapped and silently
+    // misread (which collapses sensitivity to ~zero), forcing a clean rebuild instead.
+    let index_compatible =
+        db_paths.valid_paths() && DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::index_compatible(&db_paths);
+    if db_paths.valid_paths() && !index_compatible && !options.args.force_build {
+        log::warn!("On-disk index is incompatible with this build (format/params changed); rebuilding it.");
+    }
+    let build = options.args.force_build || !index_compatible;
+
     // Build or load database
     let db: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = match build {
         true => {

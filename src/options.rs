@@ -59,9 +59,34 @@ pub struct Args {
     #[arg(short = 'x', long = "extend-top-x", default_value_t = 4)]
     pub extend_top_x: usize,
 
-    /// align the top y anchors. This happens after anchor extension 
+    /// align the top y anchors. This happens after anchor extension
     #[arg(short = 'y', long = "align-top-y", default_value_t = 4)]
     pub align_top_y: usize,
+
+    /// Minimum average nucleotide identity, as a fraction, for an alignment to be pursued and
+    /// reported. Serves double duty: it is converted into the aligner's abort score, so a candidate
+    /// whose alignment cost passes below this identity is dropped mid-alignment rather than
+    /// finished, and it gates the output, so no record is emitted below it. The identity is
+    /// approximated from the alignment cost (gap cost is priced as mismatch cost), so indel-rich
+    /// alignments read slightly lower than their true identity.
+    #[arg(long = "min-ani", default_value_t = 0.85)]
+    pub min_ani: f64,
+
+    /// Minimum fraction of the read that must be covered by the alignment (aligned query bases /
+    /// read length) for a record to be emitted. `--min-ani` prices only the *aligned* window, so a
+    /// short local match to the wrong reference -- with the rest of the read soft-clipped away for
+    /// free -- can pass the identity gate; this coverage floor rejects those partial hits. A real
+    /// short read maps end-to-end (coverage ~1.0). Set to 0.0 to disable. Default 0.70: on a marker
+    /// DB this lifts precision-of-mapped from ~26% to ~92% (matching protal) while keeping per-read
+    /// recall above protal's; wrong-reference junk is concentrated below ~0.5 coverage and precision
+    /// is flat above the knee, so 0.70 clears it with margin.
+    #[arg(long = "min-query-coverage", default_value_t = 0.70)]
+    pub min_query_coverage: f64,
+
+    /// Emit SAM instead of PAF. Only aligned records are written -- reads below --min-ani are
+    /// omitted entirely rather than emitted as unmapped, so the output is already filtered.
+    #[arg(long = "sam", action)]
+    pub sam: bool,
 
     /// Minimum number of ranges for lookup. With max-best-flex defines, none of the ranges might actually yield any seeds.
     #[arg(long = "min-ranges", default_value_t = 4)]

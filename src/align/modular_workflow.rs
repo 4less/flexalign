@@ -14,18 +14,171 @@ use crate::{
 
 use super::{
     common::{
-        Align, AnchorExtractor, AnchorPair, Heuristic,
+        penalties, Align, AnchorExtractor, AnchorPair, Heuristic,
         KmerExtractor, Or, PAFOutput, PairedAnchorExtender, PairedAnchorExtractor,
         PairedAnchorMAPQ, RangeExtractor, SAMOutput, SeedExtractor, StdPairedAnchorMAPQ,
     },
-    data_structures::common::Seed,
+    data_structures::{anchor::Anchor, common::Seed},
     process::{
-        alignment::ani_abort_score,
+        alignment::{ani_abort_score, approx_ani, hamming_ani},
         evaluate::{self, get_id_from_header},
     },
+    sam::Flag,
     stats::Stats,
 };
 use itertools::Itertools;
+
+/// One mate of the winning anchor pair, resolved to everything the output formats need.
+///
+/// Both mates are built before either is written: a SAM record carries the *other* mate's placement
+/// in RNEXT/PNEXT/TLEN, so neither can be emitted until both are known.
+struct MateOut<'m> {
+    anchor: &'m Anchor,
+    ref_name: &'m str,
+    ref_len: usize,
+    /// The query as it aligns to the forward strand of the reference -- the reverse complement when
+    /// the anchor is on the minus strand, which is what SAM's SEQ column requires.
+    query: &'m [u8],
+    qual: &'m [u8],
+    hamming: u64,
+    /// Approximate identity, from the alignment cost when the anchor was aligned and from the
+    /// Hamming distance when it was not. Compared against `--min-ani` to gate output.
+    ani: f64,
+    /// Fraction of the read covered by the alignment (aligned query bases / read length). For an
+    /// aligned anchor this is `1 - soft-clip fraction`; for a Hamming-only anchor it is the span its
+    /// seeds cover. Compared against `--min-query-coverage` to reject partial (clipped) hits, which
+    /// `ani` alone cannot -- it prices only the aligned window, leaving clipped bases free.
+    query_coverage: f64,
+}
+
+/// Resolves one mate of the winning pair. `None` when that mate has no anchor at all.
+fn resolve_mate<'m, D: FlexalignDatabase>(
+    anchor: Option<&'m Anchor>,
+    db: &'m D,
+    rec: &'m RefFastqRecord,
+    rec_revc: &'m OwnedFastqRecord,
+) -> Option<MateOut<'m>> {
+    let anchor = anchor?;
+    let ref_name = db.get_rname(anchor.reference as usize).unwrap();
+    let reference = db.get_reference(anchor.reference as usize).unwrap();
+    let query = if anchor.forward { rec.seq() } else { rec_revc.seq() };
+    let qual = if anchor.forward { rec.qual() } else { rec_revc.qual() };
+    let hamming = anchor.hamming(query, reference);
+
+    // An anchor that reached the aligner has a CIGAR, and its score is an alignment cost we can
+    // invert. One that did not (below --align-top-y, or a zero-length query) still carries its
+    // extension score, which is on a different scale entirely -- fall back to Hamming identity.
+    let ani = if anchor.cigar.is_some() {
+        approx_ani(anchor.score, penalties::MISMATCH, query.len())
+    } else {
+        hamming_ani(hamming, query.len())
+    };
+
+    // Fraction of the read the alignment actually covers. An aligned CIGAR consumes exactly the
+    // query bases it places (M/X plus query-side indels); the remainder is soft-clipped, so this is
+    // `1 - soft-clip fraction`. A Hamming-only anchor (no CIGAR) never went through the aligner, so
+    // fall back to the read span its seeds cover.
+    let query_len = query.len().max(1);
+    let query_coverage = match anchor.cigar.as_ref() {
+        Some(cigar) => (cigar.query_consumed() as f64 / query_len as f64).min(1.0),
+        None => {
+            let span = match (anchor.seeds.first(), anchor.seeds.last()) {
+                (Some(first), Some(last)) => last.qend().saturating_sub(first.qbegin()),
+                _ => 0,
+            };
+            (span as f64 / query_len as f64).min(1.0)
+        }
+    };
+
+    Some(MateOut { anchor, ref_name, ref_len: reference.len(), query, qual, hamming, ani, query_coverage })
+}
+
+/// SAM QNAME: no leading `@`, truncated at the first whitespace, and with any trailing `/1` or `/2`
+/// removed -- mate identity lives in the FLAG, and both mates of a pair must share a QNAME.
+fn sam_qname(head: &[u8]) -> &str {
+    let head = std::str::from_utf8(head).unwrap_or("*");
+    let head = head.strip_prefix('@').unwrap_or(head);
+    let head = head.split_whitespace().next().unwrap_or("*");
+    head.strip_suffix("/1").or_else(|| head.strip_suffix("/2")).unwrap_or(head)
+}
+
+/// Writes one SAM record for `m`, using `mate` for the pairing columns.
+fn write_sam_record<SO: SAMOutput>(
+    out: &mut SO,
+    head: &[u8],
+    m: &MateOut,
+    mate: Option<&MateOut>,
+    first_in_pair: bool,
+    mapping_quality: u8,
+    stats: &mut Stats,
+) {
+    let anchor = m.anchor;
+
+    // `whole_align` never fills in reference_cigar_range, so an anchor that took that path has a
+    // CIGAR but no reference coordinate to anchor it to. A SAM record cannot be written without
+    // one; count it rather than emit a record placed at the wrong position.
+    let cigar = match anchor.cigar.as_ref() {
+        Some(c) if !anchor.reference_cigar_range.is_empty() => c,
+        _ => {
+            stats.sam_records_skipped += 1;
+            return;
+        }
+    };
+
+    let mut flag = Flag::new();
+    flag.paired_end(true);
+    if first_in_pair { flag.first_in_pair(true); } else { flag.last_in_pair(true); }
+    if !anchor.forward { flag.reverse(true); }
+
+    let start = anchor.reference_cigar_range.start;
+
+    let (mate_name, mate_start, template_length) = match mate {
+        Some(mm) if !mm.anchor.reference_cigar_range.is_empty() => {
+            if !mm.anchor.forward { flag.mate_reverse(true); }
+            let same_reference = mm.anchor.reference == anchor.reference;
+            if same_reference && anchor.forward != mm.anchor.forward {
+                flag.proper_pair(true);
+            }
+
+            let mate_start = mm.anchor.reference_cigar_range.start;
+            let template_length = if same_reference {
+                let leftmost = start.min(mate_start);
+                let rightmost = anchor
+                    .reference_cigar_range
+                    .end
+                    .max(mm.anchor.reference_cigar_range.end);
+                let span = (rightmost - leftmost) as i64;
+                // The leftmost mate of the pair reports the span as positive, the other as negative.
+                if start <= mate_start { span } else { -span }
+            } else {
+                0
+            };
+            (Some(mm.ref_name), mate_start, template_length)
+        }
+        _ => {
+            flag.mate_unmapped(true);
+            (None, 0, 0)
+        }
+    };
+
+    // SAM reserves MAPQ 255 for "unavailable". The pipeline's pseudo-mapq is a raw score gap, not a
+    // phred-scaled probability, and can land on 255 -- clamp so it is never mistaken for "missing".
+    let mapping_quality = mapping_quality.min(254);
+
+    out.write(
+        sam_qname(head),
+        flag.value(),
+        m.ref_name,
+        start,
+        mapping_quality,
+        cigar,
+        mate_name,
+        mate_start,
+        template_length,
+        m.query,
+        m.qual,
+    );
+}
 
 #[derive(Clone)]
 pub struct Modular<
@@ -734,6 +887,9 @@ impl<
         let mut alignment_anchors =
             &mut extension_anchors[0..min(self.options.args.align_top_y, anchors_len)];
 
+        // Hoisted out of the closure below, which mutably borrows `self.align`.
+        let min_ani = self.options.args.min_ani;
+
         let (duration, _) = time(|| {
             let mut min_score_1 = None;
             let mut min_score_2 = None;
@@ -762,7 +918,7 @@ impl<
                             } else {
                                 if min_score_1.is_none() {
                                     min_score_1 =
-                                        Some(ani_abort_score(0.5, 4, query.len() as i32).abs());
+                                        Some(ani_abort_score(min_ani, penalties::MISMATCH, query.len() as i32).abs());
                                 }
                                 self.align.set_max_alignment_score(min_score_1.unwrap());
                                 // eprintln!("Align max score: {}", min_score_1.unwrap());
@@ -834,7 +990,7 @@ impl<
                             } else {
                                 if min_score_2.is_none() {
                                     min_score_2 =
-                                        Some(ani_abort_score(0.5, 4, query.len() as i32).abs());
+                                        Some(ani_abort_score(min_ani, penalties::MISMATCH, query.len() as i32).abs());
                                 }
 
                                 if a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
@@ -1111,42 +1267,47 @@ impl<
         //     std::io::stdin().read_line(&mut name).expect("Read line failed.");
         // }
 
+        // ##########################################################################################
+        // Output. Both mates are resolved before either is written, because a SAM record carries the
+        // other mate's placement, and because --min-ani gates the two mates independently.
+        // ##########################################################################################
+
+        let fwd_out = resolve_mate(
+            best_extended_anchor_pair.0.as_ref(),
+            self.db,
+            rec_fwd,
+            &self.rec_fwd_revc,
+        );
+        let rev_out = resolve_mate(
+            best_extended_anchor_pair.1.as_ref(),
+            self.db,
+            rec_rev,
+            &self.rec_rev_revc,
+        );
+
+        // A mate below the identity OR coverage threshold is treated exactly like a mate with no
+        // anchor: nothing is emitted for it, and it does not appear as the other mate's pairing
+        // partner either. The coverage floor rejects short local matches to the wrong reference that
+        // pass `min_ani` only because the clipped-away remainder of the read costs nothing.
+        let min_query_coverage = self.options.args.min_query_coverage;
+        let fwd_pass = fwd_out.as_ref().is_some_and(|m| m.ani >= min_ani && m.query_coverage >= min_query_coverage);
+        let rev_pass = rev_out.as_ref().is_some_and(|m| m.ani >= min_ani && m.query_coverage >= min_query_coverage);
+        if fwd_out.is_some() && !fwd_pass {
+            stats.filtered_below_min_ani += 1;
+        }
+        if rev_out.is_some() && !rev_pass {
+            stats.filtered_below_min_ani += 1;
+        }
+        let fwd_mate = if fwd_pass { fwd_out.as_ref() } else { None };
+        let rev_mate = if rev_pass { rev_out.as_ref() } else { None };
+
         let mut print_reads = false;
-        if best_extended_anchor_pair.0.is_some() {
-            let best = best_extended_anchor_pair.0.as_ref().unwrap();
-            let ref_string = &self.db.get_rname(best.reference as usize).unwrap();
-            let reference = &self.db.get_reference(best.reference as usize).unwrap();
-            let query = if best.forward {
-                rec_fwd.seq()
-            } else {
-                self.rec_fwd_revc.seq()
-            };
-            let hamming = best.hamming(query, reference);
 
-            // let (qr, rr) = best.whole(query.len(), reference.len());
-
-            // let (duration, (score, cigar)) = time(|| self.align.align(&query[qr], &reference[rr]));
-            // stats.time_alignment += duration;
-
-            // let (qr, rr) = best.whole(query.len(), reference.len());
-
-            // let hamming = score / -4;
-
-            // eprintln!("----{:?}\n Score {}, Hamming {}, cigar: {}", valid, (score / -4), hamming, cigar);
-            // eprintln!("{:?} {:?}", best.seeds.first(), best.whole(query.len(), reference.len()));
-            // eprintln!("{} {}", ref_string, String::from_utf8_lossy(rec_fwd.head()));
-            // eprintln!("{}\n{}", String::from_utf8_lossy(&query[qr]), String::from_utf8_lossy(&reference[rr]));
-
-            // let best_corelen = best.core_matches() - best.mismatches as usize - best.indels();
-            // let second_best_corelen = if anchors.len() > 1 {
-            //     let second_best = anchors.get(1).unwrap();
-            //     second_best.core_matches() - second_best.mismatches as usize - second_best.indels()
-            // } else { 0 };
-
+        if let Some(m) = fwd_mate {
             if GOLDSTD_EVAL {
                 let correct = evaluate::evaluate(
                     stats.gold_std_evaluation.as_mut().unwrap(),
-                    ref_string,
+                    m.ref_name,
                     pseudo_mapq as u64,
                     &rec_fwd,
                     self.db,
@@ -1156,8 +1317,8 @@ impl<
             }
 
             if self.options.args.debug {
-                let correct = &ref_string.as_bytes()[..min(ref_string.len(), rec_fwd.head().len())]
-                    == &rec_fwd.head()[..min(ref_string.len(), rec_fwd.head().len())];
+                let correct = &m.ref_name.as_bytes()[..min(m.ref_name.len(), rec_fwd.head().len())]
+                    == &rec_fwd.head()[..min(m.ref_name.len(), rec_fwd.head().len())];
 
                 if !correct {
                     eprintln!("\n\nIncorrect fwd:");
@@ -1186,19 +1347,32 @@ impl<
             }
 
             if self.output.has_a() {
+                let best = m.anchor;
                 self.output.a.as_mut().unwrap().write(
                     &String::from_utf8_lossy(rec_fwd.head()),
                     rec_fwd.seq().len(),
                     best.seeds.first().unwrap().qbegin() as i32,
                     best.seeds.last().unwrap().qend() as i32,
                     best.forward,
-                    ref_string,
-                    reference.len(),
+                    m.ref_name,
+                    m.ref_len,
                     best.seeds.first().unwrap().rbegin() as i32,
                     best.seeds.last().unwrap().rend() as i32,
-                    (query.len() - hamming as usize) as u32,
+                    (m.query.len() - m.hamming as usize) as u32,
                     0,
                     pseudo_mapq,
+                );
+            }
+
+            if self.output.has_b() {
+                write_sam_record(
+                    self.output.b.as_mut().unwrap(),
+                    rec_fwd.head(),
+                    m,
+                    rev_mate,
+                    true,
+                    pseudo_mapq,
+                    stats,
                 );
             }
         } else {
@@ -1207,31 +1381,11 @@ impl<
             }
         }
 
-        if best_extended_anchor_pair.1.is_some() {
-            let best = best_extended_anchor_pair.1.as_ref().unwrap();
-            let ref_string = &self.db.get_rname(best.reference as usize).unwrap();
-            let reference = &self.db.get_reference(best.reference as usize).unwrap();
-            let query = if best.forward {
-                rec_rev.seq()
-            } else {
-                self.rec_rev_revc.seq()
-            };
-
-            let hamming = best.hamming(query, reference);
-
-            // let (qr, rr) = best.whole(query.len(), reference.len());
-
-            // let (duration, (score, cigar)) = time(|| self.align.align(&query[qr], &reference[rr]));
-            // stats.time_alignment += duration;
-
-            // let (qr, rr) = best.whole(query.len(), reference.len());
-
-            // let hamming = score / -4;
-
+        if let Some(m) = rev_mate {
             if GOLDSTD_EVAL {
                 let correct = evaluate::evaluate(
                     stats.gold_std_evaluation.as_mut().unwrap(),
-                    ref_string,
+                    m.ref_name,
                     pseudo_mapq as u64,
                     &rec_rev,
                     self.db,
@@ -1240,10 +1394,10 @@ impl<
                 print_reads |= !correct;
             }
 
-            let correct = &ref_string.as_bytes()[..min(ref_string.len(), rec_fwd.head().len())]
-                == &rec_fwd.head()[..min(ref_string.len(), rec_fwd.head().len())];
-
             if self.options.args.debug {
+                let correct = &m.ref_name.as_bytes()[..min(m.ref_name.len(), rec_fwd.head().len())]
+                    == &rec_fwd.head()[..min(m.ref_name.len(), rec_fwd.head().len())];
+
                 if !correct {
                     eprintln!("\n\nIncorrect Rev:");
                     eprintln!("{}", String::from_utf8_lossy(rec_rev.head()));
@@ -1271,19 +1425,32 @@ impl<
             }
 
             if self.output.has_a() {
+                let best = m.anchor;
                 self.output.a.as_mut().unwrap().write(
                     &String::from_utf8_lossy(rec_rev.head()),
                     rec_rev.seq().len(),
                     best.seeds.first().unwrap().qbegin() as i32,
                     best.seeds.last().unwrap().qend() as i32,
                     best.forward,
-                    ref_string,
-                    reference.len(),
+                    m.ref_name,
+                    m.ref_len,
                     best.seeds.first().unwrap().rbegin() as i32,
                     best.seeds.last().unwrap().rend() as i32,
-                    (query.len() - hamming as usize) as u32,
+                    (m.query.len() - m.hamming as usize) as u32,
                     0,
                     pseudo_mapq,
+                );
+            }
+
+            if self.output.has_b() {
+                write_sam_record(
+                    self.output.b.as_mut().unwrap(),
+                    rec_rev.head(),
+                    m,
+                    fwd_mate,
+                    false,
+                    pseudo_mapq,
+                    stats,
                 );
             }
         } else {

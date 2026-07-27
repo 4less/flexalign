@@ -41,6 +41,14 @@ impl OutputBuffer {
         }
     }
 
+    /// Pushes whatever is buffered to the shared writer immediately. Needed when write ordering
+    /// matters across buffers -- a SAM header must reach the target before any worker's records.
+    pub fn flush(&mut self) {
+        let mut wr = self.writer.lock().expect("Cannot lock writer");
+        let _ = wr.write_all(&self.buffer);
+        self.buffer.clear();
+    }
+
     pub fn write(&mut self, str: String) {
         let _ = write!(self.buffer, "{}", str);
 
