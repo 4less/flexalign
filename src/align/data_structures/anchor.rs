@@ -561,7 +561,7 @@ impl Anchor {
         aligner.set_max_alignment_score(max_score + 1);
 
         // eprintln!("Align with max score {}", max_score + 1);
-        let (score,  status, _qs, _rs) = self.align_left_flank(aligner, query, reference, free_ends);
+        let (score,  status, _qs, _rs) = self.align_left_flank(aligner, query, reference, free_ends, max_score);
         match status { 
             Status::OK => {
                 assert!(score != std::i32::MIN);
@@ -642,7 +642,7 @@ impl Anchor {
         }
 
         aligner.set_max_alignment_score(max_score + 1);
-        let (score, status) = self.align_right_flank(aligner, query, reference, free_ends);
+        let (score, status) = self.align_right_flank(aligner, query, reference, free_ends, max_score);
         
         match status { 
             Status::OK => {
@@ -663,7 +663,7 @@ impl Anchor {
         Status::OK
     }
 
-    pub fn align_left_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize) -> (i32, Status, usize, usize) {
+    pub fn align_left_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize, budget: i32) -> (i32, Status, usize, usize) {
         
 
         // Accurate alignment of flanks first.
@@ -678,6 +678,36 @@ impl Anchor {
             // eprintln!("{:?} {:?}", lr.0, lr.1);
             // Assumes match penalty score is 0, and other scores are negative.
             return (0, Status::OK, 0, 0)
+        }
+
+        // Gapless fast path (skip WFA). The flank is a fixed equal-length q/r window; when the query
+        // prefix fits inside the gene (no leading soft-clip, qbegin <= rbegin) a gapless alignment is
+        // *provably optimal* if its mismatch cost is below the cheapest possible gap
+        // (gap_open + gap_extend) -- no indel can score better -- so no wavefront alignment is needed.
+        // This is the common case (short, near-identical flanks) and it is where most alignment time
+        // was going: a WFA call per flank per anchor.
+        {
+            let (qb, rb) = { let s = self.seeds.first().unwrap(); (s.qbegin(), s.rbegin()) };
+            if qb <= rb {
+                let q = &query[lr.0.clone()];
+                let r = &reference[lr.1.clone()];
+                let cost = zip(q, r).filter(|(a, b)| a != b).count() as i32 * penalties::MISMATCH;
+                // Take the gapless alignment (no WFA) when either it is *provably* optimal (its cost
+                // is below the cheapest possible gap, so no indel can beat it) OR no indel is expected
+                // anywhere in this anchor (`!flagged_for_indel`) -- the protal-style approximation.
+                // The latter is what skips WFA on the low-identity / wrong-target tail: a gapless cost
+                // over the remaining budget just drops the anchor here instead of aborting inside WFA.
+                if cost < penalties::GAP_OPENING + penalties::GAP_EXTENSION || !self.flagged_for_indel {
+                    if cost > budget {
+                        return (std::i32::MIN, Status::Dropped, 0, 0);
+                    }
+                    let start = lr.1.start;
+                    let lcigar = self.cigar.as_mut().unwrap();
+                    zip(q, r).for_each(|(a, b)| lcigar.0.push(if a == b { b'M' } else { b'X' }));
+                    self.reference_cigar_range.start = start;
+                    return (-cost, Status::OK, 0, start);
+                }
+            }
         }
 
         let q_dove = min(free_ends, lr.0.start);
@@ -742,7 +772,7 @@ impl Anchor {
         self.cigar.as_mut().unwrap()
     }
 
-    pub fn align_right_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize) -> (i32, Status) {
+    pub fn align_right_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize, budget: i32) -> (i32, Status) {
         // Accurate alignment of flanks first.
         // Add threshold later and do hamming first, and if the score can possibly improve with perfect alignment, do that
 
@@ -754,6 +784,29 @@ impl Anchor {
             lcigar.add_softclip(q_softclip);
             self.reference_cigar_range.end = rr.1.end;
             return (0, Status::OK)
+        }
+
+        // Gapless fast path (skip WFA) -- mirror of `align_left_flank`. When the query suffix fits
+        // inside the gene (no trailing soft-clip) and the gapless mismatch cost is below the cheapest
+        // gap, a gapless alignment is provably optimal, so WFA is unnecessary.
+        {
+            let no_trailing_clip = (query.len() - self.seeds.last().unwrap().qend())
+                <= (reference.len() - self.seeds.last().unwrap().rend());
+            if no_trailing_clip {
+                let q = &query[rr.0.clone()];
+                let r = &reference[rr.1.clone()];
+                let cost = zip(q, r).filter(|(a, b)| a != b).count() as i32 * penalties::MISMATCH;
+                if cost < penalties::GAP_OPENING + penalties::GAP_EXTENSION || !self.flagged_for_indel {
+                    if cost > budget {
+                        return (std::i32::MIN, Status::Dropped);
+                    }
+                    let end = rr.1.end;
+                    let lcigar = self.cigar.as_mut().unwrap();
+                    zip(q, r).for_each(|(a, b)| lcigar.0.push(if a == b { b'M' } else { b'X' }));
+                    self.reference_cigar_range.end = end;
+                    return (-cost, Status::OK);
+                }
+            }
         }
 
         let q_end = min(rr.0.end + free_ends, query.len());
