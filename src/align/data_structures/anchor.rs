@@ -490,7 +490,7 @@ impl Anchor {
 
     pub fn whole_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, _max_score: i32) -> Status {
         let (mut qr, mut rr) = self.whole(query.len(), reference.len());
-        
+
         self.cigar = Some(Cigar::new());
 
         // Left dove 
@@ -520,7 +520,22 @@ impl Anchor {
 
         if matches!(status, Status::OK) {
             self.score = score;
+            // Query bases before the aligned window are soft-clipped EXPLICITLY, at the 5' end.
+            // `whole()` starts the window at `min(query_overhang, reference_overhang)`, so when the
+            // read hangs off the start of the reference the leading bases have nowhere to go. Until
+            // this was emitted they were invisible: `to_sam` pads only at the 3' end, so a left
+            // overhang was indistinguishable from a mid-reference partial hit.
+            if qr.start > 0 {
+                self.cigar.as_mut().unwrap().add_softclip(qr.start);
+            }
             self.cigar.as_mut().unwrap().0.extend_from_slice(&cigar.0);
+            // Record the reference span this alignment covers. Without it every consumer that asks
+            // "where on the reference does this alignment start and end" -- the SAM writer, and the
+            // end-to-end acceptance check -- has to guess from the first seed, which is not the
+            // alignment start. `rr` is the window handed to the aligner, so the span begins there
+            // and runs for as many reference bases as the CIGAR consumes.
+            let consumed = self.cigar.as_ref().unwrap().reference_consumed();
+            self.reference_cigar_range = rr.start..(rr.start + consumed);
         }
         
         // let q_inserts = cigar.count_trailing_chars(b'I');
@@ -541,6 +556,29 @@ impl Anchor {
     pub fn align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, max_score: i32) -> Status {
         if self.seed_status.is_valid() {
             self.extend_seeds(query, reference);
+
+            // Whole-read gapless pre-filter (one SIMD Hamming pass on the anchor diagonal). When no
+            // indel is expected, a WFA alignment cannot beat the fixed-diagonal gapless cost by more
+            // than a small end-shift, so once that cost exceeds the ANI budget the anchor is going to
+            // drop -- do it here instead of running WFA on both flanks up to the abort. This is the
+            // bulk of the wrong-target / soft-clip throw-away work on a short-gene marker DB (~95% of
+            // alignment time went to anchors that drop, almost all via the clip path).
+            if !self.flagged_for_indel {
+                let s = self.seeds.first().unwrap();
+                let offset = s.rbegin() as i64 - s.qbegin() as i64; // reference index = query index + offset
+                let q_lo = if offset < 0 { (-offset) as usize } else { 0 };
+                let q_hi = min(query.len(), (reference.len() as i64 - offset).max(0) as usize);
+                if q_lo < q_hi {
+                    let qs = &query[q_lo..q_hi];
+                    let rs = &reference[(q_lo as i64 + offset) as usize..(q_hi as i64 + offset) as usize];
+                    if triple_accel::hamming(qs, rs) as i32 * penalties::MISMATCH > max_score {
+                        self.score = std::i32::MIN;
+                        self.cigar = Some(Cigar::new()); // downstream `cigar()` asserts Some, even when dropped
+                        return Status::Dropped;
+                    }
+                }
+            }
+
             self.smart_align(aligner, query, reference, free_ends, max_score)
         } else {
             self.whole_align(aligner, query, reference, free_ends*2, max_score)
@@ -730,7 +768,7 @@ impl Anchor {
         // aligner.set_ends_free(100,100,100,100);
 
         let (score, cigar, status) = aligner.align(q, r);
-        
+
         if !matches!(status, Status::OK) {
             return (std::i32::MIN, Status::Dropped, 0, 0)
         }

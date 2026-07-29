@@ -23,6 +23,17 @@ pub fn time<F, T>(f: F) -> (Duration, T)
 pub fn run(args: Args) {
     let options = Options::from_args(args);
 
+    // Set before any database load -- the mapping happens below the option plumbing.
+    {
+        let spec = options.args.ref_budget.clone()
+            .or_else(|| options.args.lazy_ref.then(|| "auto".to_string()));
+        let kb = crate::database::common::resolve_ref_budget(spec.as_deref());
+        crate::database::common::REF_BUDGET_KB.store(kb, std::sync::atomic::Ordering::Relaxed);
+        if kb > 0 {
+            eprintln!("--ref-budget: capping resident reference at {:.1} GB", kb as f64 / 1048576.0);
+        }
+    }
+
 
     if !options.reference.exists() {
         eprintln!("Reference does not exist {:?}", options.reference);
@@ -81,7 +92,7 @@ pub fn run(args: Args) {
             "Sliced index into {} shard(s) in {:?}: {}",
             manifest.shards.len(),
             duration,
-            crate::shard::slice::SliceManifest::path_for(&db_paths)
+            crate::shard::slice::SliceManifest::path_for(&db_paths, n_shards)
         );
         return;
     }

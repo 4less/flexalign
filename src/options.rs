@@ -59,6 +59,16 @@ pub struct Args {
     #[arg(short = 'x', long = "extend-top-x", default_value_t = 4)]
     pub extend_top_x: usize,
 
+    /// Extend at most this many anchor pairs (the top Z after the post-pairing sort).
+    ///
+    /// Extension is the first stage that touches reference sequence, so it is the first that costs
+    /// real time; without a bound it runs over EVERY anchor a read produced (15.7 per read measured
+    /// on the protal marker DB). Anchors are already sorted by anchor score when they arrive, so
+    /// the top Z are the ones worth the Hamming pass. `--extend-top-x` was intended for this and
+    /// was never wired up.
+    #[arg(short = 'z', long = "extend-top-z", default_value_t = 32)]
+    pub extend_top_z: usize,
+
     /// align the top y anchors. This happens after anchor extension
     #[arg(short = 'y', long = "align-top-y", default_value_t = 4)]
     pub align_top_y: usize,
@@ -112,6 +122,54 @@ pub struct Args {
     /// RAM-bounded shard passes: each shard loads only its slice of the keys array.
     #[arg(long = "shard-slice", value_name = "N")]
     pub shard_slice: Option<usize>,
+
+    /// Dump the candidate anchor list for every read to stderr as `ANCHOR` TSV lines.
+    ///
+    /// One line per candidate per mate: rank, reference, position, anchor score, aligned score,
+    /// whether it reached the aligner. Answers the question a wrong call always raises -- was the
+    /// correct reference absent from the candidates, or present and outscored? Those need opposite
+    /// fixes (seeding vs scoring), and no amount of output-gate tuning distinguishes them.
+    #[arg(long = "dump-anchors", action)]
+    pub dump_anchors: bool,
+
+    /// Require alignments to be end-to-end on the read, treating soft-clipping as legitimate only
+    /// where the read runs off the reference.
+    ///
+    /// OFF by default, and measured as a net loss until leading soft-clips are emitted: `to_sam`
+    /// clips only at the 3' end, so a read hanging off the START of a reference is indistinguishable
+    /// from a mid-reference partial hit and gets rejected with it. On the protal marker DB this
+    /// removed 0.156 pp of alignments to gain 0.20 pp precision -- 87% of what it rejected was
+    /// correct. Revisit once left overhangs are representable.
+    #[arg(long = "end-to-end", action)]
+    pub end_to_end: bool,
+
+    /// Compute MAPQ from the gapped-alignment scores of the best and second-best candidate,
+    /// instead of from their pre-alignment anchor scores.
+    ///
+    /// The default MAPQ is computed before alignment runs, from `core_matches - mismatches`. Two
+    /// candidates that tie as seed chains but separate once aligned therefore get a low MAPQ they
+    /// no longer deserve, and vice versa -- and since the anchors are finally *ranked* by aligned
+    /// score, the reported alignment may not even be the one the MAPQ describes.
+    #[arg(long = "mapq-from-alignment", action)]
+    pub mapq_from_alignment: bool,
+
+    /// Cap the resident reference: `auto`, or a size like `8G` / `512M`. Absent = unbounded.
+    ///
+    /// Alignment touches ~0.6 MB of distinct reference pages per read, so on a large reference the
+    /// whole thing goes resident and sets peak RSS. Unbounded is right when RAM is plentiful --
+    /// resident pages cost nothing there. Under a memory limit it is what gets the run OOM-killed,
+    /// so with a budget the rejoin drops reference pages once residency exceeds it and re-faults
+    /// what it needs again (minor faults; the pages stay in the page cache).
+    ///
+    /// `auto` reads the cgroup limit if there is one -- container, slurm, `systemd-run -p
+    /// MemoryMax=` -- and MemAvailable otherwise, then takes 60% to leave room for reads, evidence
+    /// and output buffers.
+    #[arg(long = "ref-budget", value_name = "SIZE|auto")]
+    pub ref_budget: Option<String>,
+
+    /// Alias for `--ref-budget auto`.
+    #[arg(long = "lazy-ref")]
+    pub lazy_ref: bool,
 
     /// Write the per-stage timing block as a machine-readable TSV to this path (one row per
     /// metric: `input\tmetric\tvalue\tunit`), in addition to the human-readable stderr block.

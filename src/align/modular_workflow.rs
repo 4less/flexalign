@@ -49,6 +49,34 @@ struct MateOut<'m> {
     /// seeds cover. Compared against `--min-query-coverage` to reject partial (clipped) hits, which
     /// `ani` alone cannot -- it prices only the aligned window, leaving clipped bases free.
     query_coverage: f64,
+    /// Whether the read aligns END TO END, counting soft-clipping as legitimate only where the read
+    /// runs off the reference.
+    ///
+    /// A short read from inside a marker must align over its whole length; bases clipped away in
+    /// the middle of a reference mean the alignment simply does not explain the read. The one
+    /// honest exception is an overhang: a read straddling the start or end of the reference has
+    /// nowhere to align its outer bases, and clipping exactly that many is correct.
+    ///
+    /// This is what `--min-query-coverage` was approximating with a blanket fraction, which both
+    /// rejects legitimate overhanging reads and accepts mid-reference partial hits above the
+    /// threshold.
+    end_to_end: bool,
+}
+
+/// How many of the read's bases can possibly align, given where this anchor puts it.
+///
+/// A read whose anchor sits near the end of a marker gene hangs off it -- the overhanging bases are
+/// sequence the reference does not contain, so they can never align. Both the identity budget and
+/// the coverage fraction have to be measured against THIS length, not the read length: measured on
+/// the protal marker DB, 77.9% of the clipping in reads flexalign missed is exactly this dovetail,
+/// and only 2.7% is clipping with reference on both sides of it.
+fn alignable_len(anchor: &Anchor, query_len: usize, ref_len: usize) -> usize {
+    let qbegin = anchor.seeds.first().map_or(0, |s| s.qbegin()) as i64;
+    let rbegin = anchor.seeds.first().map_or(0, |s| s.rbegin()) as i64;
+    // Where the read's first base would land on the reference, laid down from the anchor.
+    let r0 = rbegin - qbegin;
+    let overlap = (r0 + query_len as i64).min(ref_len as i64) - r0.max(0);
+    overlap.clamp(1, query_len as i64) as usize
 }
 
 /// Resolves one mate of the winning pair. `None` when that mate has no anchor at all.
@@ -68,8 +96,13 @@ fn resolve_mate<'m, D: FlexalignDatabase>(
     // An anchor that reached the aligner has a CIGAR, and its score is an alignment cost we can
     // invert. One that did not (below --align-top-y, or a zero-length query) still carries its
     // extension score, which is on a different scale entirely -- fall back to Hamming identity.
-    let ani = if anchor.cigar.is_some() {
-        approx_ani(anchor.score, penalties::MISMATCH, query.len())
+    // Identity is a property of the ALIGNMENT, so it is priced over the bases the alignment
+    // placed -- not over the whole read. Soft-clipped bases were never compared to anything: on a
+    // marker DB 78% of clipping is a dovetail (the read straddles the end of the gene and the rest
+    // of it is sequence the reference does not contain), and charging those bases as mismatches
+    // drove a 97% identity alignment down to an apparent 58% and out through the --min-ani gate.
+    let ani = if let Some(cigar) = anchor.cigar.as_ref() {
+        approx_ani(anchor.score, penalties::MISMATCH, cigar.query_aligned().max(1))
     } else {
         hamming_ani(hamming, query.len())
     };
@@ -80,7 +113,12 @@ fn resolve_mate<'m, D: FlexalignDatabase>(
     // fall back to the read span its seeds cover.
     let query_len = query.len().max(1);
     let query_coverage = match anchor.cigar.as_ref() {
-        Some(cigar) => (cigar.query_consumed() as f64 / query_len as f64).min(1.0),
+        // Denominator is what COULD align, not the read length -- so a read dovetailing off the end
+        // of a marker, aligned across its whole overlap, reads as fully covered instead of ~59%.
+        Some(cigar) => {
+            let alignable = alignable_len(anchor, query_len, reference.len());
+            (cigar.query_aligned() as f64 / alignable as f64).min(1.0)
+        }
         None => {
             let span = match (anchor.seeds.first(), anchor.seeds.last()) {
                 (Some(first), Some(last)) => last.qend().saturating_sub(first.qbegin()),
@@ -90,7 +128,43 @@ fn resolve_mate<'m, D: FlexalignDatabase>(
         }
     };
 
-    Some(MateOut { anchor, ref_name, ref_len: reference.len(), query, qual, hamming, ani, query_coverage })
+    // Soft-clipping is only justified by an overhang: how far the read would extend past either
+    // end of the reference if laid down end to end from where the alignment starts.
+    let ref_len = reference.len();
+    let end_to_end = match anchor.cigar.as_ref() {
+        Some(cigar) => {
+            let clip_5 = cigar.leading_softclip();
+            let clip_3 = query_len.saturating_sub(clip_5 + cigar.query_aligned());
+            // `reference_cigar_range` is the aligned span, but `whole_align` leaves it empty (see
+            // stats.rs), so fall back to the first seed's reference position -- the same anchor the
+            // emitted POS is derived from.
+            let (ref_start, ref_end) = if anchor.reference_cigar_range.start
+                < anchor.reference_cigar_range.end
+            {
+                (anchor.reference_cigar_range.start, anchor.reference_cigar_range.end)
+            } else {
+                let start = anchor.seeds.first().map_or(0, |sd| sd.rbegin());
+                (start, start + cigar.reference_consumed())
+            };
+            // Each end is judged separately, and clipping is legitimate only where the read runs
+            // off the reference:
+            //   5' -- the alignment sits at reference 0, so the leading bases have nowhere to go,
+            //         and no more may be clipped than would fall before the start.
+            //   3' -- the alignment reaches the reference end, and no more may be clipped than
+            //         would fall past it.
+            // Clipping anywhere else is a partial match inside the reference, which does not
+            // explain the read.
+            let ok_5 = clip_5 == 0 || (ref_start == 0 && clip_5 <= query_len.saturating_sub(ref_end));
+            let ok_3 = clip_3 == 0
+                || (ref_end >= ref_len && clip_3 <= (ref_start + query_len).saturating_sub(ref_len));
+            ok_5 && ok_3
+        }
+        // No CIGAR: never went through the aligner, so there is no clipping to justify. Judged by
+        // its seed span instead, as before.
+        None => query_coverage >= 0.95,
+    };
+
+    Some(MateOut { anchor, ref_name, ref_len, query, qual, hamming, ani, query_coverage, end_to_end })
 }
 
 /// SAM QNAME: no leading `@`, truncated at the first whitespace, and with any trailing `/1` or `/2`
@@ -766,9 +840,13 @@ impl<
         // assert!(extension_anchors.iter().all(|pair| pair.validate().is_ok()));
 
         // Assumes valid anchor seeds!!
+        // Bound extension to the top Z. Anchors arrive sorted by anchor score (anchor_extractor
+        // sorts after pairing), so this keeps the candidates worth a reference comparison and drops
+        // the tail -- extension is the first stage that reads reference sequence at all.
+        let extend_top_z = min(self.options.args.extend_top_z.max(1), anchors.len());
         let (duration, extended_count) = time(|| {
             let extended_count = self.anchor_extender.extend(
-                anchors,
+                &mut anchors[0..extend_top_z],
                 rec_fwd,
                 &self.rec_fwd_revc,
                 rec_rev,
@@ -776,6 +854,14 @@ impl<
                 stats,
             );
 
+            // RESORT before anything downstream selects candidates: extension has just replaced
+            // every anchor score with a Hamming-extended one, so the order the extractor produced
+            // is stale. The alignment window (top --align-top-y) is taken straight off this, and
+            // picking it from a stale order would align the wrong candidates.
+            //
+            // NB: a reference-id tie-break was tried here and reverted. It made ties deterministic
+            // but not more accurate (an arbitrary key cannot favour the truth), and the tuple sort
+            // key cost ~60% wall time on the protal marker DB.
             glidesort::sort_by_key(&mut anchors[0..extended_count], |AnchorPair(a1, a2)| {
                 -(a1.as_ref().map_or(0, |a| a.score) + a2.as_ref().map_or(0, |a| a.score))
             });
@@ -877,7 +963,7 @@ impl<
         //         }
         //     });
 
-        let pseudo_mapq = StdPairedAnchorMAPQ::anchor_mapq(extension_anchors);
+        let mut pseudo_mapq = StdPairedAnchorMAPQ::anchor_mapq(extension_anchors);
         let _old_score = &extension_anchors[0].0.as_ref().map_or(0, |a| a.score)
             + &extension_anchors[0].1.as_ref().map_or(0, |a| a.score);
 
@@ -916,10 +1002,13 @@ impl<
                             if query.len() == 0 {
                                 a.score = 0i32;
                             } else {
-                                if min_score_1.is_none() {
-                                    min_score_1 =
-                                        Some(ani_abort_score(min_ani, penalties::MISMATCH, query.len() as i32).abs());
-                                }
+                                // Budget the mismatches over the bases that CAN align. Charged over the
+                                // whole read, a dovetailing read spends its entire budget on bases outside
+                                // the gene and aborts -- measured at 97-98% identity, right marker, a
+                                // median 9bp from minibwa's position. Per candidate, not cached: the
+                                // alignable window depends on where this anchor sits.
+                                let alignable = alignable_len(a, query.len(), reference.len()) as i32;
+                                min_score_1 = Some(ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs());
                                 self.align.set_max_alignment_score(min_score_1.unwrap());
                                 // eprintln!("Align max score: {}", min_score_1.unwrap());
 
@@ -988,10 +1077,13 @@ impl<
                             if query.len() == 0 {
                                 a.score = 0i32;
                             } else {
-                                if min_score_2.is_none() {
-                                    min_score_2 =
-                                        Some(ani_abort_score(min_ani, penalties::MISMATCH, query.len() as i32).abs());
-                                }
+                                // Budget the mismatches over the bases that CAN align. Charged over the
+                                // whole read, a dovetailing read spends its entire budget on bases outside
+                                // the gene and aborts -- measured at 97-98% identity, right marker, a
+                                // median 9bp from minibwa's position. Per candidate, not cached: the
+                                // alignable window depends on where this anchor sits.
+                                let alignable = alignable_len(a, query.len(), reference.len()) as i32;
+                                min_score_2 = Some(ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs());
 
                                 if a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
                                     log::debug!("2  {}", a);
@@ -1087,8 +1179,39 @@ impl<
         });
         stats.time_alignment += duration;
 
-        let _new_score = &extension_anchors[0].0.as_ref().map_or(0, |a| a.score)
-            + &extension_anchors[0].1.as_ref().map_or(0, |a| a.score);
+        // The anchors have just been re-sorted by ALIGNED score, so best/second-best by alignment
+        // are now known -- which is the margin MAPQ should describe. Recompute here rather than
+        // keeping the pre-alignment estimate made before any of these candidates were aligned.
+        if self.options.args.mapq_from_alignment && !extension_anchors.is_empty() {
+            pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true);
+        }
+
+        if self.options.args.dump_anchors {
+            // One write per read: worker threads share stderr, and a single formatted string keeps
+            // each read's block intact instead of interleaving line by line.
+            let rid = String::from_utf8_lossy(rec_fwd.head()).to_string();
+            let rid = rid.split_whitespace().next().unwrap_or("?").trim_start_matches('@')
+                .rsplit('/').last().unwrap_or("?").to_string();
+            let mut buf = String::new();
+            for (rank, AnchorPair(a1, a2)) in extension_anchors.iter().enumerate() {
+                for (mate, a) in [(1, a1), (2, a2)] {
+                    if let Some(a) = a {
+                        let rname = self.db.get_rname(a.reference as usize).unwrap_or("?");
+                        buf.push_str(&format!(
+                            "ANCHOR\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                            rid, mate, rank, rname,
+                            a.seeds.first().map_or(0, |sd| sd.rbegin()),
+                            a.core_matches() as i32 - a.mismatches as i32,
+                            a.score,
+                            a.cigar.is_some(),
+                        ));
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                eprint!("{}", buf);
+            }
+        }
 
         // eprintln!("SCORE  {} -> {}", old_score, new_score);
         // eprintln!(
@@ -1289,9 +1412,26 @@ impl<
         // anchor: nothing is emitted for it, and it does not appear as the other mate's pairing
         // partner either. The coverage floor rejects short local matches to the wrong reference that
         // pass `min_ani` only because the clipped-away remainder of the read costs nothing.
+        // End-to-end (clipping only where the read overhangs the reference) replaces the blanket
+        // coverage fraction. Setting --min-query-coverage > 0 restores the old gate instead.
         let min_query_coverage = self.options.args.min_query_coverage;
-        let fwd_pass = fwd_out.as_ref().is_some_and(|m| m.ani >= min_ani && m.query_coverage >= min_query_coverage);
-        let rev_pass = rev_out.as_ref().is_some_and(|m| m.ani >= min_ani && m.query_coverage >= min_query_coverage);
+        // Two independent conditions, both required:
+        //   end_to_end     -- WHERE clipping is legitimate: only where the read runs off the
+        //                     reference, never in the middle of it.
+        //   query_coverage -- HOW MUCH of the read actually aligned. A read overhanging a marker's
+        //                     end by 140 of its 150 bases is legitimately clipped and still carries
+        //                     10 bases of evidence, which is not enough to place it.
+        // The coverage floor alone accepts mid-reference partial hits; end-to-end alone accepts
+        // 10-base edge matches. Measured: 92.03% precision for coverage alone, 53.90% for
+        // end-to-end alone.
+        let require_e2e = self.options.args.end_to_end;
+        let ok = |m: &MateOut| {
+            m.ani >= min_ani
+                && m.query_coverage >= min_query_coverage
+                && (!require_e2e || m.end_to_end)
+        };
+        let fwd_pass = fwd_out.as_ref().is_some_and(&ok);
+        let rev_pass = rev_out.as_ref().is_some_and(&ok);
         if fwd_out.is_some() && !fwd_pass {
             stats.filtered_below_min_ani += 1;
         }

@@ -12,9 +12,20 @@ channel = "nightly"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-kmerrs = { git = "https://github.com/4less/kmerr.git" }
-flexmap = { git = "https://github.com/4less/flexmap.git", branch = "zeroable-load" }
-bioreader = { git = "https://github.com/4less/bioreader.git" }
+# Pinned to exact revisions so a build anywhere -- a cluster, a fresh checkout, CI -- produces the
+# binary these benchmarks measured. Two reasons this is not optional here:
+#   * `branch = "zeroable-load"` pointed at a branch 5 commits BEHIND the `zeroable_load` branch the
+#     local path override actually built (SIMD + prefetch key lookup missing). Local and remote
+#     builds were silently different code.
+#   * flexmap owns the on-disk index format. A moving dependency can change it under a prebuilt
+#     index, which has already caused one silent accuracy regression in this project.
+# To advance a dependency: push it, then bump the rev here deliberately.
+# Caveat: flexmap pulls its own bioreader/kmerrs at unpinned revs, so the graph carries a second
+# copy of each. Cargo refuses to unify them ("patches must point to different sources"), so closing
+# that gap means pinning inside flexmap's own manifest.
+kmerrs = { git = "https://github.com/4less/kmerr.git", rev = "3b86438d083ba83d334ba19a5f5a45ad045f247d" }
+flexmap = { git = "https://github.com/4less/flexmap.git", rev = "3356b655e9cc4f5edceb11679ebd0a9308f1a820" }
+bioreader = { git = "https://github.com/4less/bioreader.git", rev = "1ba00bb9055ec71334c87576e12023f994dd1390" }
 libwfa2 = "0.1.1"
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
 clap_derive = "4.5.3"
@@ -35,6 +46,7 @@ rgb = "0.8.48"
 micromap = "0.0.15"
 ser_raw = "0.1.0"
 triple_accel = "0.4.0"
+memmap2 = "0.9.4"
 thiserror = "1.0.64"
 simple_logger=  { version = "3", features = ["stderr"] }
 log = "0"
@@ -48,3 +60,4 @@ opt-level = 3               # Use best optimizations
 overflow-checks = false     # Disable integer overflow checks.
 rustflags = ["-C", "target-feature=+avx,+sse3,+avx2,+fma"]#
 lto = "fat"
+

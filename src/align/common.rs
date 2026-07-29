@@ -273,19 +273,50 @@ impl PairedAnchorMAPQ for StdPairedAnchorMAPQ {
     /// than the maximum: on a marker DB a lone hit is empirically less reliable than a decisive
     /// margin over a real competitor, so it must not sit at the top of the MAPQ sweep.
     fn anchor_mapq(anchors: &mut [AnchorPair]) -> u8 {
+        Self::mapq_from(anchors, false)
+    }
+}
+
+impl StdPairedAnchorMAPQ {
+    /// MAPQ from the margin between best and second-best, scored either by the ANCHOR
+    /// (`core_matches - mismatches`, available before alignment) or by the ALIGNMENT (`a.score`,
+    /// the gapped-alignment score, available only after).
+    ///
+    /// The alignment form is the meaningful one: two anchors can look equally good as seed chains
+    /// and separate cleanly once actually aligned, and it is the aligned score the anchors are
+    /// finally ranked by -- so scoring the margin any other way can report high confidence for a
+    /// read whose top-2 alignments are indistinguishable.
+    pub fn mapq_from(anchors: &[AnchorPair], from_alignment: bool) -> u8 {
         assert!(!anchors.is_empty());
 
         const MAPQ_MAX: f64 = 60.0;
         const MAPQ_UNIQUE: u8 = 30;
+        if from_alignment {
+            // Aligned scores are <= 0 PENALTIES (0 = perfect, -1_000_000 = failed), the opposite
+            // convention to anchor scores -- see `approx_ani`, which negates them into a cost. So
+            // the margin is over costs (lower is better), not scores: a best with a small cost
+            // against a second with a large one is a confident read, and equal costs are a tie.
+            if anchors.len() <= 1 {
+                return MAPQ_UNIQUE;
+            }
+            let c1 = (-Self::score_paired_ext(&anchors[0])).max(0) as f64;
+            let c2 = (-Self::score_paired_ext(&anchors[1])).max(0) as f64;
+            if c2 <= 0.0 {
+                return 0; // the runner-up is also a perfect alignment: no margin at all
+            }
+            let rel_margin = (1.0 - c1 / c2).clamp(0.0, 1.0);
+            return (MAPQ_MAX * rel_margin).round() as u8;
+        }
+        let score = Self::score_paired;
 
-        let s1 = Self::score_paired(&anchors[0]).max(0);
+        let s1 = score(&anchors[0]).max(0);
         if s1 == 0 {
             return 0;
         }
         if anchors.len() <= 1 {
             return MAPQ_UNIQUE;
         }
-        let s2 = Self::score_paired(&anchors[1]).max(0);
+        let s2 = score(&anchors[1]).max(0);
         let rel_margin = 1.0 - (s2 as f64 / s1 as f64); // in [0, 1]
         (MAPQ_MAX * rel_margin).round().clamp(0.0, MAPQ_MAX) as u8
     }

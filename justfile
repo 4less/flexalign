@@ -43,6 +43,46 @@ lint:
 install:
     {{cargo}} install --path .
 
+# Install flexalign + examples on a cluster, from a clean checkout, into PREFIX (default ~/bin).
+#
+# Builds against the PINNED GitHub dependencies -- it moves .cargo/config.toml aside first, because
+# that file redirects bioreader/kmerrs/flexmap to sibling working copies that exist only on a
+# developer machine. Without that step a cluster build either fails or silently builds different
+# code than the pinned revisions.
+#
+# Needs: rustup (for nightly) and a host C toolchain (cc, make, cmake) for libwfa2. Load those with
+# `module load` first if your cluster provides them that way.
+#
+#   just install-cluster                 # -> ~/bin
+#   just install-cluster ~/opt/flexalign # -> that prefix
+install-cluster PREFIX="~/bin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v rustup >/dev/null || { echo "rustup not found -- install from https://rustup.rs"; exit 1; }
+    for t in cc make cmake; do command -v $t >/dev/null || { echo "missing $t (needed by libwfa2)"; exit 1; }; done
+    rustup toolchain install nightly --profile minimal
+    # A local path override would defeat the point of a reproducible cluster build.
+    if [ -f .cargo/config.toml ]; then
+        echo ">> setting aside .cargo/config.toml (local path override) for this build"
+        mv .cargo/config.toml .cargo/config.toml.clusterbuild
+        trap 'mv .cargo/config.toml.clusterbuild .cargo/config.toml 2>/dev/null || true' EXIT
+    fi
+    {{cargo}} build --release
+    {{cargo}} build --release --example shard_align
+    PREFIX=$(eval echo {{PREFIX}}); mkdir -p "$PREFIX"
+    install -m755 target/release/flexalign "$PREFIX/flexalign"
+    install -m755 target/release/examples/shard_align "$PREFIX/shard_align"
+    echo ">> installed to $PREFIX:"; "$PREFIX/flexalign" --version || true
+    echo ">> add to PATH:  export PATH=\"$PREFIX:\$PATH\""
+
+# Verify the pinned dependencies resolve from GitHub (no local path override). Fast, no compile.
+check-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -f .cargo/config.toml ] && { mv .cargo/config.toml .cargo/config.toml.depcheck; trap 'mv .cargo/config.toml.depcheck .cargo/config.toml' EXIT; }
+    CARGO_TARGET_DIR=$(mktemp -d) {{cargo}} metadata --format-version 1 >/dev/null
+    echo "pinned dependencies resolve from GitHub"
+
 # Remove build artifacts.
 clean:
     {{cargo}} clean

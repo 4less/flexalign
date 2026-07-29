@@ -3,6 +3,62 @@ use bioreader::{fasta_byte_reader::FastaByteReader, fasta_reader::FastaReader, s
 use flexmap::values::VRange;
 use crate::options::Options;
 
+/// Budget in kB for resident reference pages; 0 = unbounded (the default).
+///
+/// A process-wide switch rather than a parameter because `FlexalignDatabase::load` is a trait
+/// method taking only paths, and the mapping happens several layers below the option parsing.
+/// Written once at startup, only read afterwards.
+pub static REF_BUDGET_KB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn ref_budget_kb() -> u64 {
+    REF_BUDGET_KB.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve `--ref-budget`: `auto`, a size like `8G`/`512M`, or absent (unbounded).
+///
+/// `auto` asks what this process is *actually* allowed to use, which is not the same as the
+/// machine's RAM: under a cgroup (container, slurm cgroup, `systemd-run -p MemoryMax=`) the cap is
+/// far below total memory, and that is exactly the case where being unbounded gets you OOM-killed.
+/// So prefer the cgroup limit, fall back to MemAvailable, and take a fraction to leave room for the
+/// non-reference parts of the run.
+pub fn resolve_ref_budget(spec: Option<&str>) -> u64 {
+    fn parse_size(s: &str) -> Option<u64> {
+        let s = s.trim();
+        let (num, mult) = match s.chars().last()?.to_ascii_uppercase() {
+            'K' => (&s[..s.len() - 1], 1u64),
+            'M' => (&s[..s.len() - 1], 1024),
+            'G' => (&s[..s.len() - 1], 1024 * 1024),
+            'T' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+            _ => (s, 1024 * 1024), // bare number = GB, the unit anyone types for a reference budget
+        };
+        num.trim().parse::<f64>().ok().map(|v| (v * mult as f64) as u64)
+    }
+
+    fn cgroup_limit_kb() -> Option<u64> {
+        let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let path = cg.lines().find_map(|l| l.split(':').nth(2))?.to_string();
+        let v = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max")).ok()?;
+        v.trim().parse::<u64>().ok().map(|b| b / 1024) // "max" fails to parse -> unbounded
+    }
+
+    fn mem_available_kb() -> Option<u64> {
+        std::fs::read_to_string("/proc/meminfo").ok()?.lines()
+            .find(|l| l.starts_with("MemAvailable:"))?
+            .split_whitespace().nth(1)?.parse().ok()
+    }
+
+    match spec {
+        None => 0,
+        Some(s) if s.eq_ignore_ascii_case("auto") => {
+            let avail = cgroup_limit_kb().or_else(mem_available_kb).unwrap_or(0);
+            // 60%: the rejoin also holds anonymous memory (reads, evidence, output buffers), and a
+            // budget that consumed everything available would just move the OOM somewhere else.
+            (avail as f64 * 0.60) as u64
+        }
+        Some(s) => parse_size(s).unwrap_or(0),
+    }
+}
+
 const INDEX_EXTENSION: &str = ".flex.index";
 const ID2REF_MAP_EXTENSION: &str = ".flex.id2ref";
 const REF2ID_MAP_EXTENSION: &str = ".flex.ref2id";
@@ -50,6 +106,13 @@ impl DBPaths {
         format!("{}.blob", self.index_path.to_string_lossy())
     }
 
+    /// Memory-mappable reference-sequence blob (all sequences concatenated + an offset table), so a
+    /// load can `mmap` it instead of re-parsing the multi-GB reference FASTA every run. Generated
+    /// lazily on the first load that doesn't find it.
+    pub fn refseq_file(&self) -> String {
+        format!("{}.refseq", self.index_path.to_string_lossy())
+    }
+
     pub fn valid_paths(&self) -> bool {
         Path::exists(&self.reference_path) &
         Path::exists(Path::new(&self.index_blob_file())) &
@@ -64,6 +127,14 @@ pub trait FlexalignDatabase {
     fn get_rid(&self, reference: &str) -> Option<&usize>;
     fn get_rname(&self, id: usize) -> Option<&str>;
     fn get_reference(&self, id: usize) -> Option<&[u8]>;
+
+    /// Drop resident pages of the reference-sequence mapping, if it is memory-mapped.
+    ///
+    /// Alignment touches a few hundred scattered bases per candidate, so over millions of
+    /// candidates essentially the whole reference becomes resident and sets peak RSS -- above even
+    /// a full shard. Calling this at a batch boundary bounds residency to one batch's worth
+    /// instead. Default is a no-op (owned records cannot be dropped).
+    fn release_references(&self) {}
     fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>>;
     fn build(options: &Options) -> Self;
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error>;

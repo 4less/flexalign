@@ -39,7 +39,14 @@ pub struct ShardEntry {
 }
 
 /// Records how an index was sliced: the scheme parameters, the shared reference files, and each
-/// shard's key range and blob. Written next to the index as `<index>.shards.json`.
+/// shard's key range and blob.
+///
+/// The shard COUNT is part of every filename -- `<index>.s<n>.shards.json` and
+/// `<index>.s<n>.shard<i>.blob` -- so slicings at different counts sit side by side next to the
+/// index, alongside the unsharded blob, instead of overwriting one another. With the count omitted,
+/// re-slicing the same reference at a different N silently clobbered the previous slicing (a
+/// 4-shard slice overwrote shard0/shard1 of a 2-shard one and orphaned shard2/shard3), so switching
+/// back meant a full re-slice.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SliceManifest {
     pub c: usize,
@@ -52,8 +59,13 @@ pub struct SliceManifest {
 }
 
 impl SliceManifest {
-    pub fn path_for(paths: &DBPaths) -> String {
-        format!("{}.shards.json", paths.index_path.to_string_lossy())
+    /// Filename stem shared by one slicing's artifacts: `<index>.s<n>`.
+    pub fn stem_for(paths: &DBPaths, n_shards: usize) -> String {
+        format!("{}.s{}", paths.index_path.to_string_lossy(), n_shards)
+    }
+
+    pub fn path_for(paths: &DBPaths, n_shards: usize) -> String {
+        format!("{}.shards.json", Self::stem_for(paths, n_shards))
     }
 
     pub fn load(path: &str) -> std::io::Result<Self> {
@@ -134,7 +146,8 @@ pub fn slice_index<
     let block_cells = CELLS_PER_HEAD + CELLS_PER_BODY as usize;
     let shift = CELLS_PER_BODY.ilog2() as usize;
     let key_space = 1u64 << (2 * C);
-    let base = paths.index_path.to_string_lossy().into_owned();
+    // The shard count is in the stem, so slicings at different counts cannot overwrite each other.
+    let stem = SliceManifest::stem_for(paths, n_shards);
 
     let mut shards = Vec::new();
     for (i, range) in split_by_value_bytes(&full, key_space, block_cells, shift, n_shards)
@@ -168,7 +181,7 @@ pub fn slice_index<
             FMValues::<F, HEADER_THRESHOLD> { data: full.values.data[v_lo..v_hi].to_vec() };
         let shard_map = Flexmap::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD> { keys, values };
 
-        let blob_file = format!("{}.shard{}.blob", base, i);
+        let blob_file = format!("{}.shard{}.blob", stem, i);
         shard_map.save_blob(&blob_file);
         shards.push(ShardEntry { lo: range.lo, hi: range.hi, blob_file });
     }
@@ -184,7 +197,7 @@ pub fn slice_index<
     };
 
     std::fs::write(
-        SliceManifest::path_for(paths),
+        SliceManifest::path_for(paths, n_shards),
         serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
     )?;
 

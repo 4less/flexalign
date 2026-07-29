@@ -218,6 +218,20 @@ impl Cigar {
     }
 
     /// How many reference bases this CIGAR consumes.
+    /// Query bases the alignment actually PLACES, excluding soft-clips.
+    ///
+    /// `query_consumed` counts `S` too (it must, so CIGAR and SEQ lengths agree). Anything asking
+    /// "how much of the read did we actually align" -- the coverage gate, the end-to-end check --
+    /// has to exclude clips, or a read that is 90% clipped reads as 100% covered.
+    pub fn query_aligned(&self) -> usize {
+        self.0.iter().filter(|c| matches!(**c, b'M' | b'X' | b'D')).count()
+    }
+
+    /// Leading soft-clip length: query bases before the alignment starts.
+    pub fn leading_softclip(&self) -> usize {
+        self.0.iter().take_while(|c| **c == b'S').count()
+    }
+
     pub fn reference_consumed(&self) -> usize {
         self.0.iter().filter(|c| matches!(**c, b'M' | b'X' | b'I')).count()
     }

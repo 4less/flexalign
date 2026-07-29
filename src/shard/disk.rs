@@ -183,6 +183,27 @@ pub fn run_shard_pass_to_disk<
 /// evidence from each shard file, rebuilds seeds, and aligns into PAF. Only one batch's evidence is
 /// resident at a time. `evidence_paths` are the per-shard chunk files written by
 /// [`run_shard_pass_to_disk`]; `db` is the full index (references + names).
+/// Reads between residency checks when a reference budget is in force. Small enough that the
+/// resident set cannot overshoot the budget by much (~0.6 MB/read measured on the protal marker DB),
+/// large enough that the `/proc` read is amortised to nothing.
+const REF_CHECK_STRIDE: usize = 512;
+
+/// Resident kB of file-backed pages for this process.
+///
+/// `RssFile` covers every file mapping, not just the reference; on the rejoin path the shards are
+/// already dropped and the index blob is barely touched, so it tracks the reference closely enough
+/// to drive the budget, and costs one small read instead of parsing all of `smaps`.
+fn resident_ref_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("RssFile:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 pub fn run_disk_rejoin_align<
     const K: usize,
     const C: usize,
@@ -245,6 +266,8 @@ pub fn run_disk_rejoin_align<
     let mut sort_time = Duration::ZERO;
     // Per-batch decoded evidence (idx_in_batch -> gathered groups across shards); only one batch resident.
     let mut current_batch: Option<u64> = None;
+    let mut since_release: usize = 0;
+    let ref_budget_kb = crate::database::common::ref_budget_kb();
     let mut batch_map: HashMap<u32, Vec<GroupRecord>> = HashMap::new();
     let mut chunk_buf: Vec<u8> = Vec::new();
     let empty: Vec<GroupRecord> = Vec::new();
@@ -267,6 +290,27 @@ pub fn run_disk_rejoin_align<
                 }
             }
             current_batch = Some(id.batch_id);
+        }
+
+        // Reference pages accumulate DURING a batch -- ~0.6 MB of distinct pages per read on a
+        // marker DB, so a whole 15 GB reference goes resident within ~25k reads and releasing only
+        // at batch boundaries bounds nothing.
+        //
+        // Policy: spend RAM freely while there is RAM to spend, and only start dropping pages when
+        // the resident reference exceeds the budget. Unbounded (`budget == 0`) is the default, so
+        // a big machine behaves exactly as before; on a constrained box or under a cgroup cap the
+        // budget holds residency near it, paying re-faults (minor -- the pages stay in the page
+        // cache) to stay inside the limit instead of being OOM-killed.
+        if ref_budget_kb > 0 {
+            since_release += 1;
+            // Checking /proc costs a syscall + parse, so amortise it over a stride of reads rather
+            // than testing on every one.
+            if since_release >= REF_CHECK_STRIDE {
+                since_release = 0;
+                if resident_ref_kb() > ref_budget_kb {
+                    db.release_references();
+                }
+            }
         }
 
         let groups = batch_map.get(&(id.idx_in_batch as u32)).unwrap_or(&empty);

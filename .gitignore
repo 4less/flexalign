@@ -12,3 +12,4 @@ perf.data.old
 run_debug.sh
 run_default.sh
 run_default_single.sh
+paired.out
