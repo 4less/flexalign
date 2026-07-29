@@ -153,6 +153,18 @@ pub struct Args {
     #[arg(long = "mapq-from-alignment", action)]
     pub mapq_from_alignment: bool,
 
+    /// Use the N-shard slicing of the index (RAM-bounded: one shard resident at a time).
+    ///
+    /// Normally unnecessary -- a sliced index is discovered from the reference path
+    /// (`<index>.s<n>.shards.json`) and used automatically. Give this when several slicings exist
+    /// and you want a specific one, or to slice a new shard count on the fly.
+    #[arg(long = "shards", value_name = "N")]
+    pub shards: Option<usize>,
+
+    /// Ignore any sliced index and align against the whole one.
+    #[arg(long = "no-shards", action)]
+    pub no_shards: bool,
+
     /// Cap the resident reference: `auto`, or a size like `8G` / `512M`. Absent = unbounded.
     ///
     /// Alignment touches ~0.6 MB of distinct reference pages per read, so on a large reference the

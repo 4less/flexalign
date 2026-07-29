@@ -68,6 +68,34 @@ impl SliceManifest {
         format!("{}.shards.json", Self::stem_for(paths, n_shards))
     }
 
+    /// Shard counts already sliced for this reference, ascending.
+    ///
+    /// The slicings are discoverable from the reference path alone -- `<index>.s<n>.shards.json` --
+    /// so a caller can tell whether a sharded index exists without being told. That is what lets
+    /// the main binary pick the sharded path automatically instead of requiring a separate
+    /// executable, and what lets several shard counts coexist for the same reference.
+    pub fn available(paths: &DBPaths) -> Vec<usize> {
+        let stem = format!("{}.s", paths.index_path.to_string_lossy());
+        let dir = match paths.index_path.parent() {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let mut found: Vec<usize> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let s = p.to_string_lossy().into_owned();
+                let rest = s.strip_prefix(&stem)?.strip_suffix(".shards.json")?;
+                rest.parse::<usize>().ok()
+            })
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
     pub fn load(path: &str) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&text).expect("valid shard manifest"))

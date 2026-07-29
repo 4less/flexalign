@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod pass;
 pub mod record;
 pub mod rejoin;
+pub mod run;
 pub mod rejoin_align;
 pub mod replay;
 pub mod slice;

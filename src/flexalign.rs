@@ -20,6 +20,42 @@ pub fn time<F, T>(f: F) -> (Duration, T)
     
 // }
 
+/// The (reads_1, reads_2, output) triples a sharded run should process.
+///
+/// Output path follows the same rules as the unsharded path: `--output` names a file for a single
+/// input pair and a directory for several, and the format is taken from the extension (`.sam` with
+/// --sam, `.paf` otherwise) so a caller does not have to restate it.
+fn sharded_pairs(options: &Options) -> Vec<(String, String, String)> {
+    let ext = if options.args.sam { "sam" } else { "paf" };
+    let fwd: Vec<String> = options.args.fwd.iter().filter(|f| !f.is_empty()).cloned().collect();
+    let rev: Vec<String> = options.args.rev.iter().filter(|f| !f.is_empty()).cloned().collect();
+    if fwd.is_empty() || fwd.len() != rev.len() {
+        return Vec::new();
+    }
+    let multi = fwd.len() > 1;
+    fwd.iter()
+        .zip(rev.iter())
+        .map(|(r1, r2)| {
+            let out = match (&options.args.output, multi) {
+                // One pair, explicit output: use it verbatim.
+                (Some(o), false) => o.clone(),
+                // Several pairs: --output is a directory, prefix inferred per input.
+                (Some(dir), true) => {
+                    let _ = std::fs::create_dir_all(dir);
+                    let stem = std::path::Path::new(r1)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().split('.').next().unwrap_or("out").to_string())
+                        .unwrap_or_else(|| "out".to_string());
+                    format!("{}/{}.{}", dir.trim_end_matches('/'), stem, ext)
+                }
+                // No --output: next to the reads.
+                (None, _) => format!("{}.{}", r1.trim_end_matches(".gz"), ext),
+            };
+            (r1.clone(), r2.clone(), out)
+        })
+        .collect()
+}
+
 pub fn run(args: Args) {
     let options = Options::from_args(args);
 
@@ -49,6 +85,41 @@ pub fn run(args: Args) {
     const L: usize = C - S + 1; //1
     const CELLS_PER_BODY: u64 = 16;
     const HEADER_THRESHOLD: usize = 2;
+
+    // A sliced index is discoverable from the reference path alone, so the sharded pipeline is
+    // selected here rather than by reaching for a separate executable. --shards N picks a specific
+    // slicing (or slices one); --no-shards ignores them.
+    if options.args.shard_slice.is_none() && !options.args.no_shards {
+        let available = crate::shard::slice::SliceManifest::available(&db_paths);
+        let chosen = options.args.shards.or_else(|| {
+            match available.len() {
+                0 => None,
+                1 => Some(available[0]),
+                _ => {
+                    // Several slicings exist and none was named. Picking one silently would make the
+                    // run's memory profile depend on what happens to be on disk, so say what is
+                    // there and let the caller choose.
+                    eprintln!(
+                        "Several sliced indexes exist ({}). Pick one with --shards N, or --no-shards.",
+                        available.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    exit(3);
+                }
+            }
+        });
+        if let Some(n_shards) = chosen {
+            let pairs = sharded_pairs(&options);
+            if pairs.is_empty() {
+                eprintln!("Sharded alignment is paired-end only: give -1 and -2.");
+                exit(4);
+            }
+            eprintln!("Using the {n_shards}-shard index for {:?}", options.reference);
+            crate::shard::run::run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(
+                &db_paths, &options, n_shards, pairs,
+            );
+            return;
+        }
+    }
 
     // Build if the index is missing, if forced, OR if the on-disk blob is incompatible with this
     // build (wrong blob version / const params). The last check is what stops a stale index -- e.g.
