@@ -22,7 +22,7 @@ pub fn default<
             &options.reference, options.args.max_range_size
         )
     });
-    println!("Building database: {:?}", duration);
+    eprintln!("Building database: {:?}", duration);
 
     let (flexmap, reference2id, id2reference) = result.expect("Building database works");
 

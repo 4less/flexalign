@@ -89,8 +89,8 @@ impl<'a, const C: usize, const S: usize, const L: usize> FnMut<(&'_ RefFastqReco
 
 
         if seedlist.len() < 3 {
-            println!("Seeds {}", seedlist.len());
-            println!("{}", rec1.to_string());
+            eprintln!("Seeds {}", seedlist.len());
+            eprintln!("{}", rec1.to_string());
         }
 
         seedlist.clear();

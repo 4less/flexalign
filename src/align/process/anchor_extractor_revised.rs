@@ -223,7 +223,7 @@ pub fn group_into_anchor_module<'a>(
     // eprintln!("END -- Seed group -- {}", seeds.first().unwrap().rval );
 
     if indel_flag {
-        println!("Indel")
+        eprintln!("Indel")
     }
 }
 
@@ -581,7 +581,6 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                 while !self.anchors_fwd.is_empty() {
                     self.anchors.push(AnchorPair(self.anchors_fwd.pop(), None));
                 }
-                current_idx += 1;
             } else {
                 // eprintln!("Extra SINGLE REV DEAL WITH REFERENCE:  {}", current.reference);
                 group_into_anchor_module(
@@ -596,7 +595,6 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                 while !self.anchors_rev.is_empty() {
                     self.anchors.push(AnchorPair(None, self.anchors_rev.pop()));
                 }
-                current_idx += 1;
             }
         }
 

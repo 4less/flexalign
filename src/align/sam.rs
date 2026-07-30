@@ -257,7 +257,7 @@ impl Cigar {
         let mut run_op = 0u8;
         let mut run_len = 0usize;
 
-        let mut flush = |op: u8, len: usize, out: &mut String| {
+        let flush = |op: u8, len: usize, out: &mut String| {
             if len == 0 {
                 return;
             }

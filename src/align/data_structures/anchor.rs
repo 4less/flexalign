@@ -401,8 +401,15 @@ impl Anchor {
                     if merge_possible {
                         let mut newa = other.clone();
                         let mut newseeds = self.seeds.clone();
-                        if !newa.forward { 
-                            newseeds.iter_mut().map(|s| s.reverse(read_length));
+                        if !newa.forward {
+                            // `iter_mut().map(..)` here did NOTHING: `map` is lazy and the
+                            // resulting iterator was dropped, so `Seed::reverse` -- which mutates
+                            // `qpos` in place -- never ran. Seeds merged into a reverse-strand
+                            // anchor therefore kept forward-frame coordinates and were then sorted
+                            // by `qbegin()`, giving the merged anchor inconsistent seed geometry.
+                            for s in newseeds.iter_mut() {
+                                s.reverse(read_length);
+                            }
                         }
                         newa.seed_count += newseeds.len() as u32;
                         newa.seeds.extend(newseeds);
@@ -1254,9 +1261,9 @@ impl Anchor {
 
     pub fn valid_seed_check(&self, query: &[u8], reference: &[u8]) {
         self.seeds.iter().for_each(|s| {
-            println!("Seed: {}", s);
-            println!("\tQ: {}", String::from_utf8_lossy(&query[s.qrange()]));
-            println!("\tR: {}", String::from_utf8_lossy(&reference[s.rrange()]));
+            eprintln!("Seed: {}", s);
+            eprintln!("\tQ: {}", String::from_utf8_lossy(&query[s.qrange()]));
+            eprintln!("\tR: {}", String::from_utf8_lossy(&reference[s.rrange()]));
         });
     }
 

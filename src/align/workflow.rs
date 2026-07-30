@@ -662,7 +662,7 @@ impl<
 
         if stop {
             for seed in self.seeds.iter() {
-                println!("{}", seed);
+                eprintln!("{}", seed);
             }
             let mut s= String::new();
             stdin().read_line(&mut s).expect("Did not enter a correct string");

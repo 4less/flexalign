@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::{BufReader, BufWriter}};
+use std::{collections::HashMap, fs::File, io::BufWriter};
 
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
 use flexmap::flexmap::{Flexmap, FlexmapBlob, VRangeGetter};
@@ -353,7 +353,8 @@ impl<
         });
 
         let mut d_refparse = std::time::Duration::ZERO;
-        let mut d_rev = std::time::Duration::ZERO;
+        // Assigned in every branch below, so no initialiser is needed.
+        let d_rev;
         let mut ref_mode = "mmap of blob";
         let (references, rname_to_rid) = match mapped {
             Some(blob) => {

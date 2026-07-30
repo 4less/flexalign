@@ -7,7 +7,6 @@ use log::info;
 
 use crate::{
     GOLDSTD_EVAL, align::{
-        common::{NoSAMOutput, Or},
         modular_workflow::{Modular, ModularPE}, 
         process::{
             alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor

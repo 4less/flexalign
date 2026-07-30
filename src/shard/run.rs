@@ -24,7 +24,7 @@ use std::time::Instant;
 use bioreader::utils::is_gzip;
 use flate2::read::GzDecoder;
 
-use crate::database::common::{DBPaths, FlexalignDatabase};
+use crate::database::common::DBPaths;
 use crate::database::flexmap::DB;
 use crate::io::output_buffer::{OutputBuffer, OutputTarget};
 use crate::options::Options;
