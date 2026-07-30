@@ -107,7 +107,8 @@ pub struct Args {
     #[arg(long = "debug", action)]
     pub debug: bool,
 
-    /// align the top y anchors. This happens after anchor extension 
+    /// Verbosity: 0 Off, 1 Error, 2 Warn, 3 Info, 4 Debug, 5 Trace. All logging goes to stderr --
+    /// stdout carries the alignments.
     #[arg(long = "log-level", default_value_t = 3)]
     pub log_level: usize,
 
@@ -227,7 +228,6 @@ pub struct Options {
     pub rev: Vec<Option<PathBuf>>,
     pub output_prefix: Option<Vec<PathBuf>>,
     pub reference: PathBuf,
-    pub reference_database: PathBuf,
     
     pub args: Args,
 }
@@ -239,7 +239,6 @@ impl Options {
             fwd: vec![PathBuf::default(); 0],
             rev: vec![None; 0],
             reference: PathBuf::default(),
-            reference_database: PathBuf::default(),
             output_prefix: None,
             args: args,
         };
@@ -266,18 +265,21 @@ impl Options {
                 })
                 .collect::<Vec<_>>());
         } else if self.fwd.len() == 1 && self.args.output.is_some() {
-            let s = self.fwd.first().unwrap().to_str().unwrap();
-            let s = s.strip_suffix(".gz").unwrap_or(s);
-            let s = s.strip_suffix(".bz").unwrap_or(s);
-            let s = s.strip_suffix(".bz2").unwrap_or(s);     // Remove .gz if present
-            let s = s.rsplit_once('.').map_or(s, |(left, _)| left);
-            
-            self.output_prefix = Some(vec![PathBuf::from(s); 0]);
+            // ONE input pair: `--output` names the output FILE itself, as the README and the
+            // sharded path both specify ("a file for a single input pair, a directory for several").
+            //
+            // This used to derive a name from the INPUT path and then build it with `vec![p; 0]` --
+            // a zero-length vector -- so the per-input lookup in process_fastq found nothing and
+            // panicked with "There is no output for input", and `--output` was ignored either way.
+            self.output_prefix =
+                Some(vec![PathBuf::from(self.args.output.as_ref().unwrap())]);
         }
-        
+
         if self.output_prefix.is_some() {
             for s in self.output_prefix.as_ref().unwrap() {
-                println!("{:?}", s);
+                // STDERR, not stdout: stdout carries the alignments (PAF/SAM), so anything else
+                // written there corrupts the output stream.
+                log::debug!("output -> {:?}", s);
             }
         }
 

@@ -17,6 +17,25 @@ use crate::{
     }, database::common::FlexalignDatabase, io::output_buffer::{OutputBuffer, OutputTarget}, options::Options};
 
 
+/// Where the false-positive reads of `reads_file` are written (gold-standard evaluation only).
+///
+/// `--output-prefix-fp-reads PREFIX` puts them at `PREFIX<read file name>.fp`; without it they land
+/// beside the reads as `<reads_file>.fp`, which is what the code did unconditionally before -- the
+/// flag existed but was never read, so passing it silently changed nothing.
+fn fp_reads_path(options: &Options, reads_file: &std::path::Path) -> String {
+    match &options.args.output_prefix_fp_reads {
+        Some(prefix) => {
+            let name = reads_file
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "reads".to_string());
+            format!("{prefix}{name}.fp")
+        }
+        None => format!("{}.fp", reads_file.to_string_lossy()),
+    }
+}
+
+
 pub fn process_fastq_wrapper<
         const K: usize, 
         const C: usize, 
@@ -78,8 +97,13 @@ pub fn process_fastq_wrapper<
                 if GOLDSTD_EVAL {
                     let mapqeval = state.gold_std_evaluation.as_mut().unwrap();
 
-                    let fp_read1_outpath = PathBuf::from_str(&format!("{}.fp", fwd.to_str().unwrap())).unwrap();
-                    let fp_read1_file = File::create_new(fp_read1_outpath.clone()).unwrap();
+                    // --output-prefix-fp-reads, when given, decides where these go; otherwise they
+                    // land beside the reads as <reads>.fp (the previous hardcoded behaviour). The
+                    // flag was declared and never read, so setting it silently did nothing.
+                    let fp_read1_outpath = PathBuf::from_str(&fp_reads_path(options, fwd)).unwrap();
+                    // `create_new` fails if the file exists, so a SECOND run panicked. Truncate
+                    // instead, matching the equivalent path in the modular wrapper below.
+                    let fp_read1_file = File::create(fp_read1_outpath.clone()).unwrap();
                     let fp_read1_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read1_file)));
                     
                     // let fp_read2_outpath = PathBuf::from_str(&format!("{}.fp", rev.to_str().unwrap())).unwrap();
@@ -307,11 +331,11 @@ pub fn process_fastq_wrapper_modular<
                 if GOLDSTD_EVAL {
                     let mapqeval = state.gold_std_evaluation.as_mut().unwrap();
 
-                    let fp_read1_outpath = PathBuf::from_str(&format!("{}.fp", fwd.to_str().unwrap())).unwrap();
+                    let fp_read1_outpath = PathBuf::from_str(&fp_reads_path(options, fwd)).unwrap();
                     let fp_read1_file = File::create(fp_read1_outpath.clone()).unwrap();
                     let fp_read1_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read1_file)));
                     
-                    let fp_read2_outpath = PathBuf::from_str(&format!("{}.fp", rev.to_str().unwrap())).unwrap();
+                    let fp_read2_outpath = PathBuf::from_str(&fp_reads_path(options, rev)).unwrap();
                     let fp_read2_file = File::create(fp_read2_outpath.clone()).unwrap();
                     let fp_read2_writer = Arc::new(Mutex::new(OutputTarget::File(fp_read2_file)));
                     
