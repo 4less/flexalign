@@ -24,7 +24,7 @@ channel = "nightly"
 # copy of each. Cargo refuses to unify them ("patches must point to different sources"), so closing
 # that gap means pinning inside flexmap's own manifest.
 kmerrs = { git = "https://github.com/4less/kmerr.git", rev = "3b86438d083ba83d334ba19a5f5a45ad045f247d" }
-flexmap = { git = "https://github.com/4less/flexmap.git", rev = "3356b655e9cc4f5edceb11679ebd0a9308f1a820" }
+flexmap = { git = "https://github.com/4less/flexmap.git", rev = "cebfd562b073e7ac09a83817bec62ab9059f6586" }
 bioreader = { git = "https://github.com/4less/bioreader.git", rev = "1ba00bb9055ec71334c87576e12023f994dd1390" }
 libwfa2 = "0.1.1"
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
