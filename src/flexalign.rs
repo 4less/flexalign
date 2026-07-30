@@ -23,10 +23,10 @@ pub fn time<F, T>(f: F) -> (Duration, T)
 /// The (reads_1, reads_2, output) triples a sharded run should process.
 ///
 /// Output path follows the same rules as the unsharded path: `--output` names a file for a single
-/// input pair and a directory for several, and the format is taken from the extension (`.sam` with
-/// --sam, `.paf` otherwise) so a caller does not have to restate it.
+/// input pair and a directory for several, and the format is taken from the extension (`.sam` by
+/// default, `.paf` with --paf) so a caller does not have to restate it.
 fn sharded_pairs(options: &Options) -> Vec<(String, String, String)> {
-    let ext = if options.args.sam { "sam" } else { "paf" };
+    let ext = if options.args.emit_sam() { "sam" } else { "paf" };
     let fwd: Vec<String> = options.args.fwd.iter().filter(|f| !f.is_empty()).cloned().collect();
     let rev: Vec<String> = options.args.rev.iter().filter(|f| !f.is_empty()).cloned().collect();
     if fwd.is_empty() || fwd.len() != rev.len() {
@@ -70,6 +70,10 @@ pub fn run(args: Args) {
         }
     }
 
+    // The whole database is read up front unless --lazy-ref says otherwise. Set before any load,
+    // for the same reason as the budget above: the mapping happens below the option plumbing.
+    crate::database::common::EAGER_REF
+        .store(!options.args.lazy_ref, std::sync::atomic::Ordering::Relaxed);
 
     if !options.reference.exists() {
         eprintln!("Reference does not exist {:?}", options.reference);

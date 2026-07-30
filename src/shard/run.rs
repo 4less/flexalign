@@ -1,14 +1,20 @@
 //! The sharded alignment run, as a library entry point.
 //!
-//! This is the pipeline `examples/shard_align` used to own. It lives here so the main binary can
-//! select it automatically: a sliced index is discoverable from the reference path
-//! (`<index>.s<n>.shards.json`, see [`SliceManifest::available`]), so callers should not have to
-//! know which executable to reach for. The example is now a thin wrapper over this.
+//! It lives here, in the library, so the MAIN binary can select it automatically: a sliced index is
+//! discoverable from the reference path (`<index>.s<n>.shards.json`, see
+//! [`SliceManifest::available`]), so a caller should not have to know which executable to reach for.
+//! There is deliberately no separate sharded binary -- one entry point, one set of options.
 //!
 //! Shape of the run, and why: the SHARD loop is the outer one and samples are inner, so each shard
 //! is memory-mapped once for the whole batch instead of once per sample, and is dropped before the
-//! next loads. Evidence is streamed to per-(shard, sample) files rather than accumulated, so peak
-//! memory is one shard plus one batch of evidence -- independent of how many reads there are.
+//! next loads. Evidence is streamed to per-(shard, sample) files rather than accumulated.
+//!
+//! The memory contract, which the whole design exists to provide:
+//! **at any instant either ONE shard is mapped, or the reference is -- never two shards, and never a
+//! shard together with the reference.** The shard loop drops each shard before the next loads, and the
+//! reference is opened only afterwards, for the join. Reads are STREAMED from their files on every
+//! pass and never held decompressed, so peak RSS is `max(one shard, reference)` and does not grow
+//! with the number of samples or the depth of the reads.
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -26,29 +32,34 @@ use crate::shard::disk::{count_batches, run_disk_rejoin_align, run_shard_pass_to
 use crate::shard::slice::{slice_index, PhysicalShardDB, SliceManifest};
 
 const BUFFER_SIZE: usize = 1 << 24;
-const THREADS: u32 = 4;
 const MAX_HEADERED: usize = 15;
 
-/// One sample of a batch: its read files, its output path, and its reads once loaded.
+/// One sample of a batch: its read FILES and its output path. The reads are never held in memory.
 pub struct ShardSample {
     pub r1: String,
     pub r2: String,
     pub out: String,
-    reads1: Vec<u8>,
-    reads2: Vec<u8>,
     n_batches: u64,
 }
 
-fn read_all(path: &str) -> Vec<u8> {
-    let gz = is_gzip(path).unwrap_or(false);
+/// A fresh streaming reader over a read file, transparently gunzipping.
+///
+/// Every pass over a sample re-opens its files instead of reusing a decompressed copy. Holding the
+/// reads was the single largest term in a sharded batch's memory: a 10 M-pair sample is ~6.5 GB
+/// DECOMPRESSED (0.5 GB gzipped), so five samples held at once were 32.6 GB -- more than the 15.4 GB
+/// reference and four times one 7.5 GB shard. That inverted the whole point of sharding, making the
+/// sharded batch the largest-RSS contender of all.
+///
+/// The cost of streaming is re-inflating the gzip once per shard pass (CPU), which is the correct
+/// trade here: the design exists to bound memory, and peak RSS must be
+/// `max(one shard, reference)` -- never a shard plus a reference plus every sample's reads.
+fn open_reads(path: &str) -> Box<dyn Read + Send> {
     let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {}", path, e));
-    let mut buf = Vec::new();
-    if gz {
-        GzDecoder::new(file).read_to_end(&mut buf).expect("gunzip");
+    if is_gzip(path).unwrap_or(false) {
+        Box::new(GzDecoder::new(BufReader::with_capacity(1 << 22, file)))
     } else {
-        BufReader::new(file).read_to_end(&mut buf).expect("read");
+        Box::new(BufReader::with_capacity(1 << 22, file))
     }
-    buf
 }
 
 /// Align every `(reads_1, reads_2, output)` triple against the `n_shards` slicing of `paths`.
@@ -72,6 +83,10 @@ pub fn run_sharded<
     type ShardOf<const C: usize, const F: usize, const CB: u64, const HT: usize> =
         PhysicalShardDB<C, F, CB, HT>;
 
+    // -t, not a constant. This was hardcoded to 4, so sharded runs ignored --threads entirely and
+    // were benchmarked at 4 workers against everything else's 16 -- most of an apparent slowdown.
+    let threads: u32 = options.args.threads.max(1);
+
     let manifest = match SliceManifest::load(&SliceManifest::path_for(paths, n_shards)) {
         Ok(m) if m.shards.len() == n_shards => {
             eprintln!("Reusing existing slice ({n_shards} shards)");
@@ -83,15 +98,14 @@ pub fn run_sharded<
         }
     };
 
-    // All samples' reads are resident at once: the shard loop is the OUTER one, so every sample has
-    // to be streamable while a given shard is loaded. Reads are small next to a shard.
+    // Only the FILE NAMES are kept; each pass re-opens and streams them (see `open_reads`). The
+    // batch amortises the shard loads, not the reads -- holding the reads is what blew peak RSS past
+    // the unsharded contender it is supposed to undercut.
     let samples: Vec<ShardSample> = pairs
         .into_iter()
         .map(|(r1, r2, out)| {
-            let reads1 = read_all(&r1);
-            let reads2 = read_all(&r2);
-            let n_batches = count_batches(reads1.as_slice(), reads2.as_slice(), BUFFER_SIZE, THREADS);
-            ShardSample { r1, r2, out, reads1, reads2, n_batches }
+            let n_batches = count_batches(open_reads(&r1), open_reads(&r2), BUFFER_SIZE, threads);
+            ShardSample { r1, r2, out, n_batches }
         })
         .collect();
     eprintln!(
@@ -114,10 +128,10 @@ pub fn run_sharded<
             let emit = run_shard_pass_to_disk::<
                 K, C, F, S, L,
                 ShardOf<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>,
-                &[u8],
+                Box<dyn Read + Send>,
             >(
-                &s.reads1, &s.reads2, &shard, s.n_batches, &evidence[i][j], BUFFER_SIZE, THREADS,
-                options.args.max_best_flex, MAX_HEADERED,
+                open_reads(&s.r1), open_reads(&s.r2), &shard, s.n_batches, &evidence[i][j],
+                BUFFER_SIZE, threads, options.args.max_best_flex, MAX_HEADERED,
             )
             .expect("shard pass");
             eprintln!(
@@ -129,10 +143,13 @@ pub fn run_sharded<
     }
     let pass_secs = t_pass.elapsed().as_secs_f64();
 
-    // Rejoin + align: streams evidence back per batch. The full index is loaded ONCE and reused for
-    // every sample -- the second place a batch would otherwise repeat a multi-GB load.
-    eprintln!("Loading full index for the align half ...");
-    let full: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = DB::load(paths, 1);
+    // Rejoin + align: streams evidence back per batch and REPLAYS the anchors the shard passes
+    // already found (run_disk_rejoin_align never calls a range extractor), so the k-mer index is not
+    // needed here at all -- only the reference bases to align against. Loading the full 30 GB index,
+    // as this used to, read a file the join never queries. The join phase touches NO index: it loads
+    // the reference only, mapping the index without reading it.
+    eprintln!("Loading reference for the align half (no index) ...");
+    let full: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = DB::load_reference_only(paths);
 
     let t_align = Instant::now();
     let mut total_alignments = 0usize;
@@ -145,10 +162,10 @@ pub fn run_sharded<
         let stats = run_disk_rejoin_align::<
             K, C, F, S, L,
             DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>,
-            &[u8],
+            Box<dyn Read + Send>,
         >(
-            &s.reads1, &s.reads2, &full, options, out_buffer, &ev, options.args.ranges,
-            BUFFER_SIZE, THREADS,
+            open_reads(&s.r1), open_reads(&s.r2), &full, options, out_buffer, &ev,
+            options.args.ranges, BUFFER_SIZE, threads,
         )
         .expect("rejoin");
         total_alignments += stats.alignments_successful as usize;

@@ -36,8 +36,9 @@ just install-cluster              # -> ~/bin
 just install-cluster ~/opt/fa     # or a prefix of your choosing
 ```
 
-That installs nightly via rustup, checks the C toolchain, builds `flexalign` and the `shard_align`
-example, and installs both. Load your cluster's compiler modules first if it provides them that way.
+That installs nightly via rustup, checks the C toolchain, and builds and installs `flexalign`. One
+binary covers everything, sharded runs included. Load your cluster's compiler modules first if it
+provides them that way.
 
 Dependencies (`kmerrs`, `flexmap`, `bioreader`) are pinned to exact git revisions, so a build
 anywhere reproduces the same binary. `flexmap` owns the on-disk index format, so leaving it floating
@@ -98,18 +99,24 @@ the wall time grows roughly with the shard count while peak memory falls.
 ## Align against a prebuilt database
 
 ```sh
-# paired-end, PAF to stdout
-flexalign -r reference.fna -1 reads_R1.fq.gz -2 reads_R2.fq.gz -t 16 > out.paf
+# paired-end, SAM to stdout (the default: carries CIGAR and NM)
+flexalign -r reference.fna -1 reads_R1.fq.gz -2 reads_R2.fq.gz -t 16 > out.sam
 
-# SAM instead (adds CIGAR and NM)
-flexalign -r reference.fna -1 reads_R1.fq.gz -2 reads_R2.fq.gz -t 16 --sam > out.sam
+# PAF instead (mapping positions only)
+flexalign -r reference.fna -1 reads_R1.fq.gz -2 reads_R2.fq.gz -t 16 --paf > out.paf
 
-# single-end
+# single-end — always PAF, see below
 flexalign -r reference.fna -1 reads.fq.gz -t 16 > out.paf
 ```
 
-`--sam` is paired-end only, and it emits only records that reached gapped alignment above
-`--min-ani` — reads below it are omitted rather than written as unmapped.
+**SAM is the default**, since the aligner has already computed the CIGAR and NM that PAF would throw
+away; `--paf` is the lossy option and therefore the one you ask for. Either format emits only records
+that reached gapped alignment above `--min-ani` — reads below it are omitted rather than written as
+unmapped.
+
+Single-end input is the exception: that pipeline stops at anchors and never runs gapped alignment, so
+it has no CIGAR to write and PAF is the only possible output. flexalign resolves that itself rather
+than failing, and says so at `--log-level 3`.
 
 **Several samples in one invocation.** `-1` and `-2` accept multiple files, and `--output` then
 names a directory; the output prefix is inferred per input. This matters on a large reference,
@@ -119,38 +126,47 @@ because the index is loaded once for the whole batch instead of once per sample:
 flexalign -r reference.fna \
   -1 s1_R1.fq.gz s2_R1.fq.gz s3_R1.fq.gz \
   -2 s1_R2.fq.gz s2_R2.fq.gz s3_R2.fq.gz \
-  -t 16 --sam --output results/
+  -t 16 --output results/
 ```
 
 ## Align with a sharded database
 
-Sharded alignment is the `shard_align` example rather than a flag on the main binary:
+Sharded alignment is the **same binary** — there is no separate executable. flexalign discovers the
+slicings that exist beside the reference and drives the shard passes itself:
 
 ```sh
-shard_align reference.fna reads_R1.fq.gz reads_R2.fq.gz 4 out.sam
+flexalign -r reference.fna -1 reads_R1.fq.gz -2 reads_R2.fq.gz -t 16 --shards 4 > out.sam
 ```
 
-Output format follows the extension — `.sam` emits SAM, anything else PAF. The slicing is reused if
-a manifest for that shard count exists, and created if not.
+If exactly one slicing exists it is detected and used without `--shards`. If several do, flexalign
+lists them and exits rather than choosing: the shard count decides the run's memory profile, so
+picking one silently would make that depend on whatever happens to be on disk. `--no-shards` ignores
+any slicing and uses the whole index; `--shards N` creates the slicing if it does not exist yet.
 
-For several samples, put them in a manifest (`reads_1<TAB>reads_2<TAB>output` per line) so the
-samples sit *inside* the shard loop and each shard is loaded once for the whole batch:
+For several samples, pass them all in one invocation — that puts the samples *inside* the shard loop,
+so each shard is memory-mapped once for the whole batch instead of once per sample, and the full index
+of the rejoin half is loaded once rather than N times:
 
 ```sh
-printf 's1_R1.fq.gz\ts1_R2.fq.gz\tout/s1.sam\n' >  batch.tsv
-printf 's2_R1.fq.gz\ts2_R2.fq.gz\tout/s2.sam\n' >> batch.tsv
-
-shard_align reference.fna 4 --batch batch.tsv
+flexalign -r reference.fna \
+  -1 s1_R1.fq.gz s2_R1.fq.gz s3_R1.fq.gz \
+  -2 s1_R2.fq.gz s2_R2.fq.gz s3_R2.fq.gz \
+  -t 16 --shards 4 --output results/
 ```
 
-Sharded runs are paired-end only.
+Sharded runs are paired-end only, and `-t` applies to them exactly as to an unsharded run.
 
 ## Bounding memory
 
-By default flexalign lets the reference stay resident — on a machine with free RAM that costs
-nothing, since those pages are reclaimable. Under a memory limit it is what gets a run killed, so
-`--ref-budget` caps the resident reference and drops pages once it is exceeded, re-faulting what it
-needs again:
+**By default the whole database is read into memory during the load** — index *and* reference, each
+in one sequential pass. `mmap` on its own transfers nothing: the multi-GB read still happens, one 4K
+fault at a time, in whatever order queries touch it, and lands inside read processing where it looks
+like compute rather than like the load it is. Reading it up front moves the same bytes, lets the
+kernel read ahead, and makes the reported load figure real.
+
+That leaves the reference resident, which on a machine with free RAM costs nothing — those pages are
+reclaimable. Under a memory limit it is what gets a run killed, so `--ref-budget` caps the resident
+reference and drops pages once it is exceeded, re-faulting what it needs again:
 
 ```sh
 flexalign … --ref-budget auto     # read the cgroup limit (container, slurm, systemd), else MemAvailable
@@ -161,10 +177,19 @@ flexalign … --ref-budget 8G       # or an explicit size
 cgroup cap a 4-shard run completes with a budget where it is OOM-killed without one. The cost is
 re-faulting: roughly 1.7–2× on the rejoin phase at a 6 GB budget.
 
+`--lazy-ref` goes further: it skips the up-front reference read entirely and implies
+`--ref-budget auto`. Use it when RAM is the binding constraint rather than time — alignment touches
+only the few hundred bases around each anchor, so most of a large reference is never needed. The
+index is always read up front regardless: k-mer lookups hit its whole extent in essentially random
+order, so deferring that read does not avoid it, it only converts one streaming read into millions of
+faults.
+
 ## Tuning
 
 | flag | default | effect |
 |---|---|---|
+| `--paf` | off (SAM) | emit PAF instead of SAM |
+| `--lazy-ref` | off (eager) | skip the up-front reference read; implies `--ref-budget auto` |
 | `--min-ani` | 0.85 | identity floor; also sets the aligner's abort ceiling |
 | `--min-query-coverage` | 0.70 | fraction of the *alignable* window that must align |
 | `--ranges` | 15 | how many minimizer ranges are looked up |

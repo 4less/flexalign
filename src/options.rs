@@ -54,18 +54,12 @@ pub struct Args {
     #[arg(long = "mask-flank-mult", default_value_t = 0)]
     pub mask_flank_mult: usize,
 
-    /// After the seeds are grouped into anchors, the top x will be extended with the use of hamming distance.
-    /// This affects speed negatively but sensitivity and precision positively
-    #[arg(short = 'x', long = "extend-top-x", default_value_t = 4)]
-    pub extend_top_x: usize,
-
     /// Extend at most this many anchor pairs (the top Z after the post-pairing sort).
     ///
     /// Extension is the first stage that touches reference sequence, so it is the first that costs
     /// real time; without a bound it runs over EVERY anchor a read produced (15.7 per read measured
     /// on the protal marker DB). Anchors are already sorted by anchor score when they arrive, so
-    /// the top Z are the ones worth the Hamming pass. `--extend-top-x` was intended for this and
-    /// was never wired up.
+    /// the top Z are the ones worth the Hamming pass.
     #[arg(short = 'z', long = "extend-top-z", default_value_t = 32)]
     pub extend_top_z: usize,
 
@@ -93,10 +87,13 @@ pub struct Args {
     #[arg(long = "min-query-coverage", default_value_t = 0.70)]
     pub min_query_coverage: f64,
 
-    /// Emit SAM instead of PAF. Only aligned records are written -- reads below --min-ani are
-    /// omitted entirely rather than emitted as unmapped, so the output is already filtered.
-    #[arg(long = "sam", action)]
-    pub sam: bool,
+    /// Emit PAF instead of SAM. SAM is the default: it carries the CIGAR and NM that the aligner
+    /// already computed, so PAF is the lossy option and should be the one you ask for.
+    ///
+    /// Either way only aligned records are written -- reads below --min-ani are omitted entirely
+    /// rather than emitted as unmapped, so the output is already filtered.
+    #[arg(long = "paf", action)]
+    pub paf: bool,
 
     /// Minimum number of ranges for lookup. With max-best-flex defines, none of the ranges might actually yield any seeds.
     #[arg(long = "min-ranges", default_value_t = 4)]
@@ -179,7 +176,18 @@ pub struct Args {
     #[arg(long = "ref-budget", value_name = "SIZE|auto")]
     pub ref_budget: Option<String>,
 
-    /// Alias for `--ref-budget auto`.
+    /// Do NOT read the reference sequences up front; page them in as alignment needs them, and
+    /// bound what stays resident (implies `--ref-budget auto`).
+    ///
+    /// By default the WHOLE database -- index and reference -- is read into memory during the load.
+    /// `mmap` transfers nothing by itself: the multi-GB read happens later, one 4K fault at a time
+    /// in whatever order queries touch it, charged to read processing where it looks like compute
+    /// instead of like the load it is. One sequential pass up front moves the same bytes, lets the
+    /// kernel read ahead, and makes the reported load figure a real one.
+    ///
+    /// Use this when RAM is the binding constraint rather than time: alignment touches only the few
+    /// hundred bases around each anchor, so most of the reference is never needed, and skipping the
+    /// up-front read keeps residency down at the cost of faulting during alignment.
     #[arg(long = "lazy-ref")]
     pub lazy_ref: bool,
 
@@ -197,6 +205,20 @@ pub struct Args {
     /// sharded path stays at 0.
     #[arg(long = "flank-slack", value_name = "N", default_value_t = 0)]
     pub flank_slack: u32,
+}
+
+impl Args {
+    /// True when no reverse mate was given: the single-end pipeline stops at anchors.
+    pub fn single_end(&self) -> bool {
+        self.rev.iter().all(|r| r.is_empty())
+    }
+
+    /// Should this run emit SAM? SAM is the default, but the single-end pipeline never runs gapped
+    /// alignment and so has no CIGAR to put in a record -- there PAF is the only possible output,
+    /// not a preference. Resolved here so the format is decided once rather than at each writer.
+    pub fn emit_sam(&self) -> bool {
+        !self.paf && !self.single_end()
+    }
 }
 
 #[derive(Debug)]

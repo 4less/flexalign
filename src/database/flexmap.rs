@@ -63,8 +63,12 @@ impl RefSeqBlob {
     fn len(&self) -> usize { self.n }
 
     /// Drop this mapping's resident pages (`MADV_DONTNEED`). Read-only and file-backed, so nothing
-    /// is lost: a later access re-faults from the page cache. Used by `--lazy-ref` to bound the
+    /// is lost: a later access re-faults from the page cache. Used by `--ref-budget` to bound the
     /// resident set to one batch's worth of reference instead of everything the run ever touched.
+    ///
+    /// There is deliberately no `prefault` counterpart here: the up-front reference read goes
+    /// through `common::warm_file`, which reads the file with several threads (~2 GB/s) rather than
+    /// touching mapped pages one at a time on a single thread (~1 GB/s). Same bytes, half the time.
     fn release(&self) {
         // `DontNeed` is `unchecked` in memmap2 because on a writable private mapping it discards
         // un-written changes. This mapping is read-only and file-backed (`Mmap`, never `MmapMut`),
@@ -176,6 +180,63 @@ impl<
     pub fn index_compatible(paths: &DBPaths) -> bool {
         FlexmapBlob::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::is_compatible(&paths.index_blob_file())
     }
+
+    /// Load ONLY the reference (sequences + names), not the k-mer index.
+    ///
+    /// The sharded pipeline's rejoin/align half replays the anchors the shard passes already found
+    /// (see `shard::disk::run_disk_rejoin_align`: it `gather`s evidence and calls `align_from_seeds`,
+    /// never a range extractor), so `get_vrange` is never invoked there. The index is therefore not
+    /// needed at all in the join -- only the reference bases to extend/align against and the names to
+    /// write. Reading the 30 GB index here, as `load` does, is pure waste.
+    ///
+    /// The index blob is memory-mapped so the `flexmap` field is a valid value, but it is never
+    /// warmed and never queried, so **zero index bytes are read** -- only the reference is. Calling
+    /// `get_vrange` on the result would fault the index in on demand; the join never does.
+    pub fn load_reference_only(paths: &DBPaths) -> Self {
+        let io_before = super::common::disk_read_bytes();
+
+        // mmap only: opens the file into address space, reads no data pages.
+        let flexmap = FlexmapStore::Mmap(
+            FlexmapBlob::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::mmap_from_file(&paths.index_blob_file()),
+        );
+
+        // Names are part of the reference, needed to label output records.
+        let (d_names, rid_to_rname) = time(|| -> Vec<String> {
+            load(&mut File::open(&paths.id2reference_path).expect("Working id2ref file"), crate::GLOBAL_VERSION)
+                .expect("Valid id2ref")
+        });
+
+        let mapped = RefSeqBlob::mmap_from_file(&paths.refseq_file());
+        let references = match mapped {
+            Some(blob) => {
+                // The reference is read UP FRONT, as everywhere else: eager is the default and
+                // `--lazy-ref` is the explicit opt-out. The join needs the reference and nothing
+                // else, so loading it here is loading exactly what this phase uses.
+                let (_d, ref_bytes) = time(|| {
+                    if super::common::eager_ref() { super::common::warm_file(&paths.refseq_file()) } else { 0 }
+                });
+                let gb = ref_bytes as f64 / (1u64 << 30) as f64;
+                eprintln!(
+                    "Reference-only load (join phase): names {:.2}s ({} entries), reference {} -- \
+                     index NOT read",
+                    d_names.as_secs_f64(), rid_to_rname.len(),
+                    if super::common::eager_ref() { format!("{gb:.1} GB, sequential") }
+                    else { "--lazy-ref: paged in during alignment".to_string() },
+                );
+                RefStore::Mmap(blob)
+            }
+            None => panic!(
+                "reference-sequence blob {} is missing; build the index once (which writes it) \
+                 before a sharded run", paths.refseq_file()
+            ),
+        };
+
+        let read_gb = (super::common::disk_read_bytes().saturating_sub(io_before)) as f64 / (1u64 << 30) as f64;
+        eprintln!("  -> {read_gb:.1} GB read from disk (reference only; the {} index is mapped but untouched)",
+                  paths.index_blob_file());
+
+        Self { flexmap, rid_to_rname, rname_to_rid: HashMap::new(), references }
+    }
 }
 
 impl<
@@ -238,6 +299,7 @@ impl<
 
     fn load(paths: &super::common::DBPaths, version: u32) -> Self {
         let _ = version;
+        let io_before = crate::database::common::disk_read_bytes();
 
         let rid2rname_file = &mut File::open(&paths.id2reference_path).expect("Working id2ref file");
         let rname2rid_file = &mut File::open(&paths.reference2id_path).expect("Working ref2id file");
@@ -245,41 +307,75 @@ impl<
 
         // Memory-map the single-file blob: open is near-instant and only the queried keys/values
         // are paged in, instead of reading the whole multi-GB index into the heap.
-        let (duration, flexmap) = time(|| {
+        let (d_index, flexmap) = time(|| {
             FlexmapStore::Mmap(
                 FlexmapBlob::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::mmap_from_file(&paths.index_blob_file()),
             )
         });
-        eprintln!("Memory-mapping index took {:?}", duration);
+
 
         // let config = bincode::config::standard();
         // let flexmap = decode_from_reader(map_reader, config).expect("Valid reference database");
 
 
-        let rid_to_rname: Vec<String> = load(rid2rname_file, version).expect("Valid reference database");
+        // The reference-name table is DESERIALISED into the heap -- 14.5M owned Strings on the
+        // protal marker DB -- and is the dominant cost of a load. It was previously untimed, which
+        // made the whole load look like it cost only the two mmap calls above (microseconds).
+        let (d_names, rid_to_rname) = time(|| -> Vec<String> {
+            load(rid2rname_file, version).expect("Valid reference database")
+        });
 
         // Reference sequences: `mmap` the pre-built blob when it exists (near-instant); otherwise
         // parse the FASTA once (the slow path) and write the blob so the next load is fast. The
         // rname->rid map is only needed to attribute FASTA records to ids and for gold-standard
         // evaluation, so on the fast (mmap) path we skip loading that 14.5M-entry map entirely
         // unless GOLDSTD_EVAL is compiled in.
-        let (duration, mapped) = time(|| RefSeqBlob::mmap_from_file(&paths.refseq_file()));
+        let (d_refmap, mapped) = time(|| RefSeqBlob::mmap_from_file(&paths.refseq_file()));
+        // The INDEX is read in full, here, sequentially. Lazy paging is wrong for it: k-mer lookups
+        // hit the whole extent in essentially random order, so deferring the transfer does not avoid
+        // it -- it just converts one streaming read into millions of 4K faults, and hides the cost
+        // inside alignment where it looks like compute.
+        let (d_prefault, idx_bytes) = time(|| match &flexmap {
+            FlexmapStore::Mmap(_) => {
+                super::common::warm_file(&paths.index_blob_file())
+            }
+            _ => 0,
+        });
+
+        // The REFERENCE is read up front too, by default: "load the database" should mean the whole
+        // database, and the same argument applies -- the bytes are read either way, and doing it in
+        // one sequential pass lets the kernel read ahead and keeps the cost inside the load figure
+        // instead of smeared through alignment. --lazy-ref opts out for runs bounded by RAM rather
+        // than time, where most of the reference is genuinely never touched.
+        let (d_refwarm, ref_bytes) = time(|| match (&mapped, super::common::eager_ref()) {
+            (Some(_), true) => super::common::warm_file(&paths.refseq_file()),
+            _ => 0,
+        });
+
+        let mut d_refparse = std::time::Duration::ZERO;
+        let mut d_rev = std::time::Duration::ZERO;
+        let mut ref_mode = "mmap of blob";
         let (references, rname_to_rid) = match mapped {
             Some(blob) => {
-                eprintln!("Memory-mapping references took {:?}", duration);
-                let rname_to_rid = if crate::GOLDSTD_EVAL {
-                    load(rname2rid_file, version).expect("Valid reference database")
-                } else {
-                    HashMap::new()
-                };
+                let (d, rname_to_rid) = time(|| {
+                    if crate::GOLDSTD_EVAL {
+                        load(rname2rid_file, version).expect("Valid reference database")
+                    } else {
+                        HashMap::new()
+                    }
+                });
+                d_rev = d;
                 (RefStore::Mmap(blob), rname_to_rid)
             }
             None => {
-                let rname_to_rid: HashMap<String, usize> =
-                    load(rname2rid_file, version).expect("Valid reference database");
+                ref_mode = "parsed from FASTA";
+                let (d, rname_to_rid) = time(|| -> HashMap<String, usize> {
+                    load(rname2rid_file, version).expect("Valid reference database")
+                });
+                d_rev = d;
                 let (duration, parsed) =
                     time(|| load_references(references_file, &rname_to_rid, &rid_to_rname));
-                eprintln!("Loading references (parsing FASTA) took {:?}", duration);
+                d_refparse = duration;
                 let parsed = match parsed {
                     Ok(r) => r,
                     Err(why) => panic!("Could not load references {}", why),
@@ -291,6 +387,34 @@ impl<
                 (RefStore::Owned(parsed), rname_to_rid)
             }
         };
+
+        // One unambiguous breakdown, so nobody has to guess which step a load's seconds went to.
+        // Only the DESERIALISED parts occupy heap here; the mmapped blobs are address space until
+        // alignment touches them, and those page faults are charged to read processing, not to this.
+        let secs = |d: std::time::Duration| d.as_secs_f64();
+        let total = secs(d_index) + secs(d_names) + secs(d_refmap) + secs(d_refparse) + secs(d_rev)
+            + secs(d_prefault) + secs(d_refwarm);
+        let gb = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let read_gb = gb(crate::database::common::disk_read_bytes().saturating_sub(io_before));
+        eprintln!(
+            "Database load {total:.2}s total\n               index blob            {:>8.3}s  (mmap of {})\n               reference names       {:>8.3}s  (deserialised, {} entries)\n               reference sequences   {:>8.3}s  ({})\n               name->id map          {:>8.3}s  ({})\n  \
+             reading index in      {:>8.3}s  ({:.1} GB, sequential)\n  \
+             reading reference in  {:>8.3}s  ({})\n  \
+             -> {:.1} GB actually read from disk during load",
+            secs(d_index), paths.index_blob_file(),
+            secs(d_names), rid_to_rname.len(),
+            secs(d_refmap) + secs(d_refparse), ref_mode,
+            secs(d_rev),
+            if rname_to_rid.is_empty() { "skipped" } else { "deserialised" },
+            secs(d_prefault), gb(idx_bytes),
+            secs(d_refwarm),
+            if super::common::eager_ref() {
+                format!("{:.1} GB, sequential", gb(ref_bytes))
+            } else {
+                "--lazy-ref: paged in during alignment instead".to_string()
+            },
+            read_gb,
+        );
 
         Self {
             flexmap,

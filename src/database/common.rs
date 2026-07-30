@@ -3,11 +3,22 @@ use bioreader::{fasta_byte_reader::FastaByteReader, fasta_reader::FastaReader, s
 use flexmap::values::VRange;
 use crate::options::Options;
 
-/// Budget in kB for resident reference pages; 0 = unbounded (the default).
+/// Read the reference sequences during the load instead of faulting them in during alignment.
 ///
-/// A process-wide switch rather than a parameter because `FlexalignDatabase::load` is a trait
-/// method taking only paths, and the mapping happens several layers below the option parsing.
-/// Written once at startup, only read afterwards.
+/// Default ON: the whole database is loaded up front. `--lazy-ref` clears it, for runs where RAM is
+/// the binding constraint rather than time.
+///
+/// A process-wide switch rather than a parameter because `FlexalignDatabase::load` is a trait method
+/// taking only paths, and the mapping happens several layers below the option parsing. Written once
+/// at startup, only read afterwards -- as with the budget below.
+pub static EAGER_REF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn eager_ref() -> bool {
+    EAGER_REF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Budget in kB for resident reference pages; 0 = unbounded (the default).
 pub static REF_BUDGET_KB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn ref_budget_kb() -> u64 {
@@ -57,6 +68,98 @@ pub fn resolve_ref_budget(spec: Option<&str>) -> u64 {
         }
         Some(s) => parse_size(s).unwrap_or(0),
     }
+}
+
+/// Bytes this process has actually read from disk so far (`/proc/self/io` `read_bytes`).
+///
+/// The only way to say where a memory-mapped index is really paid for. `mmap` returns in
+/// microseconds and reads nothing; the multi-GB transfer happens later, as page faults while the
+/// index is queried. Sampling this around each phase attributes those bytes to the phase that
+/// actually caused them instead of leaving the load looking free.
+pub fn disk_read_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("read_bytes:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Stream a file through the page cache so a later `mmap` of it faults from memory, not disk.
+///
+/// Used instead of touching the mapping directly because the index blob is owned by the `flexmap`
+/// crate, which exposes no prefault hook -- and this is better anyway: one sequential read the
+/// kernel can prefetch aggressively, versus millions of 4K random faults. Bytes are read into a
+/// reusable buffer and discarded, so this costs page cache, not process memory.
+pub fn warm_file(path: &str) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return 0,
+    };
+    if len == 0 {
+        return 0;
+    }
+    // NVMe needs several requests in flight to reach its bandwidth: one sequential reader gets
+    // ~980 MB/s on this device, four disjoint readers ~1.8 GB/s. Measured, not assumed -- and it
+    // halves the load of a 30 GB index.
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 8);
+    let chunk = len.div_ceil(threads as u64);
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads as u64)
+            .map(|i| {
+                let path = path.to_string();
+                scope.spawn(move || -> u64 {
+                    let start = i * chunk;
+                    if start >= len {
+                        return 0;
+                    }
+                    let end = (start + chunk).min(len);
+                    let mut f = match std::fs::File::open(&path) {
+                        Ok(f) => f,
+                        Err(_) => return 0,
+                    };
+                    if f.seek(SeekFrom::Start(start)).is_err() {
+                        return 0;
+                    }
+                    let mut buf = vec![0u8; 1 << 23]; // 8 MiB
+                    let mut done = 0u64;
+                    while done < end - start {
+                        let want = ((end - start - done) as usize).min(buf.len());
+                        match f.read(&mut buf[..want]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => done += n as u64,
+                        }
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+    })
+}
+
+/// Fault a memory-mapped region in NOW, sequentially, instead of letting queries do it page by page
+/// in random order later. Returns bytes touched.
+///
+/// Same total transfer either way, but a sequential pass lets the kernel read ahead in large
+/// chunks, where random faults arrive 4K at a time -- on a cold cache this is the difference
+/// between one streaming read and millions of individual faults.
+pub fn prefault(mmap: &memmap2::Mmap) -> u64 {
+    let _ = mmap.advise(memmap2::Advice::WillNeed);
+    let mut acc: u64 = 0;
+    let step = 4096;
+    let mut i = 0;
+    while i < mmap.len() {
+        acc = acc.wrapping_add(mmap[i] as u64); // touch one byte per page
+        i += step;
+    }
+    std::hint::black_box(acc);
+    mmap.len() as u64
 }
 
 const INDEX_EXTENSION: &str = ".flex.index";

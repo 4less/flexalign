@@ -43,7 +43,7 @@ lint:
 install:
     {{cargo}} install --path .
 
-# Install flexalign + examples on a cluster, from a clean checkout, into PREFIX (default ~/bin).
+# Install flexalign on a cluster, from a clean checkout, into PREFIX (default ~/bin).
 #
 # Builds against the PINNED GitHub dependencies -- it moves .cargo/config.toml aside first, because
 # that file redirects bioreader/kmerrs/flexmap to sibling working copies that exist only on a
@@ -68,10 +68,8 @@ install-cluster PREFIX="~/bin":
         trap 'mv .cargo/config.toml.clusterbuild .cargo/config.toml 2>/dev/null || true' EXIT
     fi
     {{cargo}} build --release
-    {{cargo}} build --release --example shard_align
     PREFIX=$(eval echo {{PREFIX}}); mkdir -p "$PREFIX"
     install -m755 target/release/flexalign "$PREFIX/flexalign"
-    install -m755 target/release/examples/shard_align "$PREFIX/shard_align"
     echo ">> installed to $PREFIX:"; "$PREFIX/flexalign" --version || true
     echo ">> add to PATH:  export PATH=\"$PREFIX:\$PATH\""
 
@@ -89,4 +87,5 @@ clean:
 
 # NOTE: the alignment benchmark (flexalign vs strobealign, correctness + speed) lives in its own
 # repo — ../flexalign_benchmark — managed with pixi. Run `pixi run setup` then `pixi run bench`
-# there. This crate only provides the aligner binaries it drives (flexalign, examples/shard_align).
+# there. This crate only provides the aligner binary it drives (flexalign; sharded runs are the
+# same binary, which detects a sliced index from the reference path).

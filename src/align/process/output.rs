@@ -128,7 +128,7 @@ pub fn make_output<D: FlexalignDatabase>(
     buffer: OutputBuffer,
     db: &D,
 ) -> Or<StdPAFOutput, StdSAMOutput> {
-    if !options.args.sam {
+    if !options.args.emit_sam() {
         return Or { a: Some(StdPAFOutput::new(buffer)), b: None };
     }
 

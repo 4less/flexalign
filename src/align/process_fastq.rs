@@ -344,10 +344,12 @@ pub fn process_fastq_wrapper_modular<
             // Single-end read
             None => {
                 // The single-end path runs `Modular`, which stops at anchors and never aligns, so
-                // it has no CIGAR to put in a SAM record. Fail loudly rather than write a header
-                // with no records under it.
-                if options.args.sam {
-                    panic!("--sam is only supported for paired-end input; the single-end pipeline does not run gapped alignment");
+                // it has no CIGAR to put in a SAM record. SAM is the default now, so this is the
+                // common case rather than a user error: say what is being written and carry on.
+                // `Args::emit_sam` already resolved the format to PAF here.
+                if !options.args.paf {
+                    log::info!("single-end input: writing PAF (SAM needs the gapped alignment that \
+                                only the paired-end pipeline runs)");
                 }
 
                 let worker = move |rec: &RefFastqRecord, stats: &mut Stats| {

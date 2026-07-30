@@ -101,7 +101,7 @@ flexalign -r REFERENCE.fna -1 reads.fq                              # single-end
   `main.rs` notes this and all diagnostics go to stderr via `log` + `simple_logger`.
   Verbosity is `--log-level 0..5` (Off..Trace).
 - Key tuning args map directly onto pipeline stages: `--ranges`, `--max-range-size`,
-  `--max-best-flex`, `--extend-top-x`, `--align-top-y`, `--min-ranges`.
+  `--max-best-flex`, `--extend-top-z`, `--align-top-y`, `--min-ranges`.
 
 ## Architecture
 

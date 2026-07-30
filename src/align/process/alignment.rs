@@ -13,6 +13,30 @@ use crate::align::{common::{penalties, Align, Heuristic, Status}, sam::Cigar};
 pub struct LIBWFA2Alignment {
     pub aligner: AffineWavefronts,
     pub cigar: Cigar,
+    /// The ends-free span requested by `set_ends_free`, applied (clamped) at align time.
+    ///
+    /// WFA2 rejects an ends-free span whose free-length exceeds the sequence it applies to
+    /// (`P0<=|P|`, `Tf<=|T|`, ...) by aborting the whole process. The dovetail offsets the callers
+    /// pass can exceed a slice that turns out shorter than the offset -- which never happened on
+    /// uniform 150 bp simulated reads but does on real data (short fragments, adapters). Storing the
+    /// request and clamping it against the actual `q`/`r` lengths inside `align` makes every caller
+    /// safe at once, instead of each having to know the WFA constraint.
+    span: Option<(i32, i32, i32, i32)>,
+}
+
+impl LIBWFA2Alignment {
+    /// Apply the requested ends-free span, each component clamped to the sequence it constrains.
+    fn apply_span(&mut self, qlen: usize, rlen: usize) {
+        if let Some((qs, qe, rs, re)) = self.span {
+            let (ql, rl) = (qlen as i32, rlen as i32);
+            self.aligner.set_alignment_span(AlignmentSpan::EndsFree {
+                pattern_begin_free: qs.min(ql),
+                pattern_end_free: qe.min(ql),
+                text_begin_free: rs.min(rl),
+                text_end_free: re.min(rl),
+            });
+        }
+    }
 }
 
 
@@ -81,9 +105,10 @@ impl Clone for LIBWFA2Alignment {
 
         new_aligner.set_max_alignment_score(self.aligner.get_max_alignment_steps());
 
-        Self { 
+        Self {
             aligner: new_aligner,
             cigar: self.cigar.clone(),
+            span: self.span,
         }
     }
 }
@@ -91,6 +116,7 @@ impl Clone for LIBWFA2Alignment {
 impl Align for LIBWFA2Alignment {
     fn align(&mut self, q: &[u8], r: &[u8]) -> (i32, &Cigar, Status) {
         self.cigar.0.clear();
+        self.apply_span(q.len(), r.len());
 
         // Perform alignment
         match self.aligner.align(q, r) {
@@ -120,6 +146,7 @@ impl Align for LIBWFA2Alignment {
     }
     
     fn align_into(&mut self, q: &[u8], r: &[u8], cigar: &mut Cigar) -> (i32, Status) {
+        self.apply_span(q.len(), r.len());
         // Perform alignment
         match self.aligner.align(q, r) {
             AlignmentStatus::Completed => {
@@ -140,7 +167,9 @@ impl Align for LIBWFA2Alignment {
     }
     
     fn set_ends_free(&mut self, qstart: i32, qend: i32, rstart: i32, rend: i32) {
-        self.aligner.set_alignment_span(AlignmentSpan::EndsFree { pattern_begin_free: qstart, pattern_end_free: qend, text_begin_free: rstart, text_end_free: rend });
+        // Stored, not applied: the clamp needs the sequence lengths, which are known only at align
+        // time (see `span` / `apply_span`).
+        self.span = Some((qstart, qend, rstart, rend));
     }
 
 
@@ -155,6 +184,7 @@ impl LIBWFA2Alignment {
         Self {
             aligner: AffineWavefronts::with_penalties(match_, mismatch, gap_opening, gap_extension),
             cigar: Cigar(Vec::new()),
+            span: None,
         }
     }
 
@@ -190,6 +220,7 @@ impl Default for LIBWFA2Alignment {
         Self { 
             aligner: aligner,
             cigar: Cigar(Vec::new()),
+            span: None,
         }
     }
 }
