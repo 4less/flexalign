@@ -4,6 +4,18 @@
 
 cargo := "cargo +nightly"
 
+# CPU features the release binary is compiled for. `[profile.release] rustflags` in Cargo.toml sets
+# AVX2/FMA, which is right for a modern desktop and WRONG for anything older: the build succeeds and
+# the binary then dies with SIGILL (illegal instruction) the first time it hits an AVX2 op, with no
+# hint that the CPU is the problem. Override for a portable build:
+#
+#   just build-portable                  # baseline x86-64, runs anywhere
+#   FLEXALIGN_FEATURES=+sse4.2 just build-portable
+#
+# `cargo --config` overrides the manifest's profile setting without editing tracked files, so a
+# portable build needs no source change and cannot drift from the default one.
+features := env_var_or_default("FLEXALIGN_FEATURES", "+sse3")
+
 # Show available recipes.
 default:
     @just --list
@@ -11,6 +23,12 @@ default:
 # Build the optimized release binary (target/release/flexalign).
 build:
     {{cargo}} build --release
+
+# Build for an older/unknown CPU (no AVX2). Use this when the target machine is not the build
+# machine -- a cluster node, a colleague's laptop -- or when a binary dies with SIGILL.
+build-portable:
+    {{cargo}} --config 'profile.release.rustflags=["-C","target-feature={{features}}"]' build --release
+    @echo ">> built for target-feature={{features}} (default build uses AVX2+FMA)"
 
 # Build the debug binary (faster compile, slower binary).
 build-debug:
@@ -67,7 +85,15 @@ install-cluster PREFIX="~/bin":
         mv .cargo/config.toml .cargo/config.toml.clusterbuild
         trap 'mv .cargo/config.toml.clusterbuild .cargo/config.toml 2>/dev/null || true' EXIT
     fi
-    {{cargo}} build --release
+    # FLEXALIGN_FEATURES=+sse3 (or similar) builds for an older CPU. Default keeps AVX2+FMA: a
+    # cluster login node and its compute nodes are not always the same microarchitecture, and an
+    # AVX2 binary on a node without it dies with SIGILL rather than a readable error.
+    if [ -n "${FLEXALIGN_FEATURES:-}" ]; then
+        echo ">> building for target-feature=$FLEXALIGN_FEATURES (portable)"
+        {{cargo}} --config "profile.release.rustflags=[\"-C\",\"target-feature=$FLEXALIGN_FEATURES\"]" build --release
+    else
+        {{cargo}} build --release
+    fi
     PREFIX=$(eval echo {{PREFIX}}); mkdir -p "$PREFIX"
     install -m755 target/release/flexalign "$PREFIX/flexalign"
     echo ">> installed to $PREFIX:"; "$PREFIX/flexalign" --version || true

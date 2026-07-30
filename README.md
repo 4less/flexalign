@@ -40,6 +40,20 @@ That installs nightly via rustup, checks the C toolchain, and builds and install
 binary covers everything, sharded runs included. Load your cluster's compiler modules first if it
 provides them that way.
 
+**The release build targets AVX2 + FMA** (`[profile.release] rustflags` in `Cargo.toml`). On a CPU
+without them the build succeeds and the binary then dies with `SIGILL` (illegal instruction) at the
+first vector op, with nothing pointing at the CPU as the cause. Build for an older or unknown machine
+with:
+
+```sh
+just build-portable                       # baseline x86-64 (+sse3)
+FLEXALIGN_FEATURES=+sse4.2 just build-portable
+FLEXALIGN_FEATURES=+sse3 just install-cluster
+```
+
+This matters most on a cluster, where the login node you build on and the compute node you run on are
+not always the same microarchitecture.
+
 Dependencies (`kmerrs`, `flexmap`, `bioreader`) are pinned to exact git revisions, so a build
 anywhere reproduces the same binary. `flexmap` owns the on-disk index format, so leaving it floating
 risks a newer library reading an index built by an older one.
