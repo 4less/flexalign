@@ -46,12 +46,37 @@ Hard constraints:
 From `flexalign_benchmark/results/*/summary.tsv` as of this writing. `recall_pct` =
 correctly-placed reads / all reads; `correct_pct` = correct-of-mapped (precision).
 
-> **Provenance warning.** These numbers were read from `results/*/summary.tsv` at 22:06 on
-> 2026-08-04, *before* any run of this task's own. A benchmark run **overwrites the row of whatever
-> contender it re-runs**, so the live file stops matching this table as soon as work begins — the
-> protal `flexalign-batch` row was overwritten at 22:11 by the first (cold, invalid) run of the
-> tie-extension change. The table here is the baseline of record; snapshots live in
-> `results/_snapshot_*`. Snapshot `results/<ds>/` **before** any run that touches a baseline row.
+> # ⛔ EVERY FLEXALIGN ROW BELOW IS INVALID AS A BASELINE. DO NOT GATE ON THIS TABLE.
+>
+> These rows were not produced by HEAD. Established 2026-08-04 by a control: `--extend-tie-cap 1`
+> is a provable no-op (loop guard `screen_z < screen_z`), yet it emits **1,987,115** bacteroides
+> records where the stored row says **1,986,814**. The stored rows therefore predate HEAD, and every
+> before/after comparison made against them measured *those intervening commits plus the change*.
+>
+> | rows | backing artifact | date | threads |
+> | --- | --- | --- | --- |
+> | bacteroides, all | `results/bacteroides/single/*.time` | **2026-07-28** | **`-t 8`** |
+> | protal `flexalign`, `-paf`, `-sharded-*` | `results/protal/1/*.time` | 2026-08-02 | 16 |
+> | markersim `flexalign` | `results/markersim/single/flexalign.time` | 2026-08-02 | 16 |
+> | markersim `flexalign-batch` | snapshot `.time` | 2026-08-03 | 16 |
+> | protal `flexalign-batch` | overwritten 08-04 22:11 | — | 16 |
+>
+> The likely culprit is `c92c8a8` (08-04 10:53), which moved acceptance from a 0.70 coverage
+> *fraction* to 35 aligned *bases* — enough to emit 301 more marginal bacteroides records and drop
+> precision ~0.026 pp. `e1cefb3`, `4e2a2a0`, `14aefc7` also sit in the gap.
+>
+> **Consequence: the gate below currently fails HEAD against itself.** It demands bacteroides
+> `≥ 98.0430 / ≥ 98.2762 / ≤ 4.83 s / ≤ 6003 MB`; HEAD with the change *disabled* measures
+> `98.0315 / 98.2498 / 5.75 s / 6514 MB`. Nothing can be gated until baselines are re-derived.
+>
+> **Next action, before any further optimisation work:** re-run every flexalign contender on HEAD at
+> `--extend-tie-cap 1`, current thread count, warm, and restate both tables from that. Also note
+> `results/{protal,bacteroides}/summary.tsv` now MIX vintages row-to-row (one 08-04 16-thread row
+> beside seven 07-28 8-thread rows), so they cannot be read as leaderboards either.
+>
+> Operational rule that produced this: a benchmark run **overwrites the row of whatever contender it
+> re-runs**. Snapshot `results/<ds>/*.tsv *.json *.time` (never the SAMs — that is 34 GB) before any
+> run that touches a baseline row.
 
 ### bacteroides (whole-genome DB, 1 sample)
 
@@ -264,14 +289,25 @@ reference tools at once and is recorded explicitly in the results log with the n
 
 | date | change | dataset | before → after | verdict |
 | --- | --- | --- | --- | --- |
-| 08-04 | tie-extend the `--extend-top-z` cut (STRATEGY a) | protal, flexalign-batch | precision 86.9284 → 86.9673 (+0.039 pp); recall 4.21380 → 4.21573 (+0.002 pp); **+1 alignment of 95,589** | accuracy: negligible |
-| 08-04 | same, timing only — paired A/B on one warm binary via `--extend-tie-cap` | protal, 10 samples, DB load 5.7–5.8 s (warm) | cap=1 (off): 37.84 / 37.69 s · cap=2: 39.10 / 39.27 s · cap=64: 39.16 / 38.95 s | **costs ~1.4 s (+3.7 % wall)** |
+| 08-04 | ~~tie-extend the cut: protal precision 86.9284 → 86.9673~~ | ~~protal~~ | **RETRACTED** — "before" was the stale pre-`c92c8a8` row, and the "after" was the UNCAPPED variant, which is not the code in the tree | invalid |
+| 08-04 | ~~markersim recall 98.3410 → 98.3509, precision 98.7525 → 98.7638~~ | ~~markersim~~ | **RETRACTED** — "before" was the 08-03 row, `c92c8a8` in between | invalid |
+| 08-04 | ~~bacteroides recall −0.0114 pp, precision −0.0263 pp~~ | ~~bacteroides~~ | **RETRACTED** — "before" was the 07-28 `-t 8` row | invalid |
+| 08-04 | timing, paired A/B on one warm binary via `--extend-tie-cap` | protal, 10 samples, DB load 5.7–5.8 s | cap=1: 37.84 / 37.69 s · cap=2: 39.10 / 39.27 s · cap=64: 39.16 / 38.95 s | valid; cap=2 costs ~1.4 s (+3.7 %), **cap=64 costs no more than cap=2** |
+| 08-04 | accuracy, paired A/B (same binary, `-t 16`, warm) | bacteroides, `flexalign` | cap=1: 98.0315 / 98.2498 / 1,987,115 recs · cap=2: 98.0316 / 98.2499 / 1,987,115 recs | valid; **a wash** (+0.0001 pp, 0 records) |
+| 08-04 | records only, paired | markersim, `flexalign-batch` | cap=1: 39,833,342 recs, 102.20 s · cap=2: 39,832,788 recs, 102.94 s | valid; 554 records move, **no time cost (+0.7 %, in noise)** |
+| 08-04 | accuracy, paired | markersim | _scoring in flight_ | pending |
+| 08-04 | accuracy, paired | protal, cap=1 vs cap=2 on HEAD | _not yet run_ | pending |
 
-**Reading of the first two rows.** The change buys essentially nothing on protal (+1 alignment) and
-costs 3.7 % wall. It is not justified by this dataset. Whether it survives depends on `markersim`,
-where truth is resolved at REFERENCE level and a tie-break between two near-identical markers can
-actually change a verdict — on protal's species-level scoring, tie-breaking between markers of the
-same species is invisible by construction, so protal cannot see this change's upside even if it exists.
+**Where this actually stands.** Three of the first four rows were retracted for the same reason: they
+compared a run of mine against a `results/` row produced by an older commit, so they measured
+`c92c8a8` (and a `-t 8`→`-t 16` change) rather than the tie run. The surviving paired evidence says:
+the tie run is a **wash on bacteroides**, **moves 554 records on markersim at no time cost**, and
+**costs 3.7 % on protal** — with the cap itself unjustified, since effectively-uncapped (64) runs no
+slower than 2 and, on the one accuracy point available, scores slightly better.
+
+The default is held at 1 (off) **not because the evidence says off**, but because it was flipped once
+already on evidence that turned out invalid, and flipping it back on equally thin evidence would
+repeat the mistake. It moves when the two pending paired rows land.
 
 **Two false alarms this produced, both worth remembering.** A first protal run reported
 38.16 s → 88.53 s, and a second → 70.5 s: both were **cold-cache artifacts**. The tell is
