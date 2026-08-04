@@ -137,7 +137,7 @@ impl<
             let (duration, _) = time(|| {
                 self.extend_anchors(rec);
             });
-            stats.time_extend_anchors += duration;
+            stats.time_hamming_screen += duration;
         }
 
         // let (duration, _) = time(|| {

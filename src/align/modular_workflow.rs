@@ -9,16 +9,17 @@ use crate::{
     database::common::FlexalignDatabase,
     flexalign::time,
     options::Options,
-    GOLDSTD_EVAL,
+    GOLDSTD_EVAL, STAGE_TRACE,
 };
 
 use super::{
     common::{
-        penalties, Align, AnchorExtractor, AnchorPair, Heuristic,
+        penalties, Align, AlignTrace, AnchorExtractor, AnchorPair, AnchorScore, Heuristic,
         KmerExtractor, Or, PAFOutput, PairedAnchorExtender, PairedAnchorExtractor,
-        PairedAnchorMAPQ, RangeExtractor, SAMOutput, SeedExtractor, StdPairedAnchorMAPQ,
+        PairedAnchorMAPQ, RangeExtractor, SAMOutput, SeedExtractor, StdAnchorScore,
+        StdPairedAnchorMAPQ,
     },
-    data_structures::{anchor::Anchor, common::Seed},
+    data_structures::{anchor::{Anchor, AnchorSeed}, common::Seed},
     process::{
         alignment::{ani_abort_score, approx_ani, hamming_ani},
         evaluate::{self, get_id_from_header},
@@ -49,6 +50,8 @@ struct MateOut<'m> {
     /// seeds cover. Compared against `--min-query-coverage` to reject partial (clipped) hits, which
     /// `ani` alone cannot -- it prices only the aligned window, leaving clipped bases free.
     query_coverage: f64,
+    /// Read bases the alignment actually places (excludes soft clips). The gate is on this.
+    aligned_bases: usize,
     /// Whether the read aligns END TO END, counting soft-clipping as legitimate only where the read
     /// runs off the reference.
     ///
@@ -70,6 +73,40 @@ struct MateOut<'m> {
 /// the coverage fraction have to be measured against THIS length, not the read length: measured on
 /// the protal marker DB, 77.9% of the clipping in reads flexalign missed is exactly this dovetail,
 /// and only 2.7% is clipping with reference on both sides of it.
+/// Score given to an anchor whose alignment was dropped, so the score-descending re-sort cannot rank
+/// it above a cleanly aligned one. Far from `i32::MIN` so summing a pair cannot overflow.
+const SUNK_SCORE: i32 = -1_000_000;
+
+/// The abort budget for the candidate at `rank`, given the best complete pair aligned so far.
+///
+/// Absolute part: `ani_budget`, from `--min-ani`. Relative part: a candidate that cannot get under
+/// the best pair's cost cannot win, so there is nothing to gain by finishing it.
+///
+/// Ranks 0 and 1 are deliberately exempt. MAPQ is the gap between the best and second-best
+/// alignment, so aborting the runner-up the moment it cannot win would truncate its score and
+/// inflate MAPQ on exactly the ambiguous reads where MAPQ is the only thing carrying that
+/// ambiguity to the caller. The saving is in ranks 2+ anyway.
+fn tighten_budget(ani_budget: i32, best_pair_cost: Option<i32>, rank: usize) -> i32 {
+    if rank < 2 {
+        return ani_budget;
+    }
+    match best_pair_cost {
+        Some(c) => min(ani_budget, c),
+        None => ani_budget,
+    }
+}
+
+/// The Hamming distance the hamming-screen stage already measured for this anchor.
+///
+/// The screen set `score = query_len - hamming` over [`Anchor::whole`], which is the very window the
+/// gapless pre-filter inside [`Anchor::align`] would re-measure. Recovering it here saves that
+/// second SIMD pass. Every anchor reaching alignment was screened -- the alignment window is a
+/// prefix of the screened slice -- but the range check keeps this honest if that ever changes.
+fn screen_hamming(anchor: &Anchor, query_len: usize) -> Option<u32> {
+    let h = query_len as i32 - anchor.score;
+    if h < 0 || h > query_len as i32 { None } else { Some(h as u32) }
+}
+
 fn alignable_len(anchor: &Anchor, query_len: usize, ref_len: usize) -> usize {
     let qbegin = anchor.seeds.first().map_or(0, |s| s.qbegin()) as i64;
     let rbegin = anchor.seeds.first().map_or(0, |s| s.rbegin()) as i64;
@@ -80,6 +117,165 @@ fn alignable_len(anchor: &Anchor, query_len: usize, ref_len: usize) -> usize {
 }
 
 /// Resolves one mate of the winning pair. `None` when that mate has no anchor at all.
+/// Locate a mate the INDEX never reported, by looking where the geometry says it must be.
+///
+/// Triggered only when one mate anchored and the other produced nothing on that reference. A proper
+/// pair cannot be anywhere else: the partner overlaps the same reference within one insert size of
+/// its anchored mate, on the opposite strand. So rather than ask the index again -- measurement says
+/// 84% of these mates have no usable seeds at ANY `--max-best-flex`/`--ranges` setting, because
+/// their k-mers are suppressed or absent, not merely deprioritised -- this scans the ~1 kb of
+/// reference the pair must span and reports the best-matching offset.
+///
+/// The scan is why this is affordable: no index lookup, no header walk (42% of pipeline time), just
+/// Hamming over sequence already mmap'd, for the ~1% of pairs that come out half-placed.
+///
+/// It DECIDES nothing. The returned anchor is a position hint that flows into the ordinary
+/// extension -> gapped alignment -> emit path, so a rescued mate is judged by exactly the scoring
+/// every other mate is. That also keeps a partner carrying an indel recoverable, which a Hamming
+/// accept/reject could not: Hamming is only asked *where*, never *whether*.
+fn rescue_partner<D: FlexalignDatabase>(
+    db: &D,
+    anchored: &Anchor,
+    anchored_len: usize,
+    partner: &[u8],
+    max_insert: u64,
+    max_mismatch: u32,
+    margin: u32,
+    segments: usize,
+    ambiguous: &mut bool,
+    indel_suspected: &mut bool,
+) -> Option<Anchor> {
+    *ambiguous = false;
+    *indel_suspected = false;
+    let reference = db.get_reference(anchored.reference as usize)?;
+    let plen = partner.len();
+    if plen == 0 || reference.len() < plen {
+        return None;
+    }
+
+    // One strand, one direction. The partner of a forward mate is the reverse-complemented read
+    // lying DOWNSTREAM of it (and vice versa), so only half the window is worth touching -- which
+    // halves a scan that is otherwise the whole cost of this function.
+    let (a_start, _) = anchored.reference_pos(anchored_len);
+    let last = reference.len() - plen;
+    let (lo, hi) = if anchored.forward {
+        (a_start as usize, ((a_start + max_insert) as usize).min(last))
+    } else {
+        ((a_start.saturating_sub(max_insert)) as usize, (a_start as usize).min(last))
+    };
+    if lo > hi {
+        return None;
+    }
+
+    // SEGMENTED scan. Splitting the partner into `segments` pieces and locating each one separately
+    // costs the same byte comparisons as one full-length pass (3 x 50 == 1 x 150), but a full-length
+    // Hamming is destroyed by a single indel -- every base after it mismatches, so the read blows past
+    // the budget at EVERY offset and is rejected. Per segment, an indel can only ruin the segment it
+    // falls in.
+    //
+    // Segments are scored at a shared candidate READ-START coordinate, so "which start does this
+    // segment imply" is directly comparable between them. Agreement is a clean hit; a disagreement of
+    // d between segments IS an indel of size d, which turns the failure mode into a measurement.
+    let nseg = segments.max(1).min(plen);
+    let seg_len = plen / nseg;
+    if seg_len == 0 {
+        return None;
+    }
+    // Budget and margin scale with segment length, so the per-base standard is unchanged.
+    let seg_budget = ((max_mismatch as usize * seg_len) / plen).max(1) as u32;
+    let seg_margin = ((margin as usize * seg_len) / plen).max(2) as u32;
+
+    let mut accepted: Vec<(usize, usize, usize, u32)> = Vec::new(); // (start, qoff, len, mismatches)
+    let mut any_ambiguous = false;
+    for sidx in 0..nseg {
+        let qoff = sidx * seg_len;
+        // The last segment absorbs the remainder so the whole read is covered.
+        let slen = if sidx + 1 == nseg { plen - qoff } else { seg_len };
+        let seg = &partner[qoff..qoff + slen];
+
+        let mut best_pos = 0usize;
+        let mut best_mm = u32::MAX;
+        let mut second_mm = u32::MAX;
+        for pos in lo..=hi {
+            let rstart = pos + qoff;
+            if rstart + slen > reference.len() {
+                break;
+            }
+            let window = &reference[rstart..rstart + slen];
+            let mut mm = 0u32;
+            for (a, b) in seg.iter().zip(window) {
+                mm += (a != b) as u32;
+                if mm >= second_mm {
+                    break;
+                }
+            }
+            if mm < best_mm {
+                second_mm = best_mm;
+                best_mm = mm;
+                best_pos = pos;
+            } else if mm < second_mm {
+                second_mm = mm;
+            }
+        }
+        if best_mm > seg_budget {
+            continue;
+        }
+        // A segment that matches about equally well elsewhere in the window locates nothing.
+        if second_mm != u32::MAX && second_mm < best_mm.saturating_add(seg_margin) {
+            any_ambiguous = true;
+            continue;
+        }
+        accepted.push((best_pos, qoff, slen, best_mm));
+    }
+
+    if accepted.is_empty() {
+        *ambiguous = any_ambiguous;
+        return None;
+    }
+
+    // Consensus start: the read start the most segments agree on, ties broken by fewest mismatches.
+    // Segments landing on a DIFFERENT start are not discarded -- they are exactly what an indel looks
+    // like, and carrying them as seeds at their own offsets is how the anchor encodes it for the
+    // gapped aligner downstream.
+    let mut best_start = accepted[0].0;
+    let mut best_votes = 0usize;
+    let mut best_mm_at = u32::MAX;
+    for &(st, _, _, mm) in &accepted {
+        let votes = accepted.iter().filter(|(s2, _, _, _)| *s2 == st).count();
+        let mm_at = accepted.iter().filter(|(s2, _, _, _)| *s2 == st).map(|(_, _, _, m)| *m).min().unwrap_or(u32::MAX);
+        if votes > best_votes || (votes == best_votes && mm_at < best_mm_at) {
+            best_start = st;
+            best_votes = votes;
+            best_mm_at = mm_at;
+        }
+    }
+    *indel_suspected = accepted.iter().any(|&(st, _, _, _)| st != best_start);
+
+    // One seed per located segment, at its own offsets. Richer than a single full-length seed with a
+    // large mismatch count: extension and the aligner see where the agreement actually is.
+    let mk = |st: usize, qoff: usize, slen: usize, mm: u32| Seed {
+        rpos: (st + qoff) as u64,
+        rval: anchored.reference,
+        qpos: qoff as u32,
+        mismatch: mm.min(u8::MAX as u32) as u8,
+        length: slen.min(u8::MAX as usize) as u8,
+        flag: 0,
+    };
+    let (st0, q0, l0, m0) = accepted[0];
+    let mut a = Anchor::from_seed(&mk(st0, q0, l0, m0));
+    for &(st, qoff, slen, mm) in accepted.iter().skip(1) {
+        a.seeds.push(AnchorSeed {
+            qpos: qoff as u32,
+            rpos: (st + qoff) as u64,
+            length: slen as u32,
+        });
+        a.seed_count += 1;
+        a.mismatches += mm;
+    }
+    a.set_forward(!anchored.forward, plen);
+    Some(a)
+}
+
 fn resolve_mate<'m, D: FlexalignDatabase>(
     anchor: Option<&'m Anchor>,
     db: &'m D,
@@ -164,7 +360,19 @@ fn resolve_mate<'m, D: FlexalignDatabase>(
         None => query_coverage >= 0.95,
     };
 
-    Some(MateOut { anchor, ref_name, ref_len, query, qual, hamming, ani, query_coverage, end_to_end })
+    // The gate's quantity: bases actually placed, not a fraction of a geometry-dependent
+    // denominator. A Hamming-only anchor never reached the aligner, so its seed span is the best
+    // available estimate of what it would have placed.
+    let aligned_bases = match anchor.cigar.as_ref() {
+        Some(cigar) => cigar.query_aligned(),
+        None => match (anchor.seeds.first(), anchor.seeds.last()) {
+            (Some(first), Some(last)) => last.qend().saturating_sub(first.qbegin()),
+            _ => 0,
+        },
+    };
+
+    Some(MateOut { anchor, ref_name, ref_len, query, qual, hamming, ani, query_coverage,
+                   aligned_bases, end_to_end })
 }
 
 /// SAM QNAME: no leading `@`, truncated at the first whitespace, and with any trailing `/1` or `/2`
@@ -754,7 +962,7 @@ impl<
         // --debug: is the *true* anchor (matching the reference encoded in the read header) present
         // among all anchors, before any pruning/extension/alignment? Distinguishes a seeding/anchor
         // problem (true anchor absent) from a selection problem (present but not chosen).
-        if self.options.args.debug {
+        if self.options.args.debug && !GOLDSTD_EVAL {
             let header = String::from_utf8_lossy(rec_fwd.head());
             let true_rid = get_id_from_header(&header, self.db);
             if true_rid != 0 {
@@ -844,6 +1052,63 @@ impl<
         // sorts after pairing), so this keeps the candidates worth a reference comparison and drops
         // the tail -- extension is the first stage that reads reference sequence at all.
         let extend_top_z = min(self.options.args.extend_top_z.max(1), anchors.len());
+
+        // Truth-survival funnel. `true_rid` is the reference the read really came from, read off the
+        // simulated header; 0 when unknown. Every counter below is gated on GOLDSTD_EVAL, a
+        // compile-time constant, so an ordinary build contains none of this.
+        //
+        // The question each answers is not "how many anchors did this stage discard" but "did it
+        // discard the RIGHT one" -- which is what decides whether a cheap filter may run early.
+        let true_rid = if GOLDSTD_EVAL {
+            get_id_from_header(&String::from_utf8_lossy(rec_fwd.head()), self.db)
+        } else {
+            0
+        };
+        let mut truth_anchor_fwd = false;
+        let mut truth_anchor_rev = false;
+        let holds_truth = |slice: &[AnchorPair]| {
+            slice.iter().any(|AnchorPair(a1, a2)| {
+                a1.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+                    || a2.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+            })
+        };
+        // Same test per MATE: 0, 1 or 2. `holds_truth` is an OR over the two sides, so every stage
+        // it guards reports a pair as surviving when only one mate did -- which is precisely the
+        // loss being hunted. Counted against `2 * dbg_checked`, these localise the stage.
+        let holds_truth_mates = |slice: &[AnchorPair]| -> usize {
+            let fwd = slice.iter().any(|AnchorPair(a1, _)| {
+                a1.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+            });
+            let rev = slice.iter().any(|AnchorPair(_, a2)| {
+                a2.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+            });
+            fwd as usize + rev as usize
+        };
+        if GOLDSTD_EVAL && true_rid != 0 {
+            // Denominator, then the first two funnel steps. Owned here rather than in the `--debug`
+            // block above so a gold-standard build fills the whole funnel from one place (that block
+            // stands down when GOLDSTD_EVAL is on, or the two would double-count).
+            stats.dbg_checked += 1;
+            if holds_truth(&anchors) {
+                stats.dbg_true_anchor_present += 1;
+            }
+            if holds_truth(&anchors[0..extend_top_z]) {
+                stats.funnel_true_in_screen += 1;
+            }
+            stats.funnel_true_anchor_mates += holds_truth_mates(&anchors);
+            // Remembered for the emit site, which is where a half-pair is finally observable but
+            // where the candidate list is long gone. A dropped mate either never had an anchor on
+            // the true reference (seeding could not offer it) or had one and lost the ranking
+            // (selection threw it away) -- and those need opposite fixes.
+            truth_anchor_fwd = anchors.iter().any(|AnchorPair(a1, _)| {
+                a1.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+            });
+            truth_anchor_rev = anchors.iter().any(|AnchorPair(_, a2)| {
+                a2.as_ref().is_some_and(|a| a.reference as usize == true_rid)
+            });
+            stats.funnel_true_in_screen_mates += holds_truth_mates(&anchors[0..extend_top_z]);
+        }
+        let pair_bonus = self.options.args.proper_pair_bonus;
         let (duration, extended_count) = time(|| {
             let extended_count = self.anchor_extender.extend(
                 &mut anchors[0..extend_top_z],
@@ -862,8 +1127,16 @@ impl<
             // NB: a reference-id tie-break was tried here and reverted. It made ties deterministic
             // but not more accurate (an arbitrary key cannot favour the truth), and the tuple sort
             // key cost ~60% wall time on the protal marker DB.
+            // PROPER-PAIR BONUS. The raw key is score(a1)+score(a2) with a missing side worth 0 --
+            // but `core_matches` sums OVERLAPPING seed lengths, so it is not bounded by read length
+            // and a seed-rich repeat hit on one mate can outscore a genuine full pair. Measurement:
+            // 60% of misclassified pairs and 54,366 half-pairs are a single-sided candidate beating
+            // a two-sided one. Two mates agreeing on a locus at the right insert distance is stronger
+            // evidence than one mate scoring well, so a pair that HAS both sides is ranked ahead.
+            let bonus = pair_bonus;
             glidesort::sort_by_key(&mut anchors[0..extended_count], |AnchorPair(a1, a2)| {
-                -(a1.as_ref().map_or(0, |a| a.score) + a2.as_ref().map_or(0, |a| a.score))
+                let s = a1.as_ref().map_or(0, |a| a.score) + a2.as_ref().map_or(0, |a| a.score);
+                -(s + if a1.is_some() && a2.is_some() { bonus } else { 0 })
             });
 
             // assert!(extension_anchors.iter().all(|pair| pair.validate().is_ok()));
@@ -873,12 +1146,105 @@ impl<
         // Assumes sorted anchors !!
         let extension_anchors = &mut anchors[0..extended_count];
 
+        // Mate rescue, LAZY: run only on the candidate(s) that can still be emitted, after extension
+        // has re-scored and re-sorted everything.
+        //
+        // Doing it before extension worked but wasted most of the effort -- 649,934 rescues succeeded
+        // to change ~88,000 emitted mates, because a candidate rescued at rank 5 is still rank 5 and
+        // never reaches the output. Here the ranking is already final, so a rescue that succeeds is a
+        // rescue that counts. The rescued anchor is then extended on its own, so it carries the same
+        // extended score and CIGAR as one the index produced and is judged by the same gates.
+        if self.options.args.mate_rescue && !extension_anchors.is_empty() {
+            let args = &self.options.args;
+            let max_insert = 1000u64;
+            let max_mm = |len: usize| ((1.0 - args.min_ani) * len as f64) as u32;
+            let ext_score = |AnchorPair(a, b): &AnchorPair| {
+                a.as_ref().map_or(0, |x| x.score) + b.as_ref().map_or(0, |x| x.score)
+            };
+            let best_score = ext_score(&extension_anchors[0]);
+            // Ties still matter after extension -- selecting rank 1 alone was what made the rank-based
+            // trigger insensitive -- but the tail cannot win, so the cap stays small.
+            let cutoff = (best_score as f64 * args.mate_rescue_score_frac) as i32;
+            let cap = min(args.mate_rescue_top.min(4), extension_anchors.len());
+            let full_pair_exists = extension_anchors
+                .iter()
+                .any(|AnchorPair(a, b)| a.is_some() && b.is_some());
+            let mut fired = false;
+            let mut rescued_any = false;
+
+            for idx in 0..cap {
+                if ext_score(&extension_anchors[idx]) < cutoff {
+                    break;
+                }
+                let AnchorPair(a_fwd, a_rev) = &mut extension_anchors[idx];
+                // The partner's orientation follows the ANCHORED mate's strand, not which mate it is.
+                // In an FR pair the two mates lie on opposite strands: an anchored mate on the
+                // forward strand implies its partner is reverse-complemented, and an anchored mate on
+                // the reverse strand implies its partner is forward. Always taking the reverse
+                // complement scans the wrong sequence for every read whose anchored mate is reverse
+                // -- roughly half of them -- and no offset can then match.
+                let (anchored, anchored_len, partner) = match (a_fwd.is_some(), a_rev.is_some()) {
+                    (true, false) => {
+                        let a = a_fwd.as_ref().unwrap();
+                        let p = if a.forward { self.rec_rev_revc.seq() } else { rec_rev.seq() };
+                        (a, rec_fwd.seq().len(), p)
+                    }
+                    (false, true) => {
+                        let a = a_rev.as_ref().unwrap();
+                        let p = if a.forward { self.rec_fwd_revc.seq() } else { rec_fwd.seq() };
+                        (a, rec_rev.seq().len(), p)
+                    }
+                    _ => continue,
+                };
+                if anchored.core_matches() < args.mate_rescue_min_core {
+                    stats.rescue_skipped_weak += 1;
+                    continue;
+                }
+
+                stats.rescue_attempted += 1;
+                fired = true;
+                let mut ambiguous = false;
+                let mut indel_suspected = false;
+                let rescued = rescue_partner(
+                    self.db, anchored, anchored_len, partner, max_insert,
+                    max_mm(partner.len()), args.mate_rescue_margin,
+                    args.mate_rescue_segments, &mut ambiguous, &mut indel_suspected,
+                );
+                if ambiguous {
+                    stats.rescue_rejected_ambiguous += 1;
+                }
+                if indel_suspected {
+                    stats.rescue_indel_suspected += 1;
+                }
+                if let Some(a) = rescued {
+                    if a_fwd.is_some() { *a_rev = Some(a); } else { *a_fwd = Some(a); }
+                    stats.rescue_succeeded += 1;
+                    rescued_any = true;
+                }
+            }
+            if fired && full_pair_exists {
+                stats.rescue_with_full_pair_available += 1;
+            }
+
+            // Extend just what was rescued: a rescued anchor arrives with a position and nothing
+            // else, and everything downstream (scores, CIGAR, the emit gates) assumes an extended one.
+            if rescued_any {
+                let n = min(cap, extension_anchors.len());
+                self.anchor_extender.extend(
+                    &mut extension_anchors[0..n],
+                    rec_fwd,
+                    &self.rec_fwd_revc,
+                    rec_rev,
+                    &self.rec_rev_revc,
+                    stats,
+                );
+            }
+        }
+
         // --debug: after extension + score-sort, is the best anchor the true one? Together with
         // dbg_true_anchor_present this pinpoints the stage: present but not best => extension/scoring
         // ranks a homolog above the truth; not present => the true anchor is never formed (seeding).
-        if self.options.args.debug {
-            let header = String::from_utf8_lossy(rec_fwd.head());
-            let true_rid = get_id_from_header(&header, self.db);
+        if self.options.args.debug || GOLDSTD_EVAL {
             if true_rid != 0 {
                 if let Some(AnchorPair(a1, a2)) = extension_anchors.first() {
                     let best_is_true = a1.as_ref().is_some_and(|a| a.reference as usize == true_rid)
@@ -890,7 +1256,7 @@ impl<
             }
         }
 
-        stats.time_extend_anchors += duration;
+        stats.time_hamming_screen += duration;
 
         if GOLDSTD_EVAL {
             let mut any_correct = false;
@@ -973,12 +1339,36 @@ impl<
         let mut alignment_anchors =
             &mut extension_anchors[0..min(self.options.args.align_top_y, anchors_len)];
 
+        // Did the true anchor survive the screen's re-ranking into the alignment window? A "no" here
+        // with a "yes" at `funnel_in_screen` is the screen mis-ranking the truth -- the failure mode
+        // a fixed-diagonal Hamming has on reads with a real indel.
+        if GOLDSTD_EVAL && true_rid != 0 {
+            if holds_truth(alignment_anchors) {
+                stats.funnel_true_in_align_window += 1;
+            }
+            stats.funnel_true_in_align_window_mates += holds_truth_mates(alignment_anchors);
+        }
+
         // Hoisted out of the closure below, which mutably borrows `self.align`.
         let min_ani = self.options.args.min_ani;
 
         let (duration, _) = time(|| {
             let mut min_score_1 = None;
             let mut min_score_2 = None;
+
+            // Cost of the best complete PAIR aligned so far, or None until one completes. This is
+            // what makes the abort budget dynamic: a candidate that cannot get under it cannot win,
+            // so there is no reason to finish aligning it.
+            //
+            // Bounding each MATE by the pair cost is sound and conservative. Pair score is
+            // `s1 + s2` with both <= 0, so beating the best pair needs
+            // `s1_new > best_pair - s2_new >= best_pair`, i.e. `cost1_new < best_pair_cost`.
+            // A per-mate bound taken from that mate's own best would NOT be sound -- it would
+            // discard a weak mate belonging to a winning pair.
+            let mut best_pair_cost: Option<i32> = None;
+            let mut trace_total = AlignTrace::default();
+            let mut stage_hist = [0usize; 6];
+            let mut stage_hist_true = [0usize; 6];
 
             alignment_anchors
                 .iter_mut()
@@ -1008,7 +1398,11 @@ impl<
                                 // median 9bp from minibwa's position. Per candidate, not cached: the
                                 // alignable window depends on where this anchor sits.
                                 let alignable = alignable_len(a, query.len(), reference.len()) as i32;
-                                min_score_1 = Some(ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs());
+                                min_score_1 = Some(tighten_budget(
+                                    ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs(),
+                                    best_pair_cost,
+                                    _i,
+                                ));
                                 self.align.set_max_alignment_score(min_score_1.unwrap());
                                 // eprintln!("Align max score: {}", min_score_1.unwrap());
 
@@ -1019,13 +1413,23 @@ impl<
                                 // let status = a.smart_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
                                 // let status = a.whole_align(&mut self.align, query, reference, 10, min_score_1.unwrap());
 
+                                let mut trace = AlignTrace::default();
                                 let status = a.align(
                                     &mut self.align,
                                     query,
                                     reference,
                                     10,
                                     min_score_1.unwrap(),
+                                    screen_hamming(a, query.len()),
+                                    &mut trace,
                                 );
+                                trace_total.merge_from(&trace);
+                                if STAGE_TRACE {
+                                    stage_hist[trace.stage as usize] += 1;
+                                    if GOLDSTD_EVAL && a.reference as usize == true_rid {
+                                        stage_hist_true[trace.stage as usize] += 1;
+                                    }
+                                }
 
                                 // let (qr, rr) = a.whole(query.len(), reference.len());
                                 // let (duration, (score, cigar, status)) = time(|| self.align.align(&query[qr], &reference[rr]));
@@ -1040,7 +1444,7 @@ impl<
                                         // (whose scores are <= 0) -- so a divergent homolog that drops
                                         // beats the true locus that aligned. Sink it. (Kept well above
                                         // i32::MIN so the sort's `s1 + s2` cannot overflow.)
-                                        a.score = -1_000_000;
+                                        a.score = SUNK_SCORE;
                                     }
                                     super::common::Status::Partial => stats.alignments_partial += 1,
                                 }
@@ -1057,10 +1461,11 @@ impl<
                                 //     eprintln!("{}/1: {} ANI: {}", i, score, ani);
                                 // }
 
-                                if score != std::i32::MIN && -score < min_score_1.unwrap() {
-                                    // eprintln!("Set {} -> {}", min_score_1.unwrap(), -score);
-                                    min_score_1 = Some(-score);
-                                }
+                                // (The tightening that used to live here reassigned min_score_1 from
+                                // this candidate's own result, which the next candidate's
+                                // unconditional reassignment then discarded -- so it never had any
+                                // effect. The cross-candidate bound is now `best_pair_cost`, applied
+                                // through `tighten_budget` above.)
                                 // eprintln!("{} (asize: {}) Set score {} {} {} {}", i, a.seeds.len(), score, a.score, (1.0 - a.score as f64/cigar.0.len() as f64),  String::from_utf8_lossy(&cigar.0));
                             }
                             // eprintln!("{}", query.len());
@@ -1083,7 +1488,11 @@ impl<
                                 // median 9bp from minibwa's position. Per candidate, not cached: the
                                 // alignable window depends on where this anchor sits.
                                 let alignable = alignable_len(a, query.len(), reference.len()) as i32;
-                                min_score_2 = Some(ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs());
+                                min_score_2 = Some(tighten_budget(
+                                    ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs(),
+                                    best_pair_cost,
+                                    _i,
+                                ));
 
                                 if a.seeds.len() > 1 && a.seeds[0].qbegin() > a.seeds[1].qbegin() {
                                     log::debug!("2  {}", a);
@@ -1093,13 +1502,23 @@ impl<
                                 // let status = a.smart_align(&mut self.align, query, reference, 10, min_score_2.unwrap());
                                 // let status = a.whole_align(&mut self.align, query, reference, 10, min_score_2.unwrap());
 
+                                let mut trace = AlignTrace::default();
                                 let status = a.align(
                                     &mut self.align,
                                     query,
                                     reference,
                                     10,
                                     min_score_2.unwrap(),
+                                    screen_hamming(a, query.len()),
+                                    &mut trace,
                                 );
+                                trace_total.merge_from(&trace);
+                                if STAGE_TRACE {
+                                    stage_hist[trace.stage as usize] += 1;
+                                    if GOLDSTD_EVAL && a.reference as usize == true_rid {
+                                        stage_hist_true[trace.stage as usize] += 1;
+                                    }
+                                }
 
                                 // let (qr, rr) = a.whole(query.len(), reference.len());
                                 // let (duration, (score, cigar, status)) = time(|| self.align.align(&query[qr], &reference[rr]));
@@ -1114,7 +1533,7 @@ impl<
                                         // (whose scores are <= 0) -- so a divergent homolog that drops
                                         // beats the true locus that aligned. Sink it. (Kept well above
                                         // i32::MIN so the sort's `s1 + s2` cannot overflow.)
-                                        a.score = -1_000_000;
+                                        a.score = SUNK_SCORE;
                                     }
                                     super::common::Status::Partial => stats.alignments_partial += 1,
                                 }
@@ -1152,16 +1571,30 @@ impl<
                                 //     eprintln!("{}/2: {} ANI: {}", i, score, ani);
                                 // }
 
-                                if score != std::i32::MIN && -score < min_score_2.unwrap() {
-                                    // eprintln!("Set {} -> {}", min_score_2.unwrap(), -score);
-                                    min_score_2 = Some(-score);
-                                }
+                                // (The tightening that used to live here reassigned min_score_2 from
+                                // this candidate's own result, which the next candidate's
+                                // unconditional reassignment then discarded -- so it never had any
+                                // effect. The cross-candidate bound is now `best_pair_cost`, applied
+                                // through `tighten_budget` above.)
                                 // eprintln!("{} (asize: {}) Set score {} {} {} {}", i, a.seeds.len(), score, a.score, (1.0 - a.score as f64/cigar.0.len() as f64),  String::from_utf8_lossy(&cigar.0));
                             }
                             // eprintln!("{}", query.len());
                         }
                         None => (),
                     };
+
+                    // Both mates of this candidate are done. If the pair completed, its cost becomes
+                    // the bound every LATER candidate has to beat (see `best_pair_cost` above).
+                    // Sunk anchors (-1_000_000) are excluded: a dropped mate has no real cost.
+                    let s1 = a1.as_ref().map_or(0, |a| a.score);
+                    let s2 = a2.as_ref().map_or(0, |a| a.score);
+                    if s1 > SUNK_SCORE && s2 > SUNK_SCORE {
+                        let pair_cost = -(s1 + s2);
+                        if pair_cost >= 0 {
+                            best_pair_cost =
+                                Some(best_pair_cost.map_or(pair_cost, |c| min(c, pair_cost)));
+                        }
+                    }
                 });
 
             glidesort::sort_by_key(&mut alignment_anchors,|AnchorPair(a1, a2)| {
@@ -1176,6 +1609,14 @@ impl<
 
                 - ((s1 + s2) as i64)
             });
+
+            stats.trace.merge_from(&trace_total);
+            if STAGE_TRACE {
+                for i in 0..stage_hist.len() {
+                    stats.align_stage_reached[i] += stage_hist[i];
+                    stats.align_stage_reached_true[i] += stage_hist_true[i];
+                }
+            }
         });
         stats.time_alignment += duration;
 
@@ -1414,24 +1855,56 @@ impl<
         // pass `min_ani` only because the clipped-away remainder of the read costs nothing.
         // End-to-end (clipping only where the read overhangs the reference) replaces the blanket
         // coverage fraction. Setting --min-query-coverage > 0 restores the old gate instead.
-        let min_query_coverage = self.options.args.min_query_coverage;
+        let min_aligned_bases = self.options.args.min_query_coverage;
         // Two independent conditions, both required:
         //   end_to_end     -- WHERE clipping is legitimate: only where the read runs off the
-        //                     reference, never in the middle of it.
-        //   query_coverage -- HOW MUCH of the read actually aligned. A read overhanging a marker's
-        //                     end by 140 of its 150 bases is legitimately clipped and still carries
-        //                     10 bases of evidence, which is not enough to place it.
-        // The coverage floor alone accepts mid-reference partial hits; end-to-end alone accepts
-        // 10-base edge matches. Measured: 92.03% precision for coverage alone, 53.90% for
-        // end-to-end alone.
-        let require_e2e = self.options.args.end_to_end;
+        //                     reference, never in the middle of it. A partial match landing inside
+        //                     a gene does not explain the read.
+        //   aligned_bases  -- HOW MUCH sequence actually agreed. A read overhanging a marker's end
+        //                     by 140 of its 150 bases is legitimately clipped and still carries only
+        //                     10 bases of evidence, which is not enough to place it anywhere.
+        // Neither alone suffices: a base floor alone accepts mid-reference partial hits, end-to-end
+        // alone accepts 10-base edge matches (measured 53.90% precision).
+        let require_e2e = !self.options.args.allow_partial;
         let ok = |m: &MateOut| {
             m.ani >= min_ani
-                && m.query_coverage >= min_query_coverage
+                && m.aligned_bases >= min_aligned_bases
                 && (!require_e2e || m.end_to_end)
         };
-        let fwd_pass = fwd_out.as_ref().is_some_and(&ok);
-        let rev_pass = rev_out.as_ref().is_some_and(&ok);
+        // PAIR-AWARE base floor. `min_aligned_bases` asks "does this mate carry enough sequence to be
+        // placed ON ITS OWN" -- the right question for a single read and the wrong one for a pair. A
+        // mate overlapping a marker by 20 bases is unplaceable alone, but if its partner aligns
+        // cleanly at the correct insert distance then the pair, jointly, places it: the 20 bases only
+        // have to be CONSISTENT with a location the partner already established, not to establish one.
+        // Judging the two mates independently discards that evidence and is the same mistake as the
+        // pair-level funnel -- treating a pair as two unrelated reads.
+        //
+        // So a mate that fails only the length test is kept when its partner passed cleanly, down to
+        // a lower floor (`--min-query-coverage-mate`). Identity and end-to-end still apply to it in
+        // full: this relaxes HOW MUCH sequence is required, never whether the sequence agrees.
+        let min_mate_bases = self.options.args.min_query_coverage_mate;
+        let ok_backed = |m: &MateOut, partner_ok: bool| {
+            partner_ok
+                && m.ani >= min_ani
+                && m.aligned_bases >= min_mate_bases
+                && (!require_e2e || m.end_to_end)
+        };
+        let fwd_alone = fwd_out.as_ref().is_some_and(&ok);
+        let rev_alone = rev_out.as_ref().is_some_and(&ok);
+        // Only one side may lean on the other -- otherwise two mates that each fail the full floor
+        // could prop each other up on no independent evidence at all.
+        let fwd_pass = fwd_alone
+            || (min_mate_bases < min_aligned_bases
+                && fwd_out.as_ref().is_some_and(|m| ok_backed(m, rev_alone)));
+        let rev_pass = rev_alone
+            || (min_mate_bases < min_aligned_bases
+                && rev_out.as_ref().is_some_and(|m| ok_backed(m, fwd_alone)));
+        if fwd_pass && !fwd_alone {
+            stats.mate_backed_emitted += 1;
+        }
+        if rev_pass && !rev_alone {
+            stats.mate_backed_emitted += 1;
+        }
         if fwd_out.is_some() && !fwd_pass {
             stats.filtered_below_min_ani += 1;
         }
@@ -1440,6 +1913,51 @@ impl<
         }
         let fwd_mate = if fwd_pass { fwd_out.as_ref() } else { None };
         let rev_mate = if rev_pass { rev_out.as_ref() } else { None };
+
+        // What SHAPE did this pair emit? Counted always, not only under GOLDSTD_EVAL, because a pair
+        // that places one mate and drops the other loses a real alignment while every pair-level
+        // counter still calls the pair a success. That asymmetry hid the dominant recall loss:
+        // 194k of the 224k mates flexalign missed on markersim had their partner mate emitted.
+        match (fwd_mate.is_some(), rev_mate.is_some()) {
+            (true, true) => {}
+            (false, false) => stats.pairs_none_emitted += 1,
+            _ => {
+                stats.pairs_half_emitted += 1;
+                // Split the half-pair by WHY the dropped mate is missing. Rescue (a scan, not a
+                // lookup) can only reach the first case; the second is a ranking failure and needs a
+                // different fix entirely, so which one dominates decides where effort goes next.
+                if GOLDSTD_EVAL && true_rid != 0 {
+                    let dropped_had_anchor = if fwd_mate.is_some() {
+                        truth_anchor_rev
+                    } else {
+                        truth_anchor_fwd
+                    };
+                    if dropped_had_anchor {
+                        stats.halfpair_mate_lost_selection += 1;
+                    } else {
+                        stats.halfpair_mate_never_anchored += 1;
+                    }
+                }
+            }
+        }
+
+        // Bottom of the funnel: the true alignment made it all the way out. Compared against
+        // `funnel_in_align_window`, the difference is everything the aligner's own budgets and these
+        // two output gates cost -- so a stage that is fine on anchors but lossy on truth shows up as
+        // a step down here rather than as a number nobody was counting.
+        //
+        // Counted BOTH ways. The pair form is satisfied by either mate, so on its own it reports a
+        // half-placed pair as fully reported; the mate form (denominator `2 * dbg_checked`) is the
+        // one that can see a dropped mate at all.
+        if GOLDSTD_EVAL && true_rid != 0 {
+            let emitted_truth = |m: &&MateOut| self.db.get_rname(true_rid).is_some_and(|n| n == m.ref_name);
+            let fwd_truth = fwd_mate.as_ref().is_some_and(emitted_truth);
+            let rev_truth = rev_mate.as_ref().is_some_and(emitted_truth);
+            if fwd_truth || rev_truth {
+                stats.funnel_true_reported += 1;
+            }
+            stats.funnel_true_reported_mates += fwd_truth as usize + rev_truth as usize;
+        }
 
         let mut print_reads = false;
 
@@ -1613,5 +2131,53 @@ impl<
             }
         }
 
+    }
+}
+
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// The best and the runner-up must never be tightened. MAPQ is the gap between them, so an
+    /// early abort on rank 1 truncates the very number that carries the read's ambiguity.
+    #[test]
+    fn ranks_zero_and_one_keep_the_full_ani_budget() {
+        let ani = 300;
+        assert_eq!(tighten_budget(ani, Some(10), 0), ani);
+        assert_eq!(tighten_budget(ani, Some(10), 1), ani);
+    }
+
+    #[test]
+    fn later_ranks_are_bounded_by_the_best_pair_cost() {
+        let ani = 300;
+        assert_eq!(tighten_budget(ani, Some(10), 2), 10, "cannot beat 10, so do not spend 300");
+        assert_eq!(tighten_budget(ani, Some(500), 2), ani, "never LOOSEN past --min-ani");
+        assert_eq!(tighten_budget(ani, None, 2), ani, "nothing has completed yet");
+    }
+
+    /// A perfect pair leaves a zero budget for everyone after it: nothing can beat cost 0, so no
+    /// later candidate is worth a single mismatch of work.
+    #[test]
+    fn a_perfect_pair_closes_the_budget() {
+        assert_eq!(tighten_budget(300, Some(0), 2), 0);
+    }
+
+    /// `screen_hamming` inverts what the screen stored (`score = query_len - hamming`), and refuses
+    /// anything outside [0, query_len] rather than handing the pre-filter a nonsense bound.
+    #[test]
+    fn screen_hamming_inverts_the_screen_score() {
+        let mut a = crate::align::data_structures::anchor::tests::anchor(&[(0, 0, 10)]);
+        a.score = 150 - 7;
+        assert_eq!(screen_hamming(&a, 150), Some(7));
+
+        a.score = 150;
+        assert_eq!(screen_hamming(&a, 150), Some(0), "a perfect screen is zero mismatches");
+
+        // An anchor that never went through the screen carries an unrelated score.
+        a.score = -1_000_000;
+        assert_eq!(screen_hamming(&a, 150), None, "out of range must not be trusted");
+        a.score = 400;
+        assert_eq!(screen_hamming(&a, 150), None);
     }
 }

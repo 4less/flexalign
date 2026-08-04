@@ -198,12 +198,17 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
                     assert!(first.qend() <= query.len());
 
                     // eprintln!("Update Fwd Score:\n{}", a);
-                    let hdist = a.hamming(query, reference);
-
-
-                    if a.flagged_for_indel {
-                        a.indel_hamming(query, reference);
-                    }
+                    // Same rule as mate 2 below. This used to call `indel_hamming` and DISCARD the
+                    // result (it takes `&self`, so the call was pure), then score on plain Hamming
+                    // -- which prices an indel-bearing anchor on a fixed diagonal and charges the
+                    // whole post-indel tail as mismatches. The two mates were therefore ranked on
+                    // different scales for identical evidence, and that ranking decides which
+                    // anchors reach the aligner at all and what the best/second-best MAPQ gap is.
+                    let hdist = if !a.flagged_for_indel {
+                        a.hamming(query, reference)
+                    } else {
+                        a.indel_hamming(query, reference)
+                    };
 
                     // eprintln!("> {} - {}", query.len(), hdist);
                     a.score = (query.len() as u64 - hdist) as i32;

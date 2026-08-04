@@ -405,7 +405,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
         read_length_rev: usize,
         stats: &mut Stats,
     ) -> &mut [AnchorPair] {
-        let _ = stats;
+        // `stats` now carries the pair-leak counters below.
 
         self.groups.clear();
         self.groups_paired.clear();
@@ -477,6 +477,17 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                 //     eprintln!("{}", anchor_tmp.len());
                 // }
 
+                // Both mates had seeds on THIS reference, so a pair was available in principle.
+                // Count the three ways less than a full pair comes out of it (behaviour unchanged:
+                // an empty side already made the cross-product below iterate zero times).
+                let (n_fwd, n_rev) = (self.anchors_fwd.len(), self.anchors_rev.len());
+                if (n_fwd == 0) != (n_rev == 0) {
+                    stats.pair_leak_empty_side += 1;
+                    if n_fwd > 1 || n_rev > 1 {
+                        stats.pair_leak_multi_empty += 1;
+                    }
+                }
+
                 if self.anchors_fwd.len() <= 1 && self.anchors_rev.len() <= 1 {
                     self.anchors
                         .push(AnchorPair(self.anchors_fwd.pop(), self.anchors_rev.pop()));
@@ -487,6 +498,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
                     // eprintln!("Insert size: {:?}   {:?}, {:?}", insert_size(Some(a_fwd), Some(a_rev), read_length), a_fwd.reference_pos(read_length), a_rev.reference_pos(read_length));
                 } else {
+                    let pushed_before = self.anchors.len();
                     for a_fwd in &self.anchors_fwd {
                         for a_rev in &self.anchors_rev {
                             match insert_size(
@@ -512,6 +524,12 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                                 ),
                             };
                         }
+                    }
+                    // Both sides had anchors but nothing came within the insert-size cutoff, and
+                    // there is no fallback -- so this reference contributes no candidate at all,
+                    // for either mate.
+                    if n_fwd > 0 && n_rev > 0 && self.anchors.len() == pushed_before {
+                        stats.pair_leak_insert_size += 1;
                     }
                 }
                 current_idx += 2;

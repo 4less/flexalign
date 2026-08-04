@@ -76,16 +76,88 @@ pub struct Args {
     #[arg(long = "min-ani", default_value_t = 0.85)]
     pub min_ani: f64,
 
-    /// Minimum fraction of the read that must be covered by the alignment (aligned query bases /
-    /// read length) for a record to be emitted. `--min-ani` prices only the *aligned* window, so a
-    /// short local match to the wrong reference -- with the rest of the read soft-clipped away for
-    /// free -- can pass the identity gate; this coverage floor rejects those partial hits. A real
-    /// short read maps end-to-end (coverage ~1.0). Set to 0.0 to disable. Default 0.70: on a marker
-    /// DB this lifts precision-of-mapped from ~26% to ~92% (matching protal) while keeping per-read
-    /// recall above protal's; wrong-reference junk is concentrated below ~0.5 coverage and precision
-    /// is flat above the knee, so 0.70 clears it with margin.
-    #[arg(long = "min-query-coverage", default_value_t = 0.70)]
-    pub min_query_coverage: f64,
+    /// Minimum number of read bases an alignment must actually place for the record to be emitted.
+    ///
+    /// This is a BASE COUNT, not a fraction. A fraction is the wrong shape on a marker DB: its
+    /// denominator has to be "what COULD align", which shrinks as a read hangs further off the end
+    /// of a gene -- so the same 40 aligned bases read as 27% on a read sitting inside a gene and
+    /// 100% on one dovetailing off it. The gate then varies with geometry rather than with evidence.
+    /// A base count does not move: 35 bases is 35 bases of sequence agreement wherever it sits.
+    ///
+    /// 35 is a little over one syncmer window (k=31) plus slack -- below that a match is short
+    /// enough to occur by chance across 14.5 M markers. Set to 0 to disable.
+    #[arg(long = "min-query-coverage", default_value_t = 35)]
+    pub min_query_coverage: usize,
+
+    /// Rescue a mate the index never reported, by scanning where the pair geometry says it must be.
+    ///
+    /// Fires only when one mate anchored and the other produced nothing on that reference -- ~1% of
+    /// pairs, but the dominant recall loss: 194k of the 224k mates missed on markersim had their
+    /// partner emitted. Relaxing `--max-best-flex`/`--ranges` recovers only 16% of them, because the
+    /// partner's k-mers are absent or suppressed rather than merely deprioritised; scanning the
+    /// reference directly needs no index lookup at all.
+    ///
+    /// The scan only locates. What it finds is judged by the ordinary alignment and output gates.
+    #[arg(long = "mate-rescue", action)]
+    pub mate_rescue: bool,
+
+    /// HARD CAP on rescue attempts per read. Rank is a poor selector on its own -- single-sided
+    /// candidates are the normal contents of the ranking tail, so `top 2` already costs 53x `top 1`
+    /// for 17% more yield. This only stops a pathological read; `--mate-rescue-score-frac` does the
+    /// actual selecting.
+    #[arg(long = "mate-rescue-top", default_value_t = 16)]
+    pub mate_rescue_top: usize,
+
+    /// Attempt rescue only on candidates scoring at least this fraction of the read's BEST
+    /// candidate. Selecting by score rather than rank adapts per read: one clear winner yields one
+    /// attempt, several genuinely competitive candidates yield a few, and a long junk tail yields
+    /// none of it -- which is what makes looking past rank 1 affordable at all.
+    #[arg(long = "mate-rescue-score-frac", default_value_t = 0.85)]
+    pub mate_rescue_score_frac: f64,
+
+    /// Minimum `core_matches` (summed seed length) on the ANCHORED side before its position is
+    /// trusted as a prior. The whole scan rests on that anchor being real; rescuing the partner of a
+    /// weak single-end hit just manufactures a well-formed pair in the wrong place.
+    #[arg(long = "mate-rescue-min-core", default_value_t = 30)]
+    pub mate_rescue_min_core: usize,
+
+    /// Mismatch margin the best offset must beat the runner-up by. A partner matching about equally
+    /// well at several offsets is in a repeat and its position carries no information -- and since a
+    /// 1-base shift destroys a Hamming match entirely, a genuine hit normally wins by a mile.
+    #[arg(long = "mate-rescue-margin", default_value_t = 8)]
+    pub mate_rescue_margin: u32,
+
+    /// Score added to a candidate that has BOTH mates, when ranking candidates.
+    ///
+    /// Without it the key is just score(mate1)+score(mate2) with a missing side worth zero -- and
+    /// since `core_matches` sums overlapping seed lengths it is not bounded by read length, so a
+    /// seed-rich repeat hit on ONE mate can outrank a genuine full pair. Two mates agreeing on a
+    /// locus at the right insert distance is stronger evidence than one mate scoring well. 0 = off.
+    #[arg(long = "proper-pair-bonus", default_value_t = 0)]
+    pub proper_pair_bonus: i32,
+
+    /// Pieces the partner is split into for the rescue scan.
+    ///
+    /// A full-length Hamming is destroyed by one indel -- every base after it mismatches, so the read
+    /// exceeds the budget at every offset and is rejected outright. Per segment, an indel can only
+    /// ruin the segment containing it; the rest still locate the read. Costs the same byte
+    /// comparisons (3 x 50 == 1 x 150). Segments disagreeing about the read start ARE the indel, and
+    /// each is carried into the anchor as its own seed so the gapped aligner sees it. 1 = old
+    /// full-length behaviour.
+    #[arg(long = "mate-rescue-segments", default_value_t = 1)]
+    pub mate_rescue_segments: usize,
+
+    /// Base floor for a mate whose PARTNER already aligned cleanly -- the pair-aware counterpart of
+    /// `--min-query-coverage`.
+    ///
+    /// That flag asks whether a mate carries enough sequence to be placed on its own, which is the
+    /// wrong question for a pair: 20 bases cannot establish a location, but they can be consistent
+    /// with one the partner has already established at the correct insert distance. Judging the mates
+    /// independently throws that joint evidence away. Only one mate may lean on the other, and
+    /// identity and end-to-end still apply in full -- this relaxes how MUCH sequence is required,
+    /// never whether it agrees. Set equal to `--min-query-coverage` to disable.
+    #[arg(long = "min-query-coverage-mate", default_value_t = 20)]
+    pub min_query_coverage_mate: usize,
 
     /// Emit PAF instead of SAM. SAM is the default: it carries the CIGAR and NM that the aligner
     /// already computed, so PAF is the lossy option and should be the one you ask for.
@@ -130,16 +202,20 @@ pub struct Args {
     #[arg(long = "dump-anchors", action)]
     pub dump_anchors: bool,
 
-    /// Require alignments to be end-to-end on the read, treating soft-clipping as legitimate only
-    /// where the read runs off the reference.
+    /// Accept PARTIAL alignments -- a read matching only part way into the middle of a reference.
     ///
-    /// OFF by default, and measured as a net loss until leading soft-clips are emitted: `to_sam`
-    /// clips only at the 3' end, so a read hanging off the START of a reference is indistinguishable
-    /// from a mid-reference partial hit and gets rejected with it. On the protal marker DB this
-    /// removed 0.156 pp of alignments to gain 0.20 pp precision -- 87% of what it rejected was
-    /// correct. Revisit once left overhangs are representable.
-    #[arg(long = "end-to-end", action)]
-    pub end_to_end: bool,
+    /// ON by default. Partial alignments -- a read matching only part way into the middle of a
+    /// reference -- do not explain the read and are rejected.
+    ///
+    /// It was off historically because it "removed 0.156 pp of alignments to gain 0.20 pp precision,
+    /// 87% of what it rejected was correct". That measurement was taken while `to_sam` could only
+    /// clip at the 3' end, so a read hanging off the START of a reference was indistinguishable from
+    /// a mid-reference partial hit and was rejected with it. Leading soft-clips are now emitted, so
+    /// the two cases are separable and the rejection lands only on genuine partials.
+    ///
+    /// `--allow-partial` restores the old permissive behaviour.
+    #[arg(long = "allow-partial", action)]
+    pub allow_partial: bool,
 
     /// Compute MAPQ from the gapped-alignment scores of the best and second-best candidate,
     /// instead of from their pre-alignment anchor scores.

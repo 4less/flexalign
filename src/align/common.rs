@@ -10,6 +10,91 @@ pub enum Status {
 }
 
 
+/// How far an anchor got through [`Anchor::align`](super::data_structures::anchor::Anchor::align)
+/// before it was dropped.
+///
+/// The point is attribution, not logging: `Status::Dropped` says an anchor died, not *which*
+/// filter killed it. A cheap filter that discards true alignments and an expensive one that
+/// discards none are the same value of `Status`, and opposite answers to "should this run earlier".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlignStage {
+    /// Never entered — the anchor had no valid seed configuration.
+    #[default]
+    NotStarted,
+    /// Reached the whole-read gapless pre-filter.
+    Prefilter,
+    LeftFlank,
+    Middle,
+    RightFlank,
+    /// Came out the far end with a CIGAR.
+    Complete,
+}
+
+impl AlignStage {
+    pub const ALL: [AlignStage; 6] = [
+        AlignStage::NotStarted, AlignStage::Prefilter, AlignStage::LeftFlank,
+        AlignStage::Middle, AlignStage::RightFlank, AlignStage::Complete,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AlignStage::NotStarted => "not_started",
+            AlignStage::Prefilter  => "gapless_prefilter",
+            AlignStage::LeftFlank  => "left_flank",
+            AlignStage::Middle     => "interior",
+            AlignStage::RightFlank => "right_flank",
+            AlignStage::Complete   => "complete",
+        }
+    }
+}
+
+
+/// Per-stage timings and the furthest stage reached, for one anchor's alignment.
+///
+/// Every field is written only when [`STAGE_TRACE`](crate::STAGE_TRACE) is on, so an untraced build
+/// pays for one zeroed struct on the stack and nothing else — the clock is never read.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AlignTrace {
+    pub t_seed_extension: std::time::Duration,
+    pub t_prefilter: std::time::Duration,
+    pub t_left_flank: std::time::Duration,
+    pub t_middle: std::time::Duration,
+    pub t_right_flank: std::time::Duration,
+    pub stage: AlignStage,
+}
+
+impl AlignTrace {
+    /// Run `f`, adding its wall time to `slot` and marking `stage` as reached — but only under
+    /// `STAGE_TRACE`. The constant is known at compile time, so the untraced arm is what remains
+    /// after optimisation: a plain call to `f`.
+    #[inline(always)]
+    pub fn stage_of<T>(
+        &mut self,
+        stage: AlignStage,
+        slot: fn(&mut Self) -> &mut std::time::Duration,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        if crate::STAGE_TRACE {
+            self.stage = stage;
+            let start = std::time::Instant::now();
+            let out = f();
+            *slot(self) += start.elapsed();
+            out
+        } else {
+            f()
+        }
+    }
+
+    pub fn merge_from(&mut self, other: &Self) {
+        self.t_seed_extension += other.t_seed_extension;
+        self.t_prefilter += other.t_prefilter;
+        self.t_left_flank += other.t_left_flank;
+        self.t_middle += other.t_middle;
+        self.t_right_flank += other.t_right_flank;
+    }
+}
+
+
 /// Alignment penalties, in WFA2's *cost* space -- costs are minimised and a match always costs 0
 /// (the wavefront recurrence requires it), so bwa's scoring scheme cannot be passed through as-is.
 ///

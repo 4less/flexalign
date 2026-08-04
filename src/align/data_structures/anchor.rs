@@ -4,7 +4,7 @@ use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
 use colored::{Color, Colorize};
 use itertools::Itertools;
 
-use crate::align::{common::{penalties, Align, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
+use crate::align::{common::{penalties, Align, AlignStage, AlignTrace, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
 
 use super::common::{hamming, Seed};
 
@@ -560,9 +560,24 @@ impl Anchor {
         status
     }
 
-    pub fn align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, max_score: i32) -> Status {
+    /// `screen_hamming` is the Hamming distance the hamming-screen stage already measured for this
+    /// anchor, if it ran. It is the SAME number the gapless pre-filter below would compute: the
+    /// screen measures over [`whole`](Self::whole), the pre-filter over the anchor diagonal clipped
+    /// to both sequences, and those windows are identical —
+    /// `whole().q.start == max(0, qbegin - rbegin) == q_lo` and
+    /// `whole().q.end == min(qlen, rlen - offset) == q_hi`. `extend_seeds` between the two does not
+    /// change that: `extend_left` moves `qpos` and `rpos` by the same amount and `extend_right` moves
+    /// `qend`/`rend` together, so the diagonal — and therefore the window — is invariant. Passing it
+    /// in removes a second full SIMD pass per aligned anchor. `None` recomputes it.
+    pub fn align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, max_score: i32, screen_hamming: Option<u32>, trace: &mut AlignTrace) -> Status {
         if self.seed_status.is_valid() {
-            self.extend_seeds(query, reference);
+            if crate::STAGE_TRACE {
+                let start = std::time::Instant::now();
+                self.extend_seeds(query, reference);
+                trace.t_seed_extension += start.elapsed();
+            } else {
+                self.extend_seeds(query, reference);
+            }
 
             // Whole-read gapless pre-filter (one SIMD Hamming pass on the anchor diagonal). When no
             // indel is expected, a WFA alignment cannot beat the fixed-diagonal gapless cost by more
@@ -571,28 +586,36 @@ impl Anchor {
             // bulk of the wrong-target / soft-clip throw-away work on a short-gene marker DB (~95% of
             // alignment time went to anchors that drop, almost all via the clip path).
             if !self.flagged_for_indel {
-                let s = self.seeds.first().unwrap();
-                let offset = s.rbegin() as i64 - s.qbegin() as i64; // reference index = query index + offset
-                let q_lo = if offset < 0 { (-offset) as usize } else { 0 };
-                let q_hi = min(query.len(), (reference.len() as i64 - offset).max(0) as usize);
-                if q_lo < q_hi {
-                    let qs = &query[q_lo..q_hi];
-                    let rs = &reference[(q_lo as i64 + offset) as usize..(q_hi as i64 + offset) as usize];
-                    if triple_accel::hamming(qs, rs) as i32 * penalties::MISMATCH > max_score {
-                        self.score = std::i32::MIN;
-                        self.cigar = Some(Cigar::new()); // downstream `cigar()` asserts Some, even when dropped
-                        return Status::Dropped;
+                let dropped = trace.stage_of(AlignStage::Prefilter, |t| &mut t.t_prefilter, || {
+                    // Reuse the screen's measurement when we have it (see the doc comment above).
+                    if let Some(h) = screen_hamming {
+                        return h as i32 * penalties::MISMATCH > max_score;
                     }
+                    let s = self.seeds.first().unwrap();
+                    let offset = s.rbegin() as i64 - s.qbegin() as i64; // reference index = query index + offset
+                    let q_lo = if offset < 0 { (-offset) as usize } else { 0 };
+                    let q_hi = min(query.len(), (reference.len() as i64 - offset).max(0) as usize);
+                    if q_lo < q_hi {
+                        let qs = &query[q_lo..q_hi];
+                        let rs = &reference[(q_lo as i64 + offset) as usize..(q_hi as i64 + offset) as usize];
+                        return triple_accel::hamming(qs, rs) as i32 * penalties::MISMATCH > max_score;
+                    }
+                    false
+                });
+                if dropped {
+                    self.score = std::i32::MIN;
+                    self.cigar = Some(Cigar::new()); // downstream `cigar()` asserts Some, even when dropped
+                    return Status::Dropped;
                 }
             }
 
-            self.smart_align(aligner, query, reference, free_ends, max_score)
+            self.smart_align(aligner, query, reference, free_ends, max_score, trace)
         } else {
             self.whole_align(aligner, query, reference, free_ends*2, max_score)
         }
     }
-    
-    pub fn smart_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32) -> Status {
+
+    pub fn smart_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32, trace: &mut AlignTrace) -> Status {
         assert!(self.seed_status.0);
         
         // Accurate alignment of flanks first.
@@ -606,8 +629,9 @@ impl Anchor {
         aligner.set_max_alignment_score(max_score + 1);
 
         // eprintln!("Align with max score {}", max_score + 1);
-        let (score,  status, _qs, _rs) = self.align_left_flank(aligner, query, reference, free_ends, max_score);
-        match status { 
+        let (score,  status, _qs, _rs) = trace.stage_of(AlignStage::LeftFlank, |t| &mut t.t_left_flank,
+            || self.align_left_flank(aligner, query, reference, free_ends, max_score));
+        match status {
             Status::OK => {
                 assert!(score != std::i32::MIN);
             }, 
@@ -621,7 +645,8 @@ impl Anchor {
         alignment_score += score;
 
         // eprintln!("Max score before middle: {}", max_score);
-        let (score, status) = if !self.flagged_for_indel {
+        let (score, status) = trace.stage_of(AlignStage::Middle, |t| &mut t.t_middle, || {
+        if !self.flagged_for_indel {
             match self.align_middle(query, reference, &mut max_score) {
                 Ok(res) => res,
                 Err(ar) => {
@@ -675,20 +700,22 @@ impl Anchor {
     
                 (score, Status::OK)
             }
-        };
-        match status { 
+        }
+        });
+        match status {
             Status::OK => {
                 alignment_score += score;
-            }, 
-            _ => { 
+            },
+            _ => {
                 // eprintln!("Drop after middle {}", score);
                 return Status::Dropped
             },
         }
 
         aligner.set_max_alignment_score(max_score + 1);
-        let (score, status) = self.align_right_flank(aligner, query, reference, free_ends, max_score);
-        
+        let (score, status) = trace.stage_of(AlignStage::RightFlank, |t| &mut t.t_right_flank,
+            || self.align_right_flank(aligner, query, reference, free_ends, max_score));
+
         match status { 
             Status::OK => {
                 assert!(self.reference_cigar_range.start < self.reference_cigar_range.end);
@@ -704,7 +731,10 @@ impl Anchor {
         // eprintln!("Glorious Test {}", alignment_score);
         // print_alignment(&query, &reference[self.reference_cigar_range.clone()], &self.cigar().0);
         self.score = alignment_score;
-        
+
+        if crate::STAGE_TRACE {
+            trace.stage = AlignStage::Complete;
+        }
         Status::OK
     }
 
@@ -717,9 +747,16 @@ impl Anchor {
         let mut lr = self.left_flank();
 
         if lr.0.len() == 0 || lr.1.len() == 0 {
+            // `left_flank()` clamps BOTH windows to min(qbegin, rbegin), so an empty flank means the
+            // read hangs off the start of the reference (rbegin == 0) or starts exactly on the seed.
+            // In the first case the leading `lr.0.start` query bases have no reference to align
+            // against and must be soft-clipped HERE, at the 5' end -- `to_sam` pads only at the 3'
+            // end, so leaving them out turns a left overhang into a phantom right clip (`12M8S` for
+            // an alignment that is really `8S12M`). `whole_align` has always done this; the seeded
+            // path did not.
             let lcigar = self.cigar.as_mut().unwrap();
-            lcigar.add_softclip(max(lr.0.len(), lr.1.len()));
-            self.reference_cigar_range.start = lr.1.start - max(lr.0.len(), lr.1.len());
+            lcigar.add_softclip(lr.0.start);
+            self.reference_cigar_range.start = lr.1.start;
             // eprintln!("{:?} {:?}", lr.0, lr.1);
             // Assumes match penalty score is 0, and other scores are negative.
             return (0, Status::OK, 0, 0)
@@ -762,6 +799,13 @@ impl Anchor {
         lr.0.start -= q_dove;
         lr.1.start -= r_dove;
 
+        // Whatever query still sits left of the window after the dovetail has been pulled in has no
+        // reference to align against: the flank was clamped to min(qbegin, rbegin) and `free_ends`
+        // only buys back `q_dove` of the difference. Those bases are a 5' soft clip. Without this,
+        // any read overhanging the reference start by more than `free_ends` loses the excess from
+        // the CIGAR and `to_sam` re-attaches it at the wrong end.
+        let leading_clip = lr.0.start;
+
 
         let q = &query[lr.clone().0];
         let r = &reference[lr.clone().1];
@@ -796,7 +840,7 @@ impl Anchor {
         
         // Update cigar and set reference starting point
         let lcigar = self.cigar.as_mut().unwrap();
-        lcigar.add_softclip(q_softclip);
+        lcigar.add_softclip(leading_clip + q_softclip);
         lcigar.0.extend_from_slice(&cigar.0[(r_offset + q_softclip)..]);
         self.reference_cigar_range.start = lr.1.start + r_offset;
 
@@ -1012,6 +1056,26 @@ impl Anchor {
 
             let middle_r = &reference[between_seeds.1.clone()];
 
+            // Unequal gaps mean an INDEL sits between these two seeds, and neither the merge nor the
+            // extension below is valid across one:
+            //
+            //   * the merge grows the left seed by `middle_q.len() + right_len` -- the QUERY gap --
+            //     and `extend_right` only bumps `length`, so `rend` advances by the query distance
+            //     while the reference distance is different. The merged seed's `rend` then overshoots
+            //     the real reference end by exactly (query gap - reference gap), which is how a
+            //     150 bp read on a 303 bp gene ended up claiming reference bases up to 311.
+            //   * `zip` stops at the shorter gap, so the scan below compares MISALIGNED bases and can
+            //     report "no mismatch" for two stretches that do not correspond at all -- which is
+            //     what triggers the bad merge in the first place.
+            //
+            // Leave them as separate seeds: `flagged_for_indel` anchors send the whole interior to
+            // WFA (`complete_middle`), which is the code that can actually place a gap.
+            if middle_q.len() != middle_r.len() {
+                current_i += 1;
+                next_i += 1;
+                continue;
+            }
+
             // First extend from right to left to see if we can merge
             let by = zip(middle_q, middle_r)
                 .rev()
@@ -1222,7 +1286,7 @@ impl Anchor {
         let q_overhang_length = read_length - s.qend();
         let r_overhang_length = ref_length - s.rend();
         let overhang_length = min(q_overhang_length, r_overhang_length);
-        
+
         ((s.qend()..s.qend() + overhang_length),(s.rend()..s.rend() + overhang_length))
     }
 
@@ -1694,4 +1758,581 @@ pub fn get_seed_config(seed: &AnchorSeed, query: &[u8], query_rc: &[u8], referen
     // eprintln!("{}", hamming(&query_rc[seed.qrange()], reference_seed));
     
     ASC::None
+}
+
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::align::common::{penalties, Align, Heuristic, Status};
+    use crate::align::sam::Cigar;
+
+    /// An aligner that refuses to align. Passing it proves a code path took a gapless shortcut and
+    /// never reached WFA -- which is the whole point of the fast paths, and is otherwise invisible
+    /// (a WFA call returns the same answer, just slower).
+    pub(crate) struct NoWfa;
+
+    impl Align for NoWfa {
+        fn align(&mut self, _q: &[u8], _r: &[u8]) -> (i32, &Cigar, Status) {
+            panic!("WFA was called on a path that should have been handled gaplessly");
+        }
+        fn align_into(&mut self, _q: &[u8], _r: &[u8], _c: &mut Cigar) -> (i32, Status) {
+            panic!("WFA was called on a path that should have been handled gaplessly");
+        }
+        fn set_ends_free(&mut self, _qs: i32, _qe: i32, _rs: i32, _re: i32) {}
+    }
+
+    impl Heuristic for NoWfa {
+        fn set_max_alignment_score(&mut self, _score: i32) {}
+    }
+
+    /// `(qpos, rpos, length)` per seed. The anchor comes out valid and oriented, which is what
+    /// `extend_seeds` / `smart_align` assert on entry.
+    pub(crate) fn anchor(seeds: &[(u32, u64, u32)]) -> Anchor {
+        let mut a = Anchor {
+            reference: 0,
+            seed_count: seeds.len() as u32,
+            mismatches: 0,
+            forward: true,
+            orientation_set: true,
+            flagged_for_indel: false,
+            flag: 0,
+            counter1: 0,
+            counter2: 0,
+            seeds: seeds
+                .iter()
+                .map(|&(qpos, rpos, length)| AnchorSeed { qpos, rpos, length })
+                .collect(),
+            score: 0,
+            cigar: None,
+            reference_cigar_range: 0..0,
+            seed_status: AnchorStatus::default(),
+        };
+        a.seed_status.set_valid();
+        a
+    }
+
+    fn cigar_of(a: &Anchor) -> String {
+        String::from_utf8_lossy(&a.cigar.as_ref().unwrap().0).into_owned()
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Flank geometry. Every flank is a FIXED, EQUAL-LENGTH q/r window -- the whole gapless
+    // treatment downstream depends on that, so it is pinned here rather than assumed.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn left_flank_is_equal_length_and_clamped_to_the_shorter_side() {
+        // Seed sits 5 into the query and 5 into the reference: both overhangs available.
+        let a = anchor(&[(5, 5, 10)]);
+        assert_eq!(a.left_flank(), (0..5, 0..5));
+
+        // Query overhang (8) longer than the reference overhang (3): clamped to 3 on BOTH sides,
+        // which is what leaves query bases [0,5) outside the flank entirely.
+        let a = anchor(&[(8, 3, 10)]);
+        let (q, r) = a.left_flank();
+        assert_eq!((q.clone(), r.clone()), (5..8, 0..3));
+        assert_eq!(q.len(), r.len(), "flank windows must be equal length");
+    }
+
+    #[test]
+    fn right_flank_is_equal_length_and_clamped_to_the_shorter_side() {
+        // 20bp read, 40bp reference, seed q[5..15] / r[5..15]: query has 5 left, reference 25.
+        let a = anchor(&[(5, 5, 10)]);
+        let (q, r) = a.right_flank(20, 40);
+        assert_eq!((q.clone(), r.clone()), (15..20, 15..20));
+        assert_eq!(q.len(), r.len());
+
+        // Reference is the shorter side now: only 2 bases of gene left after the seed.
+        let (q, r) = a.right_flank(20, 17);
+        assert_eq!((q, r), (15..17, 15..17));
+    }
+
+    #[test]
+    fn whole_covers_only_the_overlapping_window() {
+        // Read overhangs the reference start by 5 (qbegin 8 vs rbegin 3) and the reference runs out
+        // 2 bases after the seed ends: `whole` is the intersection, so hamming never reads outside.
+        let a = anchor(&[(8, 3, 10)]);
+        let (q, r) = a.whole(20, 15);
+        assert_eq!((q.clone(), r.clone()), (5..20, 0..15));
+        assert_eq!(q.len(), r.len());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Seed extension.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn extends_left_across_a_fully_matching_flank() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let reference = query.clone();
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.extend_seeds(&query, &reference);
+        // The whole 5bp left flank matches, so the seed swallows it.
+        assert_eq!(a.seeds[0].qbegin(), 0);
+        assert_eq!(a.seeds[0].rbegin(), 0);
+    }
+
+    #[test]
+    fn left_extension_stops_at_the_first_mismatch_from_the_right() {
+        //                     v  query[3] != reference[3]
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[3] = b'T';
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.extend_seeds(&query, &reference);
+        // Flank is query[0..5]; scanning right-to-left, positions 4 matches then 3 mismatches,
+        // so the seed may only take 1 base.
+        assert_eq!(a.seeds[0].qbegin(), 4, "must stop AT the mismatch, not past it");
+        assert_eq!(a.seeds[0].rbegin(), 4);
+    }
+
+    #[test]
+    fn extends_right_across_a_fully_matching_flank() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let reference = query.clone();
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.extend_seeds(&query, &reference);
+        assert_eq!(a.seeds.last().unwrap().qend(), 20);
+        assert_eq!(a.seeds.last().unwrap().rend(), 20);
+    }
+
+    #[test]
+    fn right_extension_stops_at_the_first_mismatch_from_the_left() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[17] = b'A'; // query[15..20] is the right flank; index 17 is its 3rd base
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.extend_seeds(&query, &reference);
+        assert_eq!(a.seeds.last().unwrap().qend(), 17);
+    }
+
+    #[test]
+    fn merges_two_seeds_when_the_gap_between_them_matches() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let reference = query.clone();
+        // Two seeds with a 5bp gap that matches perfectly: they must collapse into one.
+        let mut a = anchor(&[(0, 0, 5), (10, 10, 5)]);
+        a.extend_seeds(&query, &reference);
+        assert_eq!(a.seeds.len(), 1, "a fully matching interior must merge the seeds");
+        assert_eq!(a.seeds[0].qbegin(), 0);
+        assert_eq!(a.seeds[0].qend(), 20, "and then extend over both flanks");
+    }
+
+    #[test]
+    fn keeps_seeds_apart_around_a_single_mismatching_interior_base() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[7] = b'A'; // interior is query[5..10]; index 7 is its middle base
+        let mut a = anchor(&[(0, 0, 5), (10, 10, 5)]);
+        a.extend_seeds(&query, &reference);
+        assert_eq!(a.seeds.len(), 2, "a mismatching interior must NOT merge");
+        // Left seed grows right up to the mismatch, right seed grows left back down to it, so
+        // exactly the one bad base is left uncovered.
+        assert_eq!(a.seeds[0].qend(), 7);
+        assert_eq!(a.seeds[1].qbegin(), 8);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Flank alignment and its stop criteria.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn left_flank_gapless_fast_path_skips_wfa() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[2] = b'G'; // one mismatch inside the left flank
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.cigar = Some(Cigar::new());
+
+        let (score, status, _, _) =
+            a.align_left_flank(&mut NoWfa, &query, &reference, 10, 100);
+
+        assert!(matches!(status, Status::OK));
+        assert_eq!(score, -penalties::MISMATCH, "one mismatch, priced gaplessly");
+        assert_eq!(cigar_of(&a), "MMXMM");
+        assert_eq!(a.reference_cigar_range.start, 0);
+    }
+
+    #[test]
+    fn left_flank_drops_when_the_gapless_cost_exceeds_the_budget() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[2] = b'G';
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.cigar = Some(Cigar::new());
+
+        // Budget below one mismatch: the anchor must die here rather than inside WFA.
+        let (score, status, _, _) =
+            a.align_left_flank(&mut NoWfa, &query, &reference, 10, penalties::MISMATCH - 1);
+
+        assert!(matches!(status, Status::Dropped));
+        assert_eq!(score, std::i32::MIN);
+    }
+
+    #[test]
+    fn right_flank_gapless_fast_path_skips_wfa() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[17] = b'A'; // one mismatch inside the right flank
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.cigar = Some(Cigar::new());
+
+        let (score, status) = a.align_right_flank(&mut NoWfa, &query, &reference, 10, 100);
+
+        assert!(matches!(status, Status::OK));
+        assert_eq!(score, -penalties::MISMATCH);
+        assert_eq!(cigar_of(&a), "MMXMM");
+        assert_eq!(a.reference_cigar_range.end, 20);
+    }
+
+    #[test]
+    fn right_flank_drops_when_the_gapless_cost_exceeds_the_budget() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[17] = b'A';
+        let mut a = anchor(&[(5, 5, 10)]);
+        a.cigar = Some(Cigar::new());
+
+        let (score, status) =
+            a.align_right_flank(&mut NoWfa, &query, &reference, 10, penalties::MISMATCH - 1);
+
+        assert!(matches!(status, Status::Dropped));
+        assert_eq!(score, std::i32::MIN);
+    }
+
+    #[test]
+    fn empty_flanks_cost_nothing_and_call_no_aligner() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let reference = query.clone();
+        // Seed spans the entire read AND the entire reference: both flanks are empty.
+        let mut a = anchor(&[(0, 0, 20)]);
+        a.cigar = Some(Cigar::new());
+
+        let (ls, lstatus, _, _) = a.align_left_flank(&mut NoWfa, &query, &reference, 10, 100);
+        let (rs, rstatus) = a.align_right_flank(&mut NoWfa, &query, &reference, 10, 100);
+
+        assert!(matches!(lstatus, Status::OK));
+        assert!(matches!(rstatus, Status::OK));
+        assert_eq!((ls, rs), (0, 0));
+        assert_eq!(cigar_of(&a), "", "an empty flank contributes no CIGAR ops");
+        assert_eq!(a.reference_cigar_range, 0..20);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The interior between seeds, and its budget check.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn middle_charges_exactly_one_mismatch_penalty_per_mismatching_base() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[6] = b'A';
+        reference[8] = b'A'; // two mismatches in the interior query[5..10]
+        let mut a = anchor(&[(0, 0, 5), (10, 10, 5)]);
+        a.cigar = Some(Cigar::new());
+
+        let mut budget = 100;
+        let (score, status) = a.align_middle(&query, &reference, &mut budget).unwrap();
+
+        assert!(matches!(status, Status::OK));
+        assert_eq!(score, -2 * penalties::MISMATCH);
+        assert_eq!(budget, 100 - 2 * penalties::MISMATCH, "budget is consumed in place");
+        assert_eq!(cigar_of(&a), "MMMMMMXMXMMMMMM");
+    }
+
+    #[test]
+    fn middle_drops_as_soon_as_the_budget_goes_negative() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[6] = b'A';
+        reference[8] = b'A';
+        let mut a = anchor(&[(0, 0, 5), (10, 10, 5)]);
+        a.cigar = Some(Cigar::new());
+
+        // Enough for one mismatch, not two.
+        let mut budget = penalties::MISMATCH + 1;
+        let (score, status) = a.align_middle(&query, &reference, &mut budget).unwrap();
+
+        assert!(matches!(status, Status::Dropped));
+        assert_eq!(score, std::i32::MIN);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The whole-read gapless pre-filter in `align`.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn prefilter_drops_a_hopeless_anchor_before_reaching_wfa() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        for i in [1usize, 4, 7] {
+            reference[i] = if reference[i] == b'A' { b'T' } else { b'A' };
+        }
+        // Seed spans the read, so extension is a no-op and the pre-filter sees all 20 bases.
+        let mut a = anchor(&[(0, 0, 20)]);
+
+        // 3 mismatches cost 30; budget 20 cannot be met by any alignment on this diagonal.
+        let status = a.align(&mut NoWfa, &query, &reference, 10, 2 * penalties::MISMATCH, None, &mut AlignTrace::default());
+
+        assert!(matches!(status, Status::Dropped));
+        assert_eq!(a.score, std::i32::MIN);
+        assert!(a.cigar.is_some(), "downstream cigar() asserts Some even when dropped");
+    }
+
+    #[test]
+    fn an_anchor_within_budget_survives_the_prefilter_and_scores_its_flank() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[0] = b'T'; // a single mismatch, at the very start of the read
+        let mut a = anchor(&[(8, 8, 4)]);
+
+        let status = a.align(&mut NoWfa, &query, &reference, 10, 2 * penalties::MISMATCH, None, &mut AlignTrace::default());
+
+        assert!(matches!(status, Status::OK));
+        // Extension swallows everything except the mismatching first base, which is then priced
+        // gaplessly by the left flank -- so the read is covered end to end.
+        assert_eq!(a.score, -penalties::MISMATCH);
+        assert_eq!(cigar_of(&a), "XMMMMMMMMMMMMMMMMMMM");
+        assert_eq!(a.reference_cigar_range, 0..20);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Leading overhang. `whole_align` emits the 5' soft clip explicitly; `smart_align` does not.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn smart_align_soft_clips_a_leading_overhang_at_the_5_prime_end() {
+        // Read starts 8 bases BEFORE the gene does (rbegin == 0, qbegin == 8) -- the dovetail that
+        // is routine on a short-marker DB. `left_flank` clamps to min(8, 0) = 0, so those 8 query
+        // bases are in no window the aligner ever sees and must be clipped explicitly.
+        let query = b"GGGGGGGGCCCCCCCCCCCC".to_vec();
+        let mut reference = vec![b'A'; 20];
+        reference[0..12].copy_from_slice(&query[8..20]);
+
+        let mut a = anchor(&[(8, 0, 4)]);
+        let status = a.align(&mut NoWfa, &query, &reference, 10, 10 * penalties::MISMATCH, None, &mut AlignTrace::default());
+        assert!(matches!(status, Status::OK));
+
+        assert_eq!(cigar_of(&a), "SSSSSSSSMMMMMMMMMMMM");
+        let sam = a.cigar.as_ref().unwrap().to_sam(query.len()).unwrap();
+        assert_eq!(sam, "8S12M", "the overhang is at the START of the read");
+        assert_eq!(a.reference_cigar_range.start, 0, "POS still points at the gene start");
+    }
+
+    /// The clip must not leak into the identity/coverage arithmetic: `query_aligned` excludes `S`
+    /// (unlike `query_consumed`, which counts it so CIGAR and SEQ lengths agree). If that ever
+    /// stopped holding, this fix would silently move every dovetailing read's ANI and coverage.
+    #[test]
+    fn a_leading_clip_does_not_change_what_counts_as_aligned() {
+        let query = b"GGGGGGGGCCCCCCCCCCCC".to_vec();
+        let mut reference = vec![b'A'; 20];
+        reference[0..12].copy_from_slice(&query[8..20]);
+
+        let mut a = anchor(&[(8, 0, 4)]);
+        a.align(&mut NoWfa, &query, &reference, 10, 10 * penalties::MISMATCH, None, &mut AlignTrace::default());
+
+        let cigar = a.cigar.as_ref().unwrap();
+        assert_eq!(cigar.query_aligned(), 12, "only the placed bases count as aligned");
+        assert_eq!(cigar.query_consumed(), query.len(), "but CIGAR must cover the whole read");
+        assert_eq!(cigar.reference_consumed(), 12);
+        assert_eq!(cigar.leading_softclip(), 8);
+    }
+
+    /// The overhang beyond `free_ends` is the second way in: here the flank window is non-empty, so
+    /// the WFA path runs, but it can only buy back `free_ends` of the difference.
+    #[test]
+    fn overhang_beyond_free_ends_is_clipped_on_the_wfa_path() {
+        // qbegin 12, rbegin 2 -> 10 query bases outside the flank; free_ends of 4 covers only 4.
+        let mut a = anchor(&[(12, 2, 4)]);
+        a.cigar = Some(Cigar::new());
+        let (q, r) = a.left_flank();
+        assert_eq!((q.clone(), r.clone()), (10..12, 0..2));
+
+        let query = vec![b'A'; 20];
+        let reference = vec![b'A'; 20];
+        let mut wfa = crate::align::process::alignment::LIBWFA2Alignment::default();
+        let (_score, status, _, _) = a.align_left_flank(&mut wfa, &query, &reference, 4, 1000);
+
+        assert!(matches!(status, Status::OK));
+        // 10 outside the flank, 4 of them pulled in as dovetail -> at least 6 must be clipped.
+        assert!(
+            a.cigar.as_ref().unwrap().leading_softclip() >= 6,
+            "got {:?}",
+            cigar_of(&a)
+        );
+    }
+    // ---------------------------------------------------------------------------------------
+    // Extension scoring. `StdPairedAnchorExtender::extend` scores mate 1 with plain `hamming` but
+    // mate 2 with `indel_hamming` whenever the anchor is flagged for an indel (it calls
+    // `indel_hamming` on mate 1 too, then throws the result away -- it takes `&self`, so the call
+    // is pure). These two numbers are only interchangeable if they agree; they do not.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn hamming_and_indel_hamming_disagree_sharply_on_an_indel_anchor() {
+        // Reference is the query with a 2bp deletion at offset 12: everything after it is shifted,
+        // so a fixed-diagonal Hamming sees the whole tail as mismatched.
+        let query = b"AAAACCCCGGGGTTTTACGTACGT".to_vec();
+        let mut reference = Vec::new();
+        reference.extend_from_slice(&query[0..12]);
+        reference.extend_from_slice(&query[14..]);
+        reference.extend_from_slice(b"CC");
+
+        let a = anchor(&[(0, 0, 8)]);
+
+        let plain = a.hamming(&query, &reference);
+        let indel = a.indel_hamming(&query, &reference);
+
+        assert_eq!(plain, 10, "fixed-diagonal Hamming is blind to the shift");
+        assert_eq!(indel, 0, "the offset-scanning estimate finds the shifted diagonal");
+
+        // This is the score each path would hand the extender, for the SAME anchor. Mate 1 gets the
+        // first, mate 2 the second -- so an indel-bearing pair is ranked on two different scales.
+        let score_as_mate_1 = (query.len() as u64 - plain) as i32;
+        let score_as_mate_2 = (query.len() as u64 - indel) as i32;
+        assert_eq!((score_as_mate_1, score_as_mate_2), (14, 24));
+    }
+}
+
+
+#[cfg(test)]
+mod prefilter_reuse_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::align::common::AlignTrace;
+
+    /// P1 rests on this: the window the hamming screen measures over (`whole`) is exactly the window
+    /// the gapless pre-filter would measure over (the anchor diagonal clipped to both sequences).
+    /// Checked on an anchor clipped on BOTH sides -- read overhangs the reference start, reference
+    /// runs out before the read ends -- which is where the two derivations could diverge.
+    #[test]
+    fn screen_window_equals_prefilter_window() {
+        let (qlen, rlen) = (20usize, 15usize);
+        let a = anchor(&[(8, 3, 4)]);
+
+        let (qr, _rr) = a.whole(qlen, rlen);
+
+        let s = a.seeds.first().unwrap();
+        let offset = s.rbegin() as i64 - s.qbegin() as i64;
+        let q_lo = if offset < 0 { (-offset) as usize } else { 0 };
+        let q_hi = min(qlen, (rlen as i64 - offset).max(0) as usize);
+
+        assert_eq!((qr.start, qr.end), (q_lo, q_hi), "screen and pre-filter must agree");
+    }
+
+    /// ...and it stays true across `extend_seeds`, which runs between the two. Growing a seed moves
+    /// `qpos` and `rpos` together, so the diagonal never shifts and the window is invariant. If this
+    /// ever stopped holding, the reused Hamming would silently describe a different window.
+    #[test]
+    fn extend_seeds_does_not_move_the_whole_window() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let reference = query.clone();
+        let mut a = anchor(&[(5, 5, 4), (12, 12, 4)]);
+
+        let before = a.whole(query.len(), reference.len());
+        a.extend_seeds(&query, &reference);
+        let after = a.whole(query.len(), reference.len());
+
+        assert_eq!(before, after, "whole() must survive seed extension unchanged");
+    }
+
+    /// The reuse must be a pure optimisation: same verdict, same score, same CIGAR.
+    #[test]
+    fn reusing_the_screen_hamming_changes_nothing() {
+        let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
+        let mut reference = query.clone();
+        reference[0] = b'T';
+        reference[13] = b'A';
+
+        // What the screen would have measured, over `whole()`.
+        let probe = anchor(&[(8, 8, 4)]);
+        let (qr, rr) = probe.whole(query.len(), reference.len());
+        let screen_h = triple_accel::hamming(&query[qr], &reference[rr]);
+
+        for budget in [2 * penalties::MISMATCH, 10 * penalties::MISMATCH] {
+            let mut recomputed = anchor(&[(8, 8, 4)]);
+            let mut reused = anchor(&[(8, 8, 4)]);
+
+            let s1 = recomputed.align(&mut NoWfa, &query, &reference, 10, budget, None, &mut AlignTrace::default());
+            let s2 = reused.align(&mut NoWfa, &query, &reference, 10, budget, Some(screen_h), &mut AlignTrace::default());
+
+            assert_eq!(format!("{:?}", s1), format!("{:?}", s2), "budget {budget}");
+            assert_eq!(recomputed.score, reused.score, "budget {budget}");
+            assert_eq!(
+                recomputed.cigar.as_ref().map(|c| c.0.clone()),
+                reused.cigar.as_ref().map(|c| c.0.clone()),
+                "budget {budget}"
+            );
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod indel_merge_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// Regression for a panic found by the `markersim` dataset (reads simulated straight from the
+    /// 14.5 M-marker reference): `extend_seeds` merged two seeds separated by an INDEL, computing the
+    /// merged seed's reference span from the QUERY gap. `rend` then ran past the end of the gene and
+    /// the next `right_flank` sliced out of bounds.
+    ///
+    /// Geometry here mirrors a real failure: a 150 bp read on a 303 bp reference whose merged seed
+    /// claimed reference bases to 311.
+    #[test]
+    fn seeds_separated_by_an_indel_are_not_merged() {
+        // Query gap is 8 bases; reference gap is 3. That difference IS the indel.
+        let query = b"AAAACCCCCCCCGGGGTTTT".to_vec();
+        let mut reference = vec![b'N'; 15];
+        reference[0..4].copy_from_slice(&query[0..4]);      // seed 1: q[0..4]  == r[0..4]
+        reference[4..7].copy_from_slice(&query[4..7]);      // 3 reference bases where the query has 8
+        reference[7..11].copy_from_slice(&query[12..16]);   // seed 2: q[12..16] == r[7..11]
+
+        //            q 0..4 / r 0..4          q 12..16 / r 7..11
+        let mut a = anchor(&[(0, 0, 4), (12, 7, 4)]);
+        a.flagged_for_indel = true;
+
+        a.extend_seeds(&query, &reference);
+
+        assert_eq!(a.seeds.len(), 2, "an indel gap must NOT collapse the two seeds into one");
+        let last = a.seeds.last().unwrap();
+        assert!(
+            last.rend() <= reference.len(),
+            "seed runs off the reference: rend {} > len {}",
+            last.rend(), reference.len()
+        );
+    }
+
+    /// The equal-gap case must still merge -- the fix must not disable ordinary extension.
+    #[test]
+    fn seeds_separated_by_a_matching_equal_gap_still_merge() {
+        let query = b"AAAACCCCGGGGTTTT".to_vec();
+        let reference = query.clone();
+        let mut a = anchor(&[(0, 0, 4), (8, 8, 4)]);
+
+        a.extend_seeds(&query, &reference);
+
+        assert_eq!(a.seeds.len(), 1, "an exactly matching equal-length gap still merges");
+        assert!(a.seeds[0].rend() <= reference.len());
+    }
+
+    /// And `right_flank` must stay in bounds for whatever `extend_seeds` produced.
+    #[test]
+    fn right_flank_stays_within_both_sequences() {
+        let query = b"AAAACCCCCCCCGGGGTTTT".to_vec();
+        let mut reference = vec![b'N'; 15];
+        reference[0..4].copy_from_slice(&query[0..4]);
+        reference[4..7].copy_from_slice(&query[4..7]);
+        reference[7..11].copy_from_slice(&query[12..16]);
+
+        let mut a = anchor(&[(0, 0, 4), (12, 7, 4)]);
+        a.flagged_for_indel = true;
+        a.extend_seeds(&query, &reference);
+
+        let (qr, rr) = a.right_flank(query.len(), reference.len());
+        assert!(qr.end <= query.len(), "query flank {:?} exceeds {}", qr, query.len());
+        assert!(rr.end <= reference.len(), "reference flank {:?} exceeds {}", rr, reference.len());
+    }
 }
