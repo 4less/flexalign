@@ -66,6 +66,11 @@ pub struct Stats {
     /// Truth-survival funnel outside the alignment itself. Gated on `GOLDSTD_EVAL`, so zero cost
     /// when off. Each counts reads whose true anchor was still alive at that point.
     pub funnel_true_in_screen: usize,
+    /// Same test over the window extension ACTUALLY ran (`screen_z` plus any tie run). Paired with
+    /// `funnel_true_in_screen` on purpose: the screen counter is fixed-width so it stays comparable
+    /// across runs, but with `--extend-tie-cap > 1` it no longer describes what was screened, and
+    /// alone it would report "truth lost at the screen" for reads whose truth the tie run rescued.
+    pub funnel_true_in_extended: usize,
     pub funnel_true_in_align_window: usize,
     pub funnel_true_reported: usize,
     /// Same bottom-of-funnel test as `funnel_true_reported`, but counting MATES rather than pairs.
@@ -214,6 +219,7 @@ impl Stats {
             ("funnel_checked",              self.dbg_checked as f64, "count"),
             ("funnel_anchor_formed",        self.dbg_true_anchor_present as f64, "count"),
             ("funnel_in_screen",            self.funnel_true_in_screen as f64, "count"),
+            ("funnel_in_extended",          self.funnel_true_in_extended as f64, "count"),
             ("funnel_screen_ranked_best",   self.dbg_true_anchor_best as f64, "count"),
             ("funnel_in_align_window",      self.funnel_true_in_align_window as f64, "count"),
             ("funnel_reported",             self.funnel_true_reported as f64, "count"),
@@ -327,6 +333,7 @@ impl Merge for Stats {
             self.align_stage_reached_true[i] += other.align_stage_reached_true[i];
         }
         self.funnel_true_in_screen += other.funnel_true_in_screen;
+        self.funnel_true_in_extended += other.funnel_true_in_extended;
         self.funnel_true_in_align_window += other.funnel_true_in_align_window;
         self.funnel_true_reported += other.funnel_true_reported;
         self.funnel_true_reported_mates += other.funnel_true_reported_mates;
@@ -555,6 +562,7 @@ impl Default for Stats {
             align_stage_reached: [0; 6],
             align_stage_reached_true: [0; 6],
             funnel_true_in_screen: 0,
+            funnel_true_in_extended: 0,
             funnel_true_in_align_window: 0,
             funnel_true_reported: 0,
             funnel_true_reported_mates: 0,

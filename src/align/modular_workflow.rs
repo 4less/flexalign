@@ -1051,7 +1051,48 @@ impl<
         // Bound extension to the top Z. Anchors arrive sorted by anchor score (anchor_extractor
         // sorts after pairing), so this keeps the candidates worth a reference comparison and drops
         // the tail -- extension is the first stage that reads reference sequence at all.
-        let extend_top_z = min(self.options.args.extend_top_z.max(1), anchors.len());
+        //
+        // TIES CROSS THAT BOUNDARY. The cut is a count, but what it cuts is a score order, and
+        // equal keys keep arrival order -- which is index-lookup order, not evidence. A read whose
+        // true locus ties the Zth anchor is therefore kept or dropped by list position alone. So
+        // extend the window while the next anchor scores EXACTLY the same as the last one taken:
+        // a tie is then settled by extension, which compares reference sequence, instead of by
+        // where the index happened to report it. The window ends at the first strictly worse anchor
+        // -- OR at `tie_cap`, whichever comes first. When the cap binds, the window stops mid-tie
+        // and the remainder of that run is still cut by list order: the coin flip moves from Z to
+        // the cap rather than disappearing.
+        //
+        // The key must match the extractor's sort key (`-(score(a1) + score(a2))`, missing side 0)
+        // or the run this walks is not the run the sort produced.
+        // AND THE TIE RUN IS CAPPED -- as a bound on a pathology that has NOT been observed, not as
+        // a fix for a measured one. The concern is real in principle: with `-z` at 32 against ~15.7
+        // anchors/read the loop is a no-op on ordinary reads and fires only where >32 anchors
+        // already exist and score EQUALLY (a conserved marker hit by a family of near-identical
+        // references), nothing bounds `anchors.len()` tightly there (headerless ranges emit up to
+        // --max-range-size positions each without spending --ranges budget, and pairing is a
+        // cross-product per reference), and the extender walks the whole slice doing a reference
+        // fetch plus a full-read Hamming pass per entry. But measurement did not find it: on protal
+        // an effectively-uncapped run (cap 64) was no slower than cap 2 and produced 4 more
+        // successful alignments out of ~165,000. Keep the bound, do not claim it buys speed.
+        let pair_anchor_score = |AnchorPair(a1, a2): &AnchorPair| {
+            a1.as_ref().map_or(0, StdAnchorScore::score)
+                + a2.as_ref().map_or(0, StdAnchorScore::score)
+        };
+        let screen_z = min(self.options.args.extend_top_z.max(1), anchors.len());
+        let tie_cap = min(
+            screen_z.saturating_mul(self.options.args.extend_tie_cap.max(1)),
+            anchors.len(),
+        );
+        let mut extend_top_z = screen_z;
+        let boundary_score = pair_anchor_score(&anchors[extend_top_z - 1]);
+        while extend_top_z < tie_cap && pair_anchor_score(&anchors[extend_top_z]) == boundary_score {
+            extend_top_z += 1;
+        }
+        debug_assert!(
+            anchors.windows(2).all(|w| pair_anchor_score(&w[0]) >= pair_anchor_score(&w[1])),
+            "anchors must reach the extension cut sorted by the extractor's key; the tie run walks \
+             that order and silently truncates if some producer re-orders or leaves them unsorted"
+        );
 
         // Truth-survival funnel. `true_rid` is the reference the read really came from, read off the
         // simulated header; 0 when unknown. Every counter below is gated on GOLDSTD_EVAL, a
@@ -1092,8 +1133,17 @@ impl<
             if holds_truth(&anchors) {
                 stats.dbg_true_anchor_present += 1;
             }
-            if holds_truth(&anchors[0..extend_top_z]) {
+            // Deliberately `screen_z`, the CONFIGURED window, not the tie-extended one: this counter
+            // is compared across runs, and a denominator that widens with a read's tie structure
+            // would make two runs' funnels incomparable for reasons unrelated to what they screened.
+            if holds_truth(&anchors[0..screen_z]) {
                 stats.funnel_true_in_screen += 1;
+            }
+            // Both windows, because they answer different questions: `screen_z` is fixed-width and
+            // therefore comparable across runs, while `extend_top_z` is what extension actually saw
+            // and is therefore the one that attributes a loss to this stage.
+            if holds_truth(&anchors[0..extend_top_z]) {
+                stats.funnel_true_in_extended += 1;
             }
             stats.funnel_true_anchor_mates += holds_truth_mates(&anchors);
             // Remembered for the emit site, which is where a half-pair is finally observable but
@@ -1106,7 +1156,7 @@ impl<
             truth_anchor_rev = anchors.iter().any(|AnchorPair(_, a2)| {
                 a2.as_ref().is_some_and(|a| a.reference as usize == true_rid)
             });
-            stats.funnel_true_in_screen_mates += holds_truth_mates(&anchors[0..extend_top_z]);
+            stats.funnel_true_in_screen_mates += holds_truth_mates(&anchors[0..screen_z]);
         }
         let pair_bonus = self.options.args.proper_pair_bonus;
         let (duration, extended_count) = time(|| {

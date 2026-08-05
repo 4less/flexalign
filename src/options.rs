@@ -63,6 +63,34 @@ pub struct Args {
     #[arg(short = 'z', long = "extend-top-z", default_value_t = 32)]
     pub extend_top_z: usize,
 
+    /// Ceiling on the tie run past `--extend-top-z`, as a MULTIPLE of it.
+    ///
+    /// The Z cut is a count applied to a score order, so anchors tying the Zth slot are kept or
+    /// dropped by arrival order -- index-lookup order, not evidence. Extension therefore continues
+    /// while the next anchor scores exactly equal to the last one taken, letting reference sequence
+    /// settle the tie instead of list position.
+    ///
+    /// 1 disables the tie run (the plain top-Z cut); 2 lets the window double; larger values allow
+    /// longer ties. The cap is a SAFETY BELT WITH NO MEASURED COST OR BENEFIT: the concern was that
+    /// a conserved marker hit by a whole reference family could tie hundreds deep, and each extra
+    /// anchor costs a reference fetch plus a full-read Hamming pass. That pathology has not been
+    /// observed -- on protal, cap 64 (effectively uncapped) ran no slower than cap 2 (38.95-39.16 s
+    /// vs 39.10-39.27 s, two reps each, warm) and added 4 successful alignments out of ~165,000.
+    /// Do not describe the cap as fixing a measured problem; it bounds one that has not appeared.
+    ///
+    /// Default 1 (off) is PROVISIONAL and rests on incomplete evidence, not on a measured
+    /// regression. What is actually measured, cap 2 vs cap 1, same binary, warm, `-t 16`:
+    ///
+    ///   bacteroides (whole-genome DB)  recall +0.0001 pp, precision +0.0001 pp, 0 record delta
+    ///
+    /// i.e. a wash on that dataset. The marker-DB arms (protal, markersim) do not yet have a
+    /// same-binary paired accuracy measurement -- earlier figures compared against `results/`
+    /// baselines produced by an OLDER COMMIT (pre-`c92c8a8`, some at `-t 8`), so they measured that
+    /// commit plus this flag. Settle the default with paired runs before quoting any per-dataset
+    /// delta here.
+    #[arg(long = "extend-tie-cap", default_value_t = 1)]
+    pub extend_tie_cap: usize,
+
     /// align the top y anchors. This happens after anchor extension
     #[arg(short = 'y', long = "align-top-y", default_value_t = 4)]
     pub align_top_y: usize,
