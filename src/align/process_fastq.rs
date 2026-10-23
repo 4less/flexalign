@@ -9,7 +9,7 @@ use crate::{
     GOLDSTD_EVAL, align::{
         modular_workflow::{Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
+            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
         }, 
         stats::Stats, 
         workflow
@@ -189,6 +189,14 @@ pub fn process_fastq_wrapper<
 
 
 
+/// Bytes of FASTQ each worker takes from the shared reader per batch (per mate file).
+///
+/// 16 MiB batches left 16 threads ~26% idle on a 650 MB sample: 41 batches over 16 workers is
+/// 2.5 rounds, so the last round ran on 9 threads while 7 waited -- a tail that costs a full
+/// batch of wall time. Smaller batches balance the tail at the price of more lock acquisitions,
+/// which are cheap next to the ~10 ms of work a batch carries.
+const READ_BATCH_BYTES: usize = 1 << 22;
+
 pub fn process_fastq_wrapper_modular<
         'a,
         const K: usize, 
@@ -286,8 +294,8 @@ pub fn process_fastq_wrapper_modular<
                 let mut modular_pe = ModularPE {
                     options,
                     db,
-                    kmer_extractor_fwd: StdKmerExtractor::<K, C, ClosedSyncmer<C, S, L>>::default(),
-                    kmer_extractor_rev: StdKmerExtractor::<K, C, ClosedSyncmer<C, S, L>>::default(),
+                    kmer_extractor_fwd: SyncmerKmerExtractor::<K, C, S, L>::default(),
+                    kmer_extractor_rev: SyncmerKmerExtractor::<K, C, S, L>::default(),
                     range_extractor_fwd: StdRangeExtractor::<K, C, F, FM>::new(db),
                     range_extractor_rev: StdRangeExtractor::<K, C, F, FM>::new(db),
                     seed_extractor_fwd: StdSeedExtractor::<K, C, F>::new(
@@ -348,7 +356,7 @@ pub fn process_fastq_wrapper_modular<
                     stats = read_fastq_paired_end_state_par(
                         GzDecoder::new(file_fwd),
                         GzDecoder::new(file_rev),
-                        usize::pow(2, 24),
+                        READ_BATCH_BYTES,
                         options.args.threads,
                         state,
                         worker_pe,//worker,
@@ -357,7 +365,7 @@ pub fn process_fastq_wrapper_modular<
                     stats = read_fastq_paired_end_state_par(
                         file_fwd,
                         file_rev,
-                        usize::pow(2, 24),
+                        READ_BATCH_BYTES,
                         options.args.threads,
                         state,
                         worker_pe,//worker,
@@ -382,14 +390,14 @@ pub fn process_fastq_wrapper_modular<
                 if fwd_gzip {
                     stats = read_fastq_single_end_state_par(
                         GzDecoder::new(file_fwd),
-                        usize::pow(2, 24),
+                        READ_BATCH_BYTES,
                         options.args.threads,
                         worker,
                     );
                 } else {
                     stats = read_fastq_single_end_state_par(
                         file_fwd,
-                        usize::pow(2, 24),
+                        READ_BATCH_BYTES,
                         options.args.threads,
                         worker,
                     );
