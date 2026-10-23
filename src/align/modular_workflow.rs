@@ -394,10 +394,6 @@ pub struct FastHitScratch {
     votes: Vec<(u64, i64, bool, u32)>,
     cands_fwd: Vec<FastCand>,
     cands_rev: Vec<FastCand>,
-    /// Probe bookkeeping: attempts, successes, and whether the path is still on for this worker.
-    tried: u32,
-    succeeded: u32,
-    off: bool,
 }
 
 /// One candidate placement of a mate on the fast-hit path: the read lies gapless on
@@ -545,6 +541,7 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
     scratch: &mut FastHitScratch,
     out: &mut SO,
     stats: &mut Stats,
+    write: bool,
 ) -> bool {
     const MAX_INSERT: usize = 1000;
     let (min_hits, max_mm, max_pos) = (args.fast_hit_min_hits, args.fast_hit_max_mismatch, args.fast_hit_max_positions);
@@ -617,6 +614,9 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
         None => { stats.fast_hit_unpaired += 1; return false; }
     };
     let (m1, m2) = (c1s[i], c2s[j]);
+    if !write {
+        return true; // the probe only asks whether the pair would have been placed
+    }
     // A lone candidate elsewhere competes too, as a single-sided anchor pair would.
     for (k, c) in c1s.iter().enumerate() { if k != i { runner_up = runner_up.max(c.score); } }
     for (k, c) in c2s.iter().enumerate() { if k != j { runner_up = runner_up.max(c.score); } }
@@ -895,13 +895,25 @@ pub struct ModularPE<
     pub fast: FastHitScratch,
 }
 
-/// How many pairs a worker tries the fast-hit path on before judging it, and the success rate
+/// How many pairs the probe tries the fast-hit path on before judging it, and the success rate
 /// (in fifths) it must reach to stay on. On a marker-gene reference only a few % of pairs have
 /// any home, so nearly every attempt falls through and the attempt itself is pure overhead
-/// (~5% of a run); on a whole-genome reference three quarters succeed. A worker that measured
-/// less than one success in five switches the path off for the rest of its run.
-const FAST_HIT_PROBE: u32 = 4096;
-const FAST_HIT_MIN_FIFTHS: u32 = 1;
+/// (~5% of a run); on a whole-genome reference three quarters succeed. The probe runs once, on
+/// the first pairs of the input, before the workers start -- a per-worker probe depended on
+/// which batches each thread happened to get and made the output differ between runs.
+pub const FAST_HIT_PROBE: usize = 2048;
+pub const FAST_HIT_MIN_FIFTHS: usize = 1;
+
+/// The probe's verdict for this run; `--no-fast-hit` is checked separately.
+pub static FAST_HIT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_fast_hit_enabled(on: bool) {
+    FAST_HIT_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn fast_hit_enabled() -> bool {
+    FAST_HIT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl<
         'a,
@@ -919,6 +931,31 @@ impl<
     > ModularPE<'a, C, F, KE, RE, SE, AE, AS, PO, SO, A, D>
 {
     //RE, SE,
+    /// The probe: would the fast-hit path place this pair? Writes nothing.
+    pub fn probe_fast_hit(&mut self, rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats) -> bool {
+        if !self.output.has_b() {
+            return false;
+        }
+        let kmers_fwd = self.kmer_extractor_fwd.generate(rec_fwd, stats);
+        let kmers_rev = self.kmer_extractor_rev.generate(rec_rev, stats);
+        fast_hit_pair::<C, F, RE, SO, D>(
+            &self.options.args,
+            self.db,
+            &mut self.range_extractor_fwd,
+            &mut self.range_extractor_rev,
+            kmers_fwd,
+            kmers_rev,
+            rec_fwd,
+            rec_rev,
+            &mut self.rec_fwd_revc,
+            &mut self.rec_rev_revc,
+            &mut self.fast,
+            self.output.b.as_mut().unwrap(),
+            stats,
+            false,
+        )
+    }
+
     pub fn run(
         &mut self,
         rec_fwd: &RefFastqRecord,
@@ -944,7 +981,7 @@ impl<
         stats.time_get_kmers += duration;
 
         // The fast-hit path: a pair pinned by its unique k-mers is written here and never seeded.
-        if self.options.args.fast_hit_on() && !self.fast.off && self.output.has_b() {
+        if self.options.args.fast_hit_on() && fast_hit_enabled() && self.output.has_b() {
             let done = fast_hit_pair::<C, F, RE, SO, D>(
                 &self.options.args,
                 self.db,
@@ -959,16 +996,11 @@ impl<
                 &mut self.fast,
                 self.output.b.as_mut().unwrap(),
                 stats,
+                true,
             );
-            self.fast.tried += 1;
             if done {
-                self.fast.succeeded += 1;
                 stats.fast_hit_pairs += 1;
                 return;
-            }
-            if self.fast.tried == FAST_HIT_PROBE && self.fast.succeeded * 5 < FAST_HIT_PROBE * FAST_HIT_MIN_FIFTHS {
-                self.fast.off = true;
-                stats.fast_hit_workers_off += 1;
             }
         }
 

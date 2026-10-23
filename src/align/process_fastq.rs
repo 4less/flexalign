@@ -1,13 +1,13 @@
 use std::{fs::File, io::{self}, path::PathBuf, str::FromStr, sync::{Arc, Mutex}};
 
-use bioreader::{parallel::fastq::{read_fastq_paired_end_state_par, read_fastq_single_end_state_par}, sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord}, utils::is_gzip};
+use bioreader::{fastq_byte_reader::FastqPairedByteReader, fastq_reader::PairedFastqReader, parallel::fastq::{read_fastq_paired_end_state_par, read_fastq_single_end_state_par}, sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord}, utils::is_gzip};
 use flate2::read::GzDecoder;
 use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 use log::info;
 
 use crate::{
     GOLDSTD_EVAL, align::{
-        modular_workflow::{FastHitScratch, Modular, ModularPE}, 
+        modular_workflow::{self, FastHitScratch, Modular, ModularPE}, 
         process::{
             alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
         }, 
@@ -328,6 +328,39 @@ pub fn process_fastq_wrapper_modular<
                     modular_rev.run(rec_rev, stats);
                 };
 
+                // The fast-hit probe: try the path on the input's first pairs, once, before the
+                // workers start, and switch it off for the run when too few succeed. One decision
+                // for the whole run, from the same pairs every time, so the output is the same
+                // run to run (a per-worker probe depended on thread scheduling).
+                if options.args.fast_hit_on() {
+                    let probe_started = std::time::Instant::now();
+                    let mut probe_stats = Stats::default();
+                    let (mut tried, mut hit) = (0usize, 0usize);
+                    {
+                        let f1 = File::open(fwd).expect("reads");
+                        let f2 = File::open(rev).expect("reads");
+                        let (b1, b2): (Box<dyn std::io::Read + Send>, Box<dyn std::io::Read + Send>) = if fwd_gzip {
+                            (Box::new(GzDecoder::new(f1)), Box::new(GzDecoder::new(f2)))
+                        } else {
+                            (Box::new(f1), Box::new(f2))
+                        };
+                        let byte_reader = Arc::new(Mutex::new(FastqPairedByteReader::new(b1, b2, READ_BATCH_BYTES)));
+                        let mut reader = PairedFastqReader::new(byte_reader, READ_BATCH_BYTES);
+                        while let Some((r1, r2)) = reader.next() {
+                            tried += 1;
+                            if modular_pe.probe_fast_hit(&r1, &r2, &mut probe_stats) {
+                                hit += 1;
+                            }
+                            if tried >= modular_workflow::FAST_HIT_PROBE {
+                                break;
+                            }
+                        }
+                    }
+                    let off = tried > 0 && hit * 5 < tried * modular_workflow::FAST_HIT_MIN_FIFTHS;
+                    modular_workflow::set_fast_hit_enabled(!off);
+                    eprintln!("Fast-hit probe: {} of the first {} pairs placed -> {} ({:.1?})", hit, tried, if off { "off for this run" } else { "on" }, probe_started.elapsed());
+                }
+
                 let worker_pe = move |rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats| {
                     
                     modular_pe.run(rec_fwd, rec_rev, stats);
@@ -407,6 +440,10 @@ pub fn process_fastq_wrapper_modular<
             },
         }
 
+        let mut stats = stats;
+        if let Ok(s) = stats.as_mut() {
+            s.fast_hit_workers_off = if options.args.fast_hit_on() && !modular_workflow::fast_hit_enabled() { 1 } else { 0 };
+        }
         eprintln!("{}", stats.as_ref().unwrap());
         if let Some(path) = &options.args.time_log {
             let input = fwd.to_str().unwrap_or("input");

@@ -125,7 +125,7 @@ pub struct Stats {
     pub fast_hit_off_reference: usize,
     pub fast_hit_mismatches: usize,
     pub fast_hit_unpaired: usize,
-    /// Workers that switched the fast-hit path off after the probe (see FAST_HIT_PROBE).
+    /// 1 when the probe over the input's first pairs switched the fast-hit path off for the run.
     pub fast_hit_workers_off: usize,
     pub rescue_succeeded: usize,
     /// Why a rescue did not happen or was refused. `skipped_weak` is the anchored side failing the
@@ -443,7 +443,7 @@ impl Display for Stats {
             ....mates off the reference end.............{:?}\n\
             ....mates over the mismatch cap.............{:?}\n\
             ....pairs whose mates did not pair..........{:?}\n\
-            ....workers that switched it off (probe)....{:?}\n\
+            ....switched off for the run by the probe...{:?}\n\
             Mate rescue attempted.......................{:?}\n\
             Mate rescue succeeded.......................{:?}\n\
             ....skipped, anchored side too weak.........{:?}\n\

@@ -10,7 +10,7 @@ pub mod options;
 pub mod utils;
 use colored::control::SHOULD_COLORIZE;
 use colored::Colorize;
-use flexalign::flexalign::{run, time};
+use flexalign::flexalign::run;
 use flexalign::options::Args;
 use log::LevelFilter;
 
@@ -72,7 +72,9 @@ fn main() {
 
     eprintln!("{}", logo());
 
-    let (duration, _) = time(|| run(args));
+    let started = std::time::Instant::now();
+    run(args);
+    let duration = started.elapsed();
 
     log::info!("Flexalign took {:?}", duration);
 }
