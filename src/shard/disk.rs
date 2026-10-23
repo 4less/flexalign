@@ -22,7 +22,7 @@ use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 
 use crate::align::common::{KmerExtractor, RangeExtractor};
 use crate::align::modular_workflow::ModularPE;
-use crate::align::process::alignment::LIBWFA2Alignment;
+use crate::align::process::alignment_rs::WFA2RSAlignment;
 use crate::align::process::anchor_extender::StdPairedAnchorExtender;
 use crate::align::process::anchor_extractor::StdPairedAnchorExtractor;
 use crate::align::process::kmer_extractor::StdKmerExtractor;
@@ -255,7 +255,7 @@ pub fn run_disk_rejoin_align<
         ),
         anchor_extractor: StdPairedAnchorExtractor::new(),
         anchor_extender: StdPairedAnchorExtender::new(db),
-        align: LIBWFA2Alignment::default(),
+        align: WFA2RSAlignment::default(),
         output,
         rec_fwd_revc: OwnedFastqRecord::new(),
         rec_rev_revc: OwnedFastqRecord::new(),

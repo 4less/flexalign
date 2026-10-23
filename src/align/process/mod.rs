@@ -9,3 +9,4 @@ pub mod anchor_extender;
 pub mod output;
 pub mod evaluate;
 pub mod alignment;
+pub mod alignment_rs;

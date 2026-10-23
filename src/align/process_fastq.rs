@@ -9,7 +9,7 @@ use crate::{
     GOLDSTD_EVAL, align::{
         modular_workflow::{Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
+            alignment_rs::WFA2RSAlignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor
         }, 
         stats::Stats, 
         workflow
@@ -306,7 +306,7 @@ pub fn process_fastq_wrapper_modular<
                     ),
                     anchor_extractor: StdPairedAnchorExtractor::new(),
                     anchor_extender: StdPairedAnchorExtender::new(db),
-                    align: LIBWFA2Alignment::default(),
+                    align: WFA2RSAlignment::default(),
                     output: output,
                     rec_fwd_revc: OwnedFastqRecord::new(),
                     rec_rev_revc: OwnedFastqRecord::new(),

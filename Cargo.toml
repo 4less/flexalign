@@ -27,6 +27,9 @@ kmerrs = { git = "https://github.com/4less/kmerr.git", rev = "3b86438d083ba83d33
 flexmap = { git = "https://github.com/4less/flexmap.git", rev = "2fde119c833088dc8a9f4227148c42697d3e0478" }
 bioreader = { git = "https://github.com/4less/bioreader.git", rev = "1ba00bb9055ec71334c87576e12023f994dd1390" }
 libwfa2 = { git = "https://github.com/4less/libwfa2.git", rev = "ca5af926661b7e3ce41a9a122cde8273b1ea675f" }
+# The pure-Rust WFA2-lib port (4less fork), as the pipeline's gapped aligner (alignment_rs.rs).
+# default-features = false: its defaults are the CLI benchmark binary's dependencies.
+wfa2lib-rs = { git = "https://github.com/4less/wfa2lib-rs.git", rev = "eb936d45410b7a0fd9e0046119891ddc50adc782", default-features = false }
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
 clap_derive = "4.5.3"
 flate2 = "1.0.28"
