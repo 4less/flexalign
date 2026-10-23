@@ -194,8 +194,9 @@ pub fn process_fastq_wrapper<
 /// 16 MiB batches left 16 threads ~26% idle on a 650 MB sample: 41 batches over 16 workers is
 /// 2.5 rounds, so the last round ran on 9 threads while 7 waited -- a tail that costs a full
 /// batch of wall time. Smaller batches balance the tail at the price of more lock acquisitions,
-/// which are cheap next to the ~10 ms of work a batch carries.
-const READ_BATCH_BYTES: usize = 1 << 22;
+/// which are cheap next to the work a batch carries: 4 MiB took the wall from 2.47 s to 2.09 s,
+/// and once the fast-hit path made each pair cheaper, 1 MiB measured 1.13 s against 1.20 s.
+const READ_BATCH_BYTES: usize = 1 << 20;
 
 pub fn process_fastq_wrapper_modular<
         'a,
