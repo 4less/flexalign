@@ -117,6 +117,14 @@ pub struct Stats {
     pub mate_backed_emitted: usize,
 
     pub rescue_attempted: usize,
+    /// Pairs written by the fast-hit path (`--fast-hit`), never seeded or aligned.
+    pub fast_hit_pairs: usize,
+    /// Fast-hit mates that fell through, by reason: too few votes, window off the reference,
+    /// too many mismatches; and pairs whose two placed mates did not pair.
+    pub fast_hit_few_votes: usize,
+    pub fast_hit_off_reference: usize,
+    pub fast_hit_mismatches: usize,
+    pub fast_hit_unpaired: usize,
     pub rescue_succeeded: usize,
     /// Why a rescue did not happen or was refused. `skipped_weak` is the anchored side failing the
     /// quality gate (its position is not worth trusting); `rejected_ambiguous` is the scan finding a
@@ -233,6 +241,11 @@ impl Stats {
             ("pairs_none_emitted",          self.pairs_none_emitted as f64, "count"),
             ("mate_backed_emitted",         self.mate_backed_emitted as f64, "count"),
             ("rescue_attempted",            self.rescue_attempted as f64, "count"),
+            ("fast_hit_pairs",              self.fast_hit_pairs as f64, "count"),
+            ("fast_hit_few_votes",          self.fast_hit_few_votes as f64, "count"),
+            ("fast_hit_off_reference",      self.fast_hit_off_reference as f64, "count"),
+            ("fast_hit_mismatches",         self.fast_hit_mismatches as f64, "count"),
+            ("fast_hit_unpaired",           self.fast_hit_unpaired as f64, "count"),
             ("rescue_succeeded",            self.rescue_succeeded as f64, "count"),
             ("rescue_skipped_weak",         self.rescue_skipped_weak as f64, "count"),
             ("rescue_rejected_ambiguous",   self.rescue_rejected_ambiguous as f64, "count"),
@@ -346,6 +359,11 @@ impl Merge for Stats {
         self.pairs_none_emitted += other.pairs_none_emitted;
         self.mate_backed_emitted += other.mate_backed_emitted;
         self.rescue_attempted += other.rescue_attempted;
+        self.fast_hit_pairs += other.fast_hit_pairs;
+        self.fast_hit_few_votes += other.fast_hit_few_votes;
+        self.fast_hit_off_reference += other.fast_hit_off_reference;
+        self.fast_hit_mismatches += other.fast_hit_mismatches;
+        self.fast_hit_unpaired += other.fast_hit_unpaired;
         self.rescue_succeeded += other.rescue_succeeded;
         self.rescue_skipped_weak += other.rescue_skipped_weak;
         self.rescue_rejected_ambiguous += other.rescue_rejected_ambiguous;
@@ -416,6 +434,11 @@ impl Display for Stats {
             ....dropped mate lost ranking (selection)...{:?}\n\
             Pairs emitting NEITHER mate.................{:?}\n\
             Mates emitted on partner evidence...........{:?}\n\
+            Pairs resolved by fast hit..................{:?}\n\
+            ....mates with too few votes................{:?}\n\
+            ....mates off the reference end.............{:?}\n\
+            ....mates over the mismatch cap.............{:?}\n\
+            ....pairs whose mates did not pair..........{:?}\n\
             Mate rescue attempted.......................{:?}\n\
             Mate rescue succeeded.......................{:?}\n\
             ....skipped, anchored side too weak.........{:?}\n\
@@ -490,6 +513,11 @@ impl Display for Stats {
             self.halfpair_mate_lost_selection,
             self.pairs_none_emitted,
             self.mate_backed_emitted,
+            self.fast_hit_pairs,
+            self.fast_hit_few_votes,
+            self.fast_hit_off_reference,
+            self.fast_hit_mismatches,
+            self.fast_hit_unpaired,
             self.rescue_attempted,
             self.rescue_succeeded,
             self.rescue_skipped_weak,
@@ -575,6 +603,11 @@ impl Default for Stats {
             pairs_none_emitted: 0,
             mate_backed_emitted: 0,
             rescue_attempted: 0,
+            fast_hit_pairs: 0,
+            fast_hit_few_votes: 0,
+            fast_hit_off_reference: 0,
+            fast_hit_mismatches: 0,
+            fast_hit_unpaired: 0,
             rescue_succeeded: 0,
             rescue_skipped_weak: 0,
             rescue_rejected_ambiguous: 0,

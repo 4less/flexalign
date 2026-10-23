@@ -7,7 +7,7 @@ use log::info;
 
 use crate::{
     GOLDSTD_EVAL, align::{
-        modular_workflow::{Modular, ModularPE}, 
+        modular_workflow::{FastHitScratch, Modular, ModularPE}, 
         process::{
             alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
         }, 
@@ -318,6 +318,7 @@ pub fn process_fastq_wrapper_modular<
                     output: output,
                     rec_fwd_revc: OwnedFastqRecord::new(),
                     rec_rev_revc: OwnedFastqRecord::new(),
+                    fast: FastHitScratch::default(),
                 };  
 
 

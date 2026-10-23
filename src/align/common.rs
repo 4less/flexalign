@@ -238,8 +238,24 @@ pub trait KmerExtractor<const K: usize> {
     fn retrieve(&self) -> &[(usize, Kmer<K>)];
 }
 
+/// One index position of a read's k-mer, from a key with few positions: `rpos` is where that
+/// k-mer (flanks included) starts on reference `rval`, in the index's canonical orientation.
+#[derive(Clone, Copy, Debug)]
+pub struct UniqueHit {
+    pub qpos: u32,
+    pub rval: u64,
+    pub rpos: u64,
+}
+
 pub trait RangeExtractor<const C: usize, const F: usize> {
     fn generate(&mut self, kmers: &[(usize, Kmer<C>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>];
+    /// The fast-hit lookup (`--fast-hit`): every position of every k-mer whose key has at most
+    /// `max_positions` positions in the index (and so no flank headers), without materialising
+    /// ranges. Returns false when the implementation cannot answer, in which case the caller
+    /// takes the full path.
+    fn unique_hits(&mut self, _kmers: &[(usize, Kmer<C>)], _max_positions: usize, _out: &mut Vec<UniqueHit>) -> bool {
+        false
+    }
     fn retrieve(&self) -> &[Range<'_, F>];
 }
 

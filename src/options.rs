@@ -129,6 +129,32 @@ pub struct Args {
     #[arg(long = "mate-rescue", action)]
     pub mate_rescue: bool,
 
+    /// Resolve a pair from its unique k-mers alone when they allow it (SAM output only).
+    ///
+    /// Every position of a mate's k-mers whose keys have at most `--fast-hit-max-positions`
+    /// positions votes for a (reference, diagonal, strand); the winner needs at least
+    /// `--fast-hit-min-hits` votes, and the mate is compared base by base against that window.
+    /// At most `--fast-hit-max-mismatch` mismatches, the whole read inside the reference, and a
+    /// partner resolved the same way on the same reference, the opposite strand and within 1 kb,
+    /// and the pair is written as two gapless records without seeding, anchoring or alignment,
+    /// with MAPQ from the vote margin over the runner-up locus as the full path scores anchors.
+    /// Everything else takes the full path. Modelled on protal 2.0's sparse-first gate.
+    #[arg(long = "fast-hit", action)]
+    pub fast_hit: bool,
+
+    /// Most mismatches a fast-hit mate may carry (`--fast-hit`).
+    #[arg(long = "fast-hit-max-mismatch", default_value_t = 6)]
+    pub fast_hit_max_mismatch: usize,
+
+    /// Fewest k-mer hits on the winning diagonal a fast-hit mate needs (`--fast-hit`).
+    #[arg(long = "fast-hit-min-hits", default_value_t = 3)]
+    pub fast_hit_min_hits: usize,
+
+    /// Most index positions a k-mer's key may have for the fast-hit path to use it; keys with more
+    /// carry flank headers and are left to the full path (`--fast-hit`).
+    #[arg(long = "fast-hit-max-positions", default_value_t = 2)]
+    pub fast_hit_max_positions: usize,
+
     /// HARD CAP on rescue attempts per read. Rank is a poor selector on its own -- single-sided
     /// candidates are the normal contents of the ranking tail, so `top 2` already costs 53x `top 1`
     /// for 17% more yield. This only stops a pathological read; `--mate-rescue-score-frac` does the

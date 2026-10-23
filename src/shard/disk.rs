@@ -259,6 +259,7 @@ pub fn run_disk_rejoin_align<
         output,
         rec_fwd_revc: OwnedFastqRecord::new(),
         rec_rev_revc: OwnedFastqRecord::new(),
+        fast: crate::align::modular_workflow::FastHitScratch::default(),
     };
 
     let mut replay_fwd = ReplaySeedExtractor::<K, C, F>::new(max_ranges);

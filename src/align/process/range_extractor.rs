@@ -6,7 +6,7 @@ use flexmap::range::AnyRange;
 use kmerrs::consecutive::kmer::Kmer;
 use kmerrs::kmer_utils::mask_coremer;
 
-use crate::{align::{common::RangeExtractor, stats::Stats}, database::common::FlexalignDatabase};
+use crate::{align::{common::{RangeExtractor, UniqueHit}, stats::Stats}, database::common::FlexalignDatabase};
 
 // pub type Range<'a, const F: usize> = (usize, Kmer<F>, VRange<'a>, usize);
 
@@ -79,6 +79,27 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         stats.ranges += self.ranges.len();
 
         &self.ranges
+    }
+
+    fn unique_hits(&mut self, kmers: &[(usize, Kmer<K>)], max_positions: usize, out: &mut Vec<UniqueHit>) -> bool {
+        out.clear();
+        self.keys.clear();
+        for (_, kmer) in kmers {
+            self.keys.push(mask_coremer::<C>(kmer.middle::<C>().0));
+        }
+        self.db.for_each_vrange(&self.keys, &mut |i, range| {
+            if let Some(range) = range {
+                // Headerless keys (at most HEADER_THRESHOLD positions) hold the positions directly.
+                let n = range.len();
+                if n <= max_positions && !range.has_header() {
+                    for j in 0..n {
+                        let (rval, rpos) = range.value(j);
+                        out.push(UniqueHit { qpos: kmers[i].0 as u32, rval, rpos });
+                    }
+                }
+            }
+        });
+        true
     }
 }
 

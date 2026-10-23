@@ -16,7 +16,7 @@ use super::{
     common::{
         penalties, Align, AlignTrace, AnchorExtractor, AnchorPair, AnchorScore, Heuristic,
         KmerExtractor, Or, PAFOutput, PairedAnchorExtender, PairedAnchorExtractor,
-        PairedAnchorMAPQ, RangeExtractor, SAMOutput, SeedExtractor, StdAnchorScore,
+        PairedAnchorMAPQ, RangeExtractor, UniqueHit, SAMOutput, SeedExtractor, StdAnchorScore,
         StdPairedAnchorMAPQ,
     },
     data_structures::{anchor::{Anchor, AnchorSeed}, common::Seed},
@@ -24,7 +24,7 @@ use super::{
         alignment::{ani_abort_score, approx_ani, hamming_ani},
         evaluate::{self, get_id_from_header},
     },
-    sam::Flag,
+    sam::{Cigar, Flag},
     stats::Stats,
 };
 use itertools::Itertools;
@@ -384,6 +384,223 @@ fn sam_qname(head: &[u8]) -> &str {
     head.strip_suffix("/1").or_else(|| head.strip_suffix("/2")).unwrap_or(head)
 }
 
+/// Buffers of the fast-hit path, reused across pairs.
+#[derive(Clone, Default)]
+pub struct FastHitScratch {
+    hits_fwd: Vec<UniqueHit>,
+    hits_rev: Vec<UniqueHit>,
+    cigar_fwd: Vec<u8>,
+    cigar_rev: Vec<u8>,
+    votes: Vec<(u64, i64, bool, u32)>,
+}
+
+/// One mate placed by the fast-hit path: the read lies gapless on `[start, end)` of `rval`.
+struct FastMate {
+    rval: u64,
+    start: usize,
+    end: usize,
+    forward: bool,
+    /// `K * votes - mismatches` of this locus and of the best other locus on the mate: the anchor
+    /// score (`core_matches - mismatches`) the full path builds its MAPQ from.
+    score: i64,
+    runner_up: i64,
+}
+
+/// Why a mate fell through to the full path.
+enum FastMiss {
+    FewVotes,
+    OffReference,
+    Mismatches,
+}
+
+/// Places one mate from its few-position k-mers, or says why not.
+///
+/// `K` is the k-mer length (the extractor's `C` parameter in `ModularPE`). Each hit votes for a
+/// (reference, diagonal) under both strand hypotheses -- read forward (`rpos - qpos`) and read
+/// reverse-complement (`rpos - (len - K - qpos)`); the index stores the canonical k-mer, so a hit
+/// says nothing about strand by itself. The true strand's votes pile onto one diagonal while the
+/// other strand's scatter. Every locus with at least `min_hits` votes and at least half the top
+/// count is a candidate: the oriented read is compared base by base against its window (which
+/// rejects a wrong strand call outright), and the candidate with the fewest mismatches wins -- two
+/// copies of a locus that tie on votes are told apart here, as the full path tells them apart by
+/// its Hamming screen and alignment. The winner must lie inside the reference (the full path does
+/// the clipping) and within `max_mismatch`.
+#[allow(clippy::too_many_arguments)]
+fn fast_hit_mate<const K: usize, D: FlexalignDatabase>(
+    db: &D,
+    hits: &[UniqueHit],
+    rec: &RefFastqRecord,
+    revc: &mut OwnedFastqRecord,
+    cigar: &mut Vec<u8>,
+    votes: &mut Vec<(u64, i64, bool, u32)>,
+    min_hits: usize,
+    max_mismatch: usize,
+) -> Result<FastMate, FastMiss> {
+    let len = rec.seq().len();
+    if hits.len() < min_hits || len < K {
+        return Err(FastMiss::FewVotes);
+    }
+    votes.clear();
+    for h in hits {
+        let fwd = (h.rval, h.rpos as i64 - h.qpos as i64, true);
+        let rev = (h.rval, h.rpos as i64 - (len - K - h.qpos as usize) as i64, false);
+        for key in [fwd, rev] {
+            match votes.iter_mut().find(|v| (v.0, v.1, v.2) == key) {
+                Some(v) => v.3 += 1,
+                None => votes.push((key.0, key.1, key.2, 1)),
+            }
+        }
+    }
+    let top = votes.iter().map(|v| v.3).max().unwrap_or(0);
+    if (top as usize) < min_hits {
+        return Err(FastMiss::FewVotes);
+    }
+    // Evaluate the candidates: fewest mismatches wins, votes break ties.
+    let mut revc_ready = false;
+    let mut best: Option<(usize, usize, i64)> = None; // (index into votes, mismatches, score)
+    let mut runner_up: i64 = 0;
+    let mut off_reference = 0usize;
+    let mut over_cap = 0usize;
+    for (i, &(rval, diag, forward, n)) in votes.iter().enumerate() {
+        if (n as usize) < min_hits || 2 * n < top {
+            runner_up = runner_up.max(K as i64 * n as i64);
+            continue;
+        }
+        let reference = match db.get_reference(rval as usize) {
+            Some(r) => r,
+            None => continue,
+        };
+        if diag < 0 || diag as usize + len > reference.len() {
+            off_reference += 1;
+            continue;
+        }
+        let start = diag as usize;
+        let window = &reference[start..start + len];
+        let query: &[u8] = if forward {
+            rec.seq()
+        } else {
+            if !revc_ready {
+                rec.reverse_complement(revc);
+                revc_ready = true;
+            }
+            revc.seq()
+        };
+        let mm = triple_accel::hamming(query, window) as usize;
+        let score = K as i64 * n as i64 - mm as i64;
+        if mm > max_mismatch {
+            over_cap += 1;
+            runner_up = runner_up.max(score);
+            continue;
+        }
+        match best {
+            Some((_, bmm, bscore)) if (mm, -bscore) >= (bmm, -score) => runner_up = runner_up.max(score),
+            Some((_, _, bscore)) => {
+                runner_up = runner_up.max(bscore);
+                best = Some((i, mm, score));
+            }
+            None => best = Some((i, mm, score)),
+        }
+    }
+    let (i, _, score) = match best {
+        Some(b) => b,
+        None if over_cap > 0 => return Err(FastMiss::Mismatches),
+        None if off_reference > 0 => return Err(FastMiss::OffReference),
+        None => return Err(FastMiss::FewVotes),
+    };
+    let (rval, diag, forward, _) = votes[i];
+    let start = diag as usize;
+    let reference = db.get_reference(rval as usize).ok_or(FastMiss::OffReference)?;
+    let window = &reference[start..start + len];
+    let query: &[u8] = if forward { rec.seq() } else { revc.seq() };
+    cigar.clear();
+    cigar.extend(query.iter().zip(window).map(|(q, r)| if q == r { b'M' } else { b'X' }));
+    Ok(FastMate { rval, start, end: start + len, forward, score, runner_up })
+}
+
+/// The fast-hit path for one pair (`--fast-hit`): both mates placed by `fast_hit_mate` on the same
+/// reference, opposite strands, within `MAX_INSERT`, then written as a proper pair. MAPQ is the
+/// pair's vote margin over the runner-up loci, scaled as `StdPairedAnchorMAPQ` scales the anchor
+/// margin (60 for no runner-up). True when the pair was written; false leaves it to the full path.
+#[allow(clippy::too_many_arguments)]
+fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: SAMOutput, D: FlexalignDatabase>(
+    args: &crate::options::Args,
+    db: &D,
+    re_fwd: &mut RE,
+    re_rev: &mut RE,
+    kmers_fwd: &[(usize, kmerrs::consecutive::kmer::Kmer<K>)],
+    kmers_rev: &[(usize, kmerrs::consecutive::kmer::Kmer<K>)],
+    rec_fwd: &RefFastqRecord,
+    rec_rev: &RefFastqRecord,
+    revc_fwd: &mut OwnedFastqRecord,
+    revc_rev: &mut OwnedFastqRecord,
+    scratch: &mut FastHitScratch,
+    out: &mut SO,
+    stats: &mut Stats,
+) -> bool {
+    const MAX_INSERT: usize = 1000;
+    let (min_hits, max_mm, max_pos) = (args.fast_hit_min_hits, args.fast_hit_max_mismatch, args.fast_hit_max_positions);
+    let mut miss = |m: FastMiss, stats: &mut Stats| {
+        match m {
+            FastMiss::FewVotes => stats.fast_hit_few_votes += 1,
+            FastMiss::OffReference => stats.fast_hit_off_reference += 1,
+            FastMiss::Mismatches => stats.fast_hit_mismatches += 1,
+        }
+        false
+    };
+    if !re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd) {
+        return false;
+    }
+    let m1 = match fast_hit_mate::<K, D>(db, &scratch.hits_fwd, rec_fwd, revc_fwd, &mut scratch.cigar_fwd, &mut scratch.votes, min_hits, max_mm) {
+        Ok(m) => m,
+        Err(e) => return miss(e, stats),
+    };
+    if !re_rev.unique_hits(kmers_rev, max_pos, &mut scratch.hits_rev) {
+        return false;
+    }
+    let m2 = match fast_hit_mate::<K, D>(db, &scratch.hits_rev, rec_rev, revc_rev, &mut scratch.cigar_rev, &mut scratch.votes, min_hits, max_mm) {
+        Ok(m) => m,
+        Err(e) => return miss(e, stats),
+    };
+    let leftmost = m1.start.min(m2.start);
+    let rightmost = m1.end.max(m2.end);
+    if m1.rval != m2.rval || m1.forward == m2.forward || rightmost - leftmost > MAX_INSERT {
+        stats.fast_hit_unpaired += 1;
+        return false;
+    }
+    let ref_name = match db.get_rname(m1.rval as usize) {
+        Some(n) => n,
+        None => return false,
+    };
+    // As StdPairedAnchorMAPQ::mapq_from scores anchor pairs: margin of the pair's score over the
+    // runner-up pair's, scaled to 60.
+    let s1 = (m1.score + m2.score).max(1) as f64;
+    let s2 = (m1.runner_up + m2.runner_up).max(0) as f64;
+    let mapq = (60.0 * (1.0 - s2 / s1)).round().clamp(0.0, 60.0) as u8;
+    let span = (rightmost - leftmost) as i64;
+    let cigar_fwd = Cigar(std::mem::take(&mut scratch.cigar_fwd));
+    let cigar_rev = Cigar(std::mem::take(&mut scratch.cigar_rev));
+    let revc_fwd: &OwnedFastqRecord = revc_fwd;
+    let revc_rev: &OwnedFastqRecord = revc_rev;
+    for (first, m, mate, cigar, rec, revc) in [
+        (true, &m1, &m2, &cigar_fwd, rec_fwd, revc_fwd),
+        (false, &m2, &m1, &cigar_rev, rec_rev, revc_rev),
+    ] {
+        let mut flag = Flag::new();
+        flag.paired_end(true);
+        flag.proper_pair(true);
+        if first { flag.first_in_pair(true); } else { flag.last_in_pair(true); }
+        if !m.forward { flag.reverse(true); }
+        if !mate.forward { flag.mate_reverse(true); }
+        // The leftmost mate reports the span as positive, the other as negative.
+        let tlen = if m.start <= mate.start { span } else { -span };
+        let (seq, qual) = if m.forward { (rec.seq(), rec.qual()) } else { (revc.seq(), revc.qual()) };
+        out.write(sam_qname(rec.head()), flag.value(), ref_name, m.start, mapq, cigar, Some(ref_name), mate.start, tlen, seq, qual);
+    }
+    scratch.cigar_fwd = cigar_fwd.0;
+    scratch.cigar_rev = cigar_rev.0;
+    true
+}
+
 /// Writes one SAM record for `m`, using `mate` for the pairing columns.
 fn write_sam_record<SO: SAMOutput>(
     out: &mut SO,
@@ -615,6 +832,8 @@ pub struct ModularPE<
 
     pub rec_fwd_revc: OwnedFastqRecord,
     pub rec_rev_revc: OwnedFastqRecord,
+    /// Scratch of the fast-hit path (`--fast-hit`), reused across pairs.
+    pub fast: FastHitScratch,
 }
 
 impl<
@@ -656,6 +875,29 @@ impl<
         stats.time_get_kmers += duration;
         let (duration, kmers_rev) = time(|| self.kmer_extractor_rev.generate(rec_rev, stats));
         stats.time_get_kmers += duration;
+
+        // The fast-hit path: a pair pinned by its unique k-mers is written here and never seeded.
+        if self.options.args.fast_hit && self.output.has_b() {
+            let done = fast_hit_pair::<C, F, RE, SO, D>(
+                &self.options.args,
+                self.db,
+                &mut self.range_extractor_fwd,
+                &mut self.range_extractor_rev,
+                kmers_fwd,
+                kmers_rev,
+                rec_fwd,
+                rec_rev,
+                &mut self.rec_fwd_revc,
+                &mut self.rec_rev_revc,
+                &mut self.fast,
+                self.output.b.as_mut().unwrap(),
+                stats,
+            );
+            if done {
+                stats.fast_hit_pairs += 1;
+                return;
+            }
+        }
 
         // Get ranges from minimizers
         let (duration, ranges_fwd) =

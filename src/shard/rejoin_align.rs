@@ -87,6 +87,7 @@ pub fn run_rejoin_align<
         output,
         rec_fwd_revc: OwnedFastqRecord::new(),
         rec_rev_revc: OwnedFastqRecord::new(),
+        fast: crate::align::modular_workflow::FastHitScratch::default(),
     };
 
     // Per-worker replay state (cloned per thread). Rather than materialising every read's seeds up
