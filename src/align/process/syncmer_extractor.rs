@@ -66,8 +66,11 @@ static CODE: [u8; 256] = {
 };
 
 /// Sliding-window minimum, window `w`, over `v`: `out[i] = min(v[i..i+w])` for every full window.
-/// Van Herk / Gil-Werman: a suffix-min pass inside each block of `w` and a prefix-min pass, then
-/// every window is the min of one suffix entry and one prefix entry.
+///
+/// With AVX2 (the release build's target), 16 windows are reduced at once: the minimum of the
+/// `w` shifted loads. Otherwise, van Herk / Gil-Werman: a suffix-min pass inside each block of
+/// `w` and a prefix-min pass, then every window is the min of one suffix entry and one prefix
+/// entry.
 #[inline]
 fn window_min(v: &[u16], w: usize, prefix: &mut Vec<u16>, out: &mut Vec<u16>) {
     let n = v.len();
@@ -75,28 +78,61 @@ fn window_min(v: &[u16], w: usize, prefix: &mut Vec<u16>, out: &mut Vec<u16>) {
     if n < w {
         return;
     }
-    prefix.clear();
-    prefix.resize(n, 0);
-    out.resize(n, 0);
-    let mut i = 0;
-    while i < n {
-        let end = (i + w).min(n);
-        let mut m = v[i];
-        for j in i..end {
-            m = m.min(v[j]);
-            prefix[j] = m;
+    let m = n - w + 1;
+    out.resize(m, 0);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let _ = prefix;
+        // SAFETY: every load reads v[i + j .. i + j + 16] with i + 16 <= m and j < w, so
+        // i + j + 16 <= m - 1 + w = n; every store writes out[i..i+16] with i + 16 <= m.
+        unsafe {
+            use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_min_epu16, _mm256_storeu_si256};
+            let mut i = 0;
+            while i + 16 <= m {
+                let base = v.as_ptr().add(i);
+                let mut acc: __m256i = _mm256_loadu_si256(base as *const __m256i);
+                for j in 1..w {
+                    acc = _mm256_min_epu16(acc, _mm256_loadu_si256(base.add(j) as *const __m256i));
+                }
+                _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut __m256i, acc);
+                i += 16;
+            }
+            while i < m {
+                let mut mn = *v.get_unchecked(i);
+                for j in 1..w {
+                    mn = mn.min(*v.get_unchecked(i + j));
+                }
+                *out.get_unchecked_mut(i) = mn;
+                i += 1;
+            }
         }
-        let mut m = v[end - 1];
-        for j in (i..end).rev() {
-            m = m.min(v[j]);
-            out[j] = m;
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        prefix.clear();
+        prefix.resize(n, 0);
+        out.resize(n, 0);
+        let mut i = 0;
+        while i < n {
+            let end = (i + w).min(n);
+            let mut mn = v[i];
+            for j in i..end {
+                mn = mn.min(v[j]);
+                prefix[j] = mn;
+            }
+            let mut mn = v[end - 1];
+            for j in (i..end).rev() {
+                mn = mn.min(v[j]);
+                out[j] = mn;
+            }
+            i = end;
         }
-        i = end;
+        for i in 0..m {
+            out[i] = out[i].min(prefix[i + w - 1]);
+        }
+        out.truncate(m);
     }
-    for i in 0..=(n - w) {
-        out[i] = out[i].min(prefix[i + w - 1]);
-    }
-    out.truncate(n - w + 1);
 }
 
 impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmerExtractor<K, C, S, L> {
