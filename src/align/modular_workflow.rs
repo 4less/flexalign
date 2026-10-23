@@ -860,14 +860,21 @@ impl<
         // Get Seeds from ranges. Own them so the reference-comparison half can run behind a
         // `&mut self` call, and so the sharded rejoin can feed it replayed seeds through the very
         // same path.
-        let (duration, seeds_fwd) = time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats).to_vec());
+        // Taken out of the extractors (not copied) for the duration of the `&mut self` call below,
+        // and put back afterwards so their capacity is reused: two `to_vec()` per pair were a
+        // visible share of the allocator time.
+        let (duration, _) = time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats));
         stats.time_range_header += duration;
-        stats.seeds += seeds_fwd.len();
-        let (duration, seeds_rev) = time(|| self.seed_extractor_rev.generate(ranges_rev, stats).to_vec());
+        let (duration, _) = time(|| self.seed_extractor_rev.generate(ranges_rev, stats));
         stats.time_range_header += duration;
-        stats.seeds += seeds_rev.len();
+        let seeds_fwd = self.seed_extractor_fwd.take_seeds();
+        let seeds_rev = self.seed_extractor_rev.take_seeds();
+        stats.seeds += seeds_fwd.len() + seeds_rev.len();
 
         self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats);
+
+        self.seed_extractor_fwd.put_seeds(seeds_fwd);
+        self.seed_extractor_rev.put_seeds(seeds_rev);
     }
 
     /// The reference-comparison half of the pipeline: seeds -> anchors -> extend -> gapped align ->

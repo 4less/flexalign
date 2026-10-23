@@ -85,35 +85,50 @@ impl SAMOutput for StdSAMOutput {
         seq: &[u8],
         qual: &[u8],
     ) {
-        // A CIGAR that does not fit the read would make an unreadable record; skip rather than
-        // emit something samtools will reject.
-        let cigar_string = match cigar.to_sam(seq.len()) {
-            Some(c) => c,
-            None => return,
-        };
-
         // RNEXT is "=" when the mate is on this same reference, which is the common case.
         let rnext = match mate_reference_name {
             Some(name) if name == reference_name => "=",
             Some(name) => name,
             None => "*",
         };
+        let pnext = if mate_reference_name.is_some() { mate_reference_start + 1 } else { 0 };
+        let nm = cigar.edit_distance();
 
-        self.buffer.write(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\n",
-            query_name,
-            flag,
-            reference_name,
-            reference_start + 1, // SAM POS is 1-based
-            mapping_quality,
-            cigar_string,
-            rnext,
-            if mate_reference_name.is_some() { mate_reference_start + 1 } else { 0 },
-            template_length,
-            String::from_utf8_lossy(seq),
-            if qual.is_empty() { "*".to_string() } else { String::from_utf8_lossy(qual).to_string() },
-            cigar.edit_distance(),
-        ));
+        // Appended as bytes: formatting through `format!` plus a lossy UTF-8 copy of SEQ and QUAL
+        // per record was ~8% of a run. `itoa` writes the integers; the sequences are copied once.
+        self.buffer.write_with(|out| {
+            let mark = out.len();
+            let mut n = itoa::Buffer::new();
+            out.extend_from_slice(query_name.as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(n.format(flag).as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(reference_name.as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(n.format(reference_start + 1).as_bytes()); // SAM POS is 1-based
+            out.push(b'\t');
+            out.extend_from_slice(n.format(mapping_quality).as_bytes());
+            out.push(b'\t');
+            // A CIGAR that does not fit the read would make an unreadable record; skip rather than
+            // emit something samtools will reject.
+            if !cigar.to_sam_into(seq.len(), out) {
+                out.truncate(mark);
+                return;
+            }
+            out.push(b'\t');
+            out.extend_from_slice(rnext.as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(n.format(pnext).as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(n.format(template_length).as_bytes());
+            out.push(b'\t');
+            out.extend_from_slice(seq);
+            out.push(b'\t');
+            if qual.is_empty() { out.push(b'*'); } else { out.extend_from_slice(qual); }
+            out.extend_from_slice(b"\tNM:i:");
+            out.extend_from_slice(n.format(nm).as_bytes());
+            out.push(b'\n');
+        });
     }
 }
 

@@ -50,6 +50,9 @@ fn main() {
     SHOULD_COLORIZE.set_override(true);
 
     let args: Args = Args::parse();
+    flexalign::flexalign::set_stage_timing(
+        args.time_log.is_some() || args.debug || std::env::var_os("FLEXALIGN_TIMING").is_some(),
+    );
     let _level = log::LevelFilter::from_str(&args.log_level.to_string());
 
     let level = match args.log_level {

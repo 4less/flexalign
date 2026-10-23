@@ -248,27 +248,38 @@ impl Cigar {
     /// invalid record -- callers emit nothing rather than corrupt output. If it consumes fewer, the
     /// remainder is soft-clipped so that query length and CIGAR agree, as SAM requires.
     pub fn to_sam(&self, query_length: usize) -> Option<String> {
-        let consumed = self.query_consumed();
-        if consumed > query_length {
+        let mut out = Vec::with_capacity(16);
+        if !self.to_sam_into(query_length, &mut out) {
             return None;
         }
+        Some(String::from_utf8(out).expect("CIGAR is ASCII"))
+    }
 
-        let mut out = String::with_capacity(16);
+    /// `to_sam`, appended to a byte buffer: the record writer calls this per alignment, and a
+    /// String per record was a measurable share of the output cost. Returns false (and appends
+    /// nothing) when the CIGAR does not fit the read.
+    pub fn to_sam_into(&self, query_length: usize, out: &mut Vec<u8>) -> bool {
+        let consumed = self.query_consumed();
+        if consumed > query_length {
+            return false;
+        }
+        let start = out.len();
+
         let mut run_op = 0u8;
         let mut run_len = 0usize;
 
-        let flush = |op: u8, len: usize, out: &mut String| {
+        let flush = |op: u8, len: usize, out: &mut Vec<u8>| {
             if len == 0 {
                 return;
             }
             let sam_op = match op {
-                b'M' | b'X' => 'M',
-                b'D' => 'I', // gap in reference == insertion, in SAM's vocabulary
-                b'I' => 'D', // gap in query == deletion
-                b'S' => 'S',
+                b'M' | b'X' => b'M',
+                b'D' => b'I', // gap in reference == insertion, in SAM's vocabulary
+                b'I' => b'D', // gap in query == deletion
+                b'S' => b'S',
                 other => panic!("Unknown cigar op {}", other as char),
             };
-            out.push_str(&len.to_string());
+            out.extend_from_slice(itoa::Buffer::new().format(len).as_bytes());
             out.push(sam_op);
         };
 
@@ -278,19 +289,19 @@ impl Cigar {
             if op == run_op {
                 run_len += 1;
             } else {
-                flush(run_op, run_len, &mut out);
+                flush(run_op, run_len, out);
                 run_op = op;
                 run_len = 1;
             }
         }
-        flush(run_op, run_len, &mut out);
+        flush(run_op, run_len, out);
 
         if consumed < query_length {
-            out.push_str(&(query_length - consumed).to_string());
-            out.push('S');
+            out.extend_from_slice(itoa::Buffer::new().format(query_length - consumed).as_bytes());
+            out.push(b'S');
         }
 
-        if out.is_empty() { None } else { Some(out) }
+        out.len() > start
     }
 
     /// Edit distance (SAM's `NM` tag): mismatches plus gap bases.

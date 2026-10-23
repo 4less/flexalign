@@ -47,6 +47,8 @@ micromap = "0.0.15"
 ser_raw = "0.1.0"
 triple_accel = "0.4.0"
 memmap2 = "0.9.4"
+# Integer formatting into the output buffer without going through core::fmt (SAM records).
+itoa = "1"
 thiserror = "1.0.64"
 simple_logger=  { version = "3", features = ["stderr"] }
 log = "0"

@@ -288,4 +288,12 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
     fn retrieve(&self) -> &[Seed] {
         &self.seeds
     }
+
+    fn take_seeds(&mut self) -> Vec<Seed> {
+        std::mem::take(&mut self.seeds)
+    }
+
+    fn put_seeds(&mut self, seeds: Vec<Seed>) {
+        self.seeds = seeds;
+    }
 }

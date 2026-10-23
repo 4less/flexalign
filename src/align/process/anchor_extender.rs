@@ -143,6 +143,24 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
         let mut _previous_score = 0;
         let mut extended_anchors = 0;
 
+        // The first thing done with each anchor is comparing its seeds against the reference, a
+        // random access into a multi-GB mmap that misses every cache level. Issue the loads for
+        // every anchor up front so they overlap instead of each stalling the loop in turn.
+        for AnchorPair(a_fwd, a_rev) in anchors.iter() {
+            for a in [a_fwd, a_rev].into_iter().flatten() {
+                if let Some(reference) = self.db.get_reference(a.reference as usize) {
+                    if let (Some(first), Some(last)) = (a.seeds.first(), a.seeds.last()) {
+                        for seed in [first, last] {
+                            let r = seed.rrange();
+                            if r.end <= reference.len() {
+                                prefetch(&reference[r.start..]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for AnchorPair(a_fwd, a_rev) in anchors.iter_mut() {
             let s1 = match a_fwd {
                 Some(a) => StdAnchorScore::score(a),
@@ -275,5 +293,23 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
         }
 
         extended_anchors
+    }
+}
+
+
+/// Touches the cache line(s) at the start of `bytes` without waiting for them.
+#[inline(always)]
+fn prefetch(bytes: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(bytes.as_ptr() as *const i8, _MM_HINT_T0);
+        if bytes.len() > 64 {
+            _mm_prefetch(bytes.as_ptr().add(64) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = bytes;
     }
 }

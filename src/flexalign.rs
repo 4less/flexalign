@@ -8,9 +8,21 @@ use crate::options::{Args, Options};
 use crate::GLOBAL_VERSION;
 
 
+/// Whether the per-stage timers in the read pipeline are live. They wrap every stage of every
+/// read, and two `Instant::now()` per stage was ~2% of a run, so they are off unless asked for:
+/// `--time-log`, `--debug`, or `FLEXALIGN_TIMING=1`. Off, `time()` reports zero.
+pub static STAGE_TIMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_stage_timing(on: bool) {
+    STAGE_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
 pub fn time<F, T>(f: F) -> (Duration, T)
     where F: FnOnce() -> T {
-
+    if !STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+        return (Duration::ZERO, f());
+    }
     let start: Instant = Instant::now();
     let result = f();
     (start.elapsed(), result)
@@ -197,6 +209,9 @@ pub fn run(args: Args) {
         }
     }
 
-    let (duration, _result) = time(|| process_fastq_wrapper_modular::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db));
-    log::info!("Modular: Process reads: {:?}", duration);
+    // Timed directly, not through `time()`: that one is opt-in now, and this single measurement
+    // is what the benchmarks read.
+    let started = Instant::now();
+    process_fastq_wrapper_modular::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db);
+    log::info!("Modular: Process reads: {:?}", started.elapsed());
 }

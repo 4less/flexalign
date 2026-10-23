@@ -51,7 +51,19 @@ impl OutputBuffer {
 
     pub fn write(&mut self, str: String) {
         let _ = write!(self.buffer, "{}", str);
+        self.flush_if_full();
+    }
 
+    /// Lets the caller append a record straight into the buffer (bytes, no intermediate String),
+    /// then hands it to the shared writer once the threshold is passed.
+    #[inline]
+    pub fn write_with(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
+        f(&mut self.buffer);
+        self.flush_if_full();
+    }
+
+    #[inline]
+    fn flush_if_full(&mut self) {
         if self.buffer.len() > self.threshold {
             let mut wr: std::sync::MutexGuard<'_, OutputTarget> = self.writer.lock().expect("Cannot lock writer");
             let _ = wr.write_all(&self.buffer);

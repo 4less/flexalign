@@ -246,6 +246,10 @@ pub trait RangeExtractor<const C: usize, const F: usize> {
 pub trait SeedExtractor<const F: usize> {
     fn generate(&mut self, ranges: &[Range<F>], stats: &mut Stats) -> &[Seed];
     fn retrieve(&self) -> &[Seed];
+    /// Moves the seeds of the last `generate` out (leaving an empty Vec), so a caller that needs
+    /// `&mut self` elsewhere can hold them without copying; `put_seeds` returns the allocation.
+    fn take_seeds(&mut self) -> Vec<Seed>;
+    fn put_seeds(&mut self, seeds: Vec<Seed>);
 }
 
 pub trait AnchorExtractor {
