@@ -119,7 +119,9 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         let file = paths.index_packed_file(format);
         if Self::packed_compatible(paths, format) {
             let store = match format {
+                IndexFormat::Hashed if index_mmap() => FlexmapStore::Hashed(Arc::new(PackedFlexmap::mmap(&file).expect("mappable hashed index"))),
                 IndexFormat::Hashed => FlexmapStore::Hashed(Arc::new(PackedFlexmap::load(&file, threads).expect("readable hashed index"))),
+                _ if index_mmap() => FlexmapStore::Compact(Arc::new(PackedFlexmap::mmap(&file).expect("mappable compact index"))),
                 _ => FlexmapStore::Compact(Arc::new(PackedFlexmap::load(&file, threads).expect("readable compact index"))),
             };
             return (store, format!("read {file} on {threads} threads"));
@@ -630,4 +632,12 @@ impl<
             None
         }
     }
+}
+
+
+/// `--index-mmap`, set once at start-up (the loader has no options in reach).
+pub static INDEX_MMAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn index_mmap() -> bool {
+    INDEX_MMAP.load(std::sync::atomic::Ordering::Relaxed)
 }

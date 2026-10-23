@@ -50,6 +50,7 @@ fn main() {
     SHOULD_COLORIZE.set_override(true);
 
     let args: Args = Args::parse();
+    flexalign::database::flexmap::INDEX_MMAP.store(args.index_mmap, std::sync::atomic::Ordering::Relaxed);
     flexalign::flexalign::set_stage_timing(
         args.time_log.is_some() || args.debug || std::env::var_os("FLEXALIGN_TIMING").is_some(),
     );

@@ -171,6 +171,12 @@ pub struct Args {
     #[arg(long = "anchor-gate-flank", default_value_t = 6)]
     pub anchor_gate_flank: u32,
 
+    /// Map the packed index (compact or hashed) into memory instead of reading it: nothing to
+    /// copy at start-up, pages fault in as they are touched. Worth it when the file is in the
+    /// page cache and the run is short; the read-in path gets huge pages, this does not.
+    #[arg(long = "index-mmap", action)]
+    pub index_mmap: bool,
+
     /// Never take the fast-hit path: every pair goes through seeding, anchoring and alignment.
     #[arg(long = "no-fast-hit", action, conflicts_with = "fast_hit")]
     pub no_fast_hit: bool,
