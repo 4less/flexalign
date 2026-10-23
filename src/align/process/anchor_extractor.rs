@@ -38,6 +38,8 @@ pub struct StdPairedAnchorExtractor {
     pub anchors: Vec<AnchorPair>,
     pub anchors_fwd: Vec<Anchor>,
     pub anchors_rev: Vec<Anchor>,
+    /// (key, index) table of the anchor sort, reused across reads.
+    pub sort_scratch: Vec<(i32, u32)>,
 }
 
 #[inline(always)]
@@ -359,6 +361,7 @@ impl StdPairedAnchorExtractor {
             other_indices: Vec::new(),
             groups: Vec::new(),
             groups_paired: Vec::new(),
+                    sort_scratch: Vec::new(),
         }
     }
 }
@@ -612,7 +615,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
         // std's stable sort, in place: ~17 pairs of ~200 bytes a read on a marker DB, and
         // glidesort's scratch buffer and merges were a tenth of such a run. Same order.
-        self.anchors.sort_by_key(|AnchorPair(a_fwd, a_rev)| {
+        crate::align::common::sort_pairs_by_key(&mut self.anchors, &mut self.sort_scratch, |AnchorPair(a_fwd, a_rev)| {
             let s1 = a_fwd.as_ref().map_or(0, |a| StdAnchorScore::score(a));
             let s2 = a_rev.as_ref().map_or(0, |a| StdAnchorScore::score(a));
 

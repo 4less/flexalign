@@ -588,3 +588,53 @@ impl Print for SeedGroupPairedList {
         eprintln!("----- Seed group print");
     }
 }
+
+
+/// Stable sort of a short slice by key: insertion sort up to 48 elements (a marker-DB read.s seeds
+/// and anchors are fewer), std's stable sort beyond. Same order as `sort_by_key`.
+pub fn sort_short_by_key<T, K: Ord>(v: &mut [T], key: impl Fn(&T) -> K) {
+    if v.len() > 48 {
+        v.sort_by_key(key);
+        return;
+    }
+    for i in 1..v.len() {
+        let mut j = i;
+        while j > 0 && key(&v[j - 1]) > key(&v[j]) {
+            v.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
+/// Stable sort of anchor pairs by key through a (key, index) table and one permutation pass,
+/// so the ~200-byte pairs move once each instead of through every comparison. Same order as
+/// `sort_by_key`. `scratch` is reused across calls.
+pub fn sort_pairs_by_key<K: Ord + Copy>(v: &mut [AnchorPair], scratch: &mut Vec<(K, u32)>, key: impl Fn(&AnchorPair) -> K) {
+    let n = v.len();
+    if n < 2 {
+        return;
+    }
+    scratch.clear();
+    scratch.extend(v.iter().enumerate().map(|(i, a)| (key(a), i as u32)));
+    sort_short_by_key(scratch, |&(k, i)| (k, i));
+    // Apply the permutation in place by following its cycles.
+    let mut placed = vec![false; n];
+    for start in 0..n {
+        if placed[start] || scratch[start].1 as usize == start {
+            placed[start] = true;
+            continue;
+        }
+        let mut i = start;
+        let tmp = std::mem::replace(&mut v[i], AnchorPair(None, None));
+        loop {
+            let src = scratch[i].1 as usize;
+            placed[i] = true;
+            if src == start {
+                v[i] = tmp;
+                break;
+            }
+            v[i] = std::mem::replace(&mut v[src], AnchorPair(None, None));
+            i = src;
+        }
+    }
+}

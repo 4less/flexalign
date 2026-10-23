@@ -278,7 +278,7 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
         let (duration, _) = stage_time(|| {
             // std's stable sort: a read's seeds are few, and it sorts them in place without the
             // scratch buffer glidesort allocates per call. Same order (both stable).
-            self.seeds.sort_by_key(|seed: &Seed| {
+            crate::align::common::sort_short_by_key(&mut self.seeds, |seed: &Seed| {
                 (seed.rval, seed.rpos)//, seed.length) // seed.offset
             });
         });

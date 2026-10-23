@@ -394,6 +394,8 @@ pub struct FastHitScratch {
     votes: Vec<(u64, i64, bool, u32)>,
     cands_fwd: Vec<FastCand>,
     cands_rev: Vec<FastCand>,
+    /// (key, index) table of the anchor-pair sorts, reused across reads.
+    sort_scratch: Vec<(i64, u32)>,
 }
 
 /// One candidate placement of a mate on the fast-hit path: the read lies gapless on
@@ -1538,9 +1540,9 @@ impl<
             // a two-sided one. Two mates agreeing on a locus at the right insert distance is stronger
             // evidence than one mate scoring well, so a pair that HAS both sides is ranked ahead.
             let bonus = pair_bonus;
-            anchors[0..extended_count].sort_by_key(|AnchorPair(a1, a2)| {
+            crate::align::common::sort_pairs_by_key(&mut anchors[0..extended_count], &mut self.fast.sort_scratch, |AnchorPair(a1, a2)| {
                 let s = a1.as_ref().map_or(0, |a| a.score) + a2.as_ref().map_or(0, |a| a.score);
-                -(s + if a1.is_some() && a2.is_some() { bonus } else { 0 })
+                -((s + if a1.is_some() && a2.is_some() { bonus } else { 0 }) as i64)
             });
 
             // assert!(extension_anchors.iter().all(|pair| pair.validate().is_ok()));
@@ -2001,7 +2003,7 @@ impl<
                     }
                 });
 
-            alignment_anchors.sort_by_key(|AnchorPair(a1, a2)| {
+            crate::align::common::sort_pairs_by_key(&mut alignment_anchors, &mut self.fast.sort_scratch, |AnchorPair(a1, a2)| {
                 let s1 = match a1 {
                     Some(a) => a.score,
                     None => 0,
