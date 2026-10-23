@@ -10,6 +10,14 @@ use crate::align::{common::{penalties, Align, Heuristic, Status}, sam::Cigar};
 
 
 
+/// The gapped-alignment heuristic. WF-adaptive prunes wavefronts far behind the best diagonal;
+/// alignments are optimal unless the optimum strays that far.
+pub const HEURISTIC: HeuristicStrategy = HeuristicStrategy::WFAdaptive {
+    min_wavefront_length: 10,
+    max_distance_threshold: 50,
+    score_steps: 1,
+};
+
 pub struct LIBWFA2Alignment {
     pub aligner: AffineWavefronts,
     pub cigar: Cigar,
@@ -160,8 +168,9 @@ impl LIBWFA2Alignment {
 
     pub fn with_penalties(match_: i32, mismatch: i32, gap_opening: i32, gap_extension: i32) -> Self {
         let mut aligner = AffineWavefronts::with_penalties(match_, mismatch, gap_opening, gap_extension);
-        // WFA2-lib's default WF-adaptive heuristic would prune wavefronts: align exactly.
-        aligner.set_heuristic(&HeuristicStrategy::None);
+        // WF-adaptive (10, 50, 1): what flexalign has always run (WFA2-lib's default, inherited
+        // silently before libwfa2 0.1.2), now set explicitly so every aligner and clone has it.
+        aligner.set_heuristic(&HEURISTIC);
         Self {
             aligner,
             cigar: Cigar(Vec::new()),
@@ -191,8 +200,9 @@ impl Default for LIBWFA2Alignment {
             penalties::GAP_OPENING,
             penalties::GAP_EXTENSION,
         );
-        // WFA2-lib's default WF-adaptive heuristic would prune wavefronts: align exactly.
-        aligner.set_heuristic(&HeuristicStrategy::None);
+        // WF-adaptive (10, 50, 1): what flexalign has always run (WFA2-lib's default, inherited
+        // silently before libwfa2 0.1.2), now set explicitly so every aligner and clone has it.
+        aligner.set_heuristic(&HEURISTIC);
         // aligner.set_heuristic(&HeuristicStrategy::XDrop { xdrop: std::i32::MIN, score_steps: 2 });
         // aligner.set_heuristic(&HeuristicStrategy::BandedStatic { band_min_k: -1, band_max_k: 1 });
         aligner.set_alignment_scope(libwfa2::affine_wavefront::AlignmentScope::Alignment);
