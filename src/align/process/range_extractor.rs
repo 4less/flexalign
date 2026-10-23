@@ -30,6 +30,9 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     /// (range size, index) sort keys and the reordered ranges, reused across reads.
     order: Vec<(u32, u32)>,
     sorted: Vec<Range<'a, F>>,
+    /// Set by `unique_hits`, which already fetched every range of these keys into `ranges`:
+    /// `generate` on the same k-mers then skips the lookup (the fast path's fallback pairs).
+    prefetched: bool,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
@@ -38,26 +41,12 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
     }
     
     fn generate(&mut self, kmers: &[(usize, Kmer<K>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>] {
-        self.ranges.clear();
-        self.keys.clear();
-        self.key_info.clear();
-
-        for (pos, kmer) in kmers {
-            // Look up under the same de-biasing mix used at index build and syncmer selection.
-            self.keys.push(mask_coremer::<C>(kmer.middle::<C>().0));
-            self.key_info.push((*pos, kmer.flanks::<F>()));
+        let reuse = self.prefetched && self.key_info.len() == kmers.len()
+            && self.key_info.iter().zip(kmers).all(|(k, (pos, _))| k.0 == *pos);
+        self.prefetched = false;
+        if !reuse {
+            self.lookup(kmers);
         }
-
-        // All of the read's keys in one call, so that the index can fetch them ahead.
-        let db: &'a D = self.db;
-        let (ranges, key_info) = (&mut self.ranges, &self.key_info);
-        db.for_each_vrange(&self.keys, &mut |i, range| {
-            if let Some(range) = range {
-                let (qpos, fmer) = (key_info[i].0, key_info[i].1.clone());
-                let range_size = range.len() as u32;
-                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0 });
-            }
-        });
         
         for range in &mut self.ranges {
             let qual_mer = &rec.qual()[range.qpos..(range.qpos + C)];
@@ -82,29 +71,51 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
     }
 
     fn unique_hits(&mut self, kmers: &[(usize, Kmer<K>)], max_positions: usize, out: &mut Vec<UniqueHit>) -> bool {
+        self.lookup(kmers);
+        self.prefetched = true;
         out.clear();
-        self.keys.clear();
-        for (_, kmer) in kmers {
-            self.keys.push(mask_coremer::<C>(kmer.middle::<C>().0));
-        }
-        self.db.for_each_vrange(&self.keys, &mut |i, range| {
-            if let Some(range) = range {
-                // Headerless keys (at most HEADER_THRESHOLD positions) hold the positions directly.
-                let n = range.len();
-                if n <= max_positions && !range.has_header() {
-                    for j in 0..n {
-                        let (rval, rpos) = range.value(j);
-                        out.push(UniqueHit { qpos: kmers[i].0 as u32, rval, rpos });
-                    }
+        for r in &self.ranges {
+            // Headerless keys (at most HEADER_THRESHOLD positions) hold the positions directly.
+            let n = r.vrange.len();
+            if n <= max_positions && !r.vrange.has_header() {
+                for j in 0..n {
+                    let (rval, rpos) = r.vrange.value(j);
+                    out.push(UniqueHit { qpos: r.qpos as u32, rval, rpos });
                 }
             }
-        });
+        }
         true
     }
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
+    /// Fetches every key's range into `ranges` (unsorted, qualities unset).
+    fn lookup(&mut self, kmers: &[(usize, Kmer<K>)]) {
+        self.ranges.clear();
+        self.keys.clear();
+        self.key_info.clear();
+
+        for (pos, kmer) in kmers {
+            // Look up under the same de-biasing mix used at index build and syncmer selection.
+            self.keys.push(mask_coremer::<C>(kmer.middle::<C>().0));
+            self.key_info.push((*pos, kmer.flanks::<F>()));
+        }
+
+        // All of the read's keys in one call, so that the index can fetch them ahead.
+        let db: &'a D = self.db;
+        let (ranges, key_info) = (&mut self.ranges, &self.key_info);
+        db.for_each_vrange(&self.keys, &mut |i, range| {
+            if let Some(range) = range {
+                let (qpos, fmer) = (key_info[i].0, key_info[i].1.clone());
+                let range_size = range.len() as u32;
+                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0 });
+            }
+        });
+    }
+}
+
+impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false }
     }
 }

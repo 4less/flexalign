@@ -146,8 +146,10 @@ pub struct Args {
     #[arg(long = "fast-hit-max-mismatch", default_value_t = 6)]
     pub fast_hit_max_mismatch: usize,
 
-    /// Fewest k-mer hits on the winning diagonal a fast-hit mate needs (`--fast-hit`).
-    #[arg(long = "fast-hit-min-hits", default_value_t = 3)]
+    /// Fewest k-mer hits on the winning diagonal a fast-hit mate needs (`--fast-hit`). 2, not 3:
+    /// on bacteroides 3 left 31% of pairs to the full path and 2 leaves 21%, with MORE mates
+    /// placed correctly and fewer wrongly (the Hamming check does the real deciding).
+    #[arg(long = "fast-hit-min-hits", default_value_t = 2)]
     pub fast_hit_min_hits: usize,
 
     /// Most index positions a k-mer's key may have for the fast-hit path to use it; keys with more

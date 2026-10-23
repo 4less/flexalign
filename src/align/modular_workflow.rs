@@ -455,7 +455,24 @@ fn fast_hit_mate<const K: usize, D: FlexalignDatabase>(
     if (top as usize) < min_hits {
         return Err(FastMiss::FewVotes);
     }
-    // Evaluate the candidates: fewest mismatches wins, votes break ties.
+    // Touch every candidate's window first so the reference misses overlap, then evaluate:
+    // fewest mismatches wins, votes break ties.
+    for &(rval, diag, _, n) in votes.iter() {
+        if (n as usize) < min_hits || 2 * n < top || diag < 0 {
+            continue;
+        }
+        if let Some(reference) = db.get_reference(rval as usize) {
+            let start = diag as usize;
+            if start + len <= reference.len() {
+                let w = &reference[start..start + len];
+                let mut off = 0;
+                while off < w.len() {
+                    prefetch_line(&w[off..]);
+                    off += 64;
+                }
+            }
+        }
+    }
     let mut revc_ready = false;
     let mut best: Option<(usize, usize, i64)> = None; // (index into votes, mismatches, score)
     let mut runner_up: i64 = 0;
@@ -2478,5 +2495,20 @@ mod budget_tests {
         assert_eq!(screen_hamming(&a, 150), None, "out of range must not be trusted");
         a.score = 400;
         assert_eq!(screen_hamming(&a, 150), None);
+    }
+}
+
+
+/// Touches the cache line at the start of `bytes` without waiting for it.
+#[inline(always)]
+fn prefetch_line(bytes: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(bytes.as_ptr() as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = bytes;
     }
 }
