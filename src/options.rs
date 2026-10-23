@@ -146,6 +146,19 @@ pub struct Args {
     #[arg(long = "fast-hit", action)]
     pub fast_hit: bool,
 
+    /// Drop candidate anchors that rest on a single core-only seed: an anchor pair is kept only
+    /// if one of its anchors has at least two seeds or an exact full-k-mer seed. Modelled on
+    /// protal 2.0's threshold-score gate. NOT lossless: it trades a little sensitivity for the
+    /// screening and alignment of spurious anchors, which on a marker-gene reference is most of
+    /// the work. Off by default; measure before using.
+    #[arg(long = "anchor-gate", action)]
+    pub anchor_gate: bool,
+
+    /// With `--anchor-gate`: when no anchor pair of a read passes, keep this many of the best
+    /// weak ones instead of none (0 drops the read).
+    #[arg(long = "anchor-gate-keep", default_value_t = 0)]
+    pub anchor_gate_keep: usize,
+
     /// Never take the fast-hit path: every pair goes through seeding, anchoring and alignment.
     #[arg(long = "no-fast-hit", action, conflicts_with = "fast_hit")]
     pub no_fast_hit: bool,

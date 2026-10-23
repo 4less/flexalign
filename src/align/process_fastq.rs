@@ -313,7 +313,7 @@ pub fn process_fastq_wrapper_modular<
                         options.args.ranges,
                         options.args.mask_flank_mult, options.args.flank_slack,
                     ),
-                    anchor_extractor: StdPairedAnchorExtractor::new(),
+                    anchor_extractor: StdPairedAnchorExtractor::new().with_gate(options.args.anchor_gate.then_some(K), options.args.anchor_gate_keep),
                     anchor_extender: StdPairedAnchorExtender::new(db),
                     align: LIBWFA2Alignment::default(),
                     output: output,

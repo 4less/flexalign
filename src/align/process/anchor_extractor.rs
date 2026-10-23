@@ -40,6 +40,10 @@ pub struct StdPairedAnchorExtractor {
     pub anchors_rev: Vec<Anchor>,
     /// (key, index) table of the anchor sort, reused across reads.
     pub sort_scratch: Vec<(i32, u32)>,
+    /// `--anchor-gate`: the core matches a lone seed needs (the full k-mer length); None = off.
+    pub gate_min_core: Option<usize>,
+    /// `--anchor-gate-keep`: weak pairs kept when none passes.
+    pub gate_keep: usize,
 }
 
 #[inline(always)]
@@ -362,7 +366,16 @@ impl StdPairedAnchorExtractor {
             groups: Vec::new(),
             groups_paired: Vec::new(),
                     sort_scratch: Vec::new(),
+            gate_min_core: None,
+            gate_keep: 0,
         }
+    }
+
+    /// `--anchor-gate` with the full k-mer length as the lone-seed threshold.
+    pub fn with_gate(mut self, min_core: Option<usize>, keep: usize) -> Self {
+        self.gate_min_core = min_core;
+        self.gate_keep = keep;
+        self
     }
 }
 
@@ -612,6 +625,21 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
 
 
+
+        // --anchor-gate: a pair rests on something more than one core-only seed on one mate.
+        if let Some(min_core) = self.gate_min_core {
+            let passes = |a: &Option<Anchor>| a.as_ref().is_some_and(|a| a.seeds.len() >= 2 || a.core_matches() >= min_core);
+            let any = self.anchors.iter().any(|AnchorPair(a_fwd, a_rev)| passes(a_fwd) || passes(a_rev));
+            if any {
+                self.anchors.retain(|AnchorPair(a_fwd, a_rev)| passes(a_fwd) || passes(a_rev));
+            } else if self.gate_keep < self.anchors.len() {
+                // Nothing strong: keep the best few weak pairs (by anchor score) rather than none.
+                crate::align::common::sort_pairs_by_key(&mut self.anchors, &mut self.sort_scratch, |AnchorPair(a_fwd, a_rev)| {
+                    -(a_fwd.as_ref().map_or(0, |a| StdAnchorScore::score(a)) + a_rev.as_ref().map_or(0, |a| StdAnchorScore::score(a)))
+                });
+                self.anchors.truncate(self.gate_keep);
+            }
+        }
 
         // std's stable sort, in place: ~17 pairs of ~200 bytes a read on a marker DB, and
         // glidesort's scratch buffer and merges were a tenth of such a run. Same order.
