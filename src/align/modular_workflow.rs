@@ -394,6 +394,10 @@ pub struct FastHitScratch {
     votes: Vec<(u64, i64, bool, u32)>,
     cands_fwd: Vec<FastCand>,
     cands_rev: Vec<FastCand>,
+    /// Probe bookkeeping: attempts, successes, and whether the path is still on for this worker.
+    tried: u32,
+    succeeded: u32,
+    off: bool,
 }
 
 /// One candidate placement of a mate on the fast-hit path: the read lies gapless on
@@ -891,6 +895,14 @@ pub struct ModularPE<
     pub fast: FastHitScratch,
 }
 
+/// How many pairs a worker tries the fast-hit path on before judging it, and the success rate
+/// (in fifths) it must reach to stay on. On a marker-gene reference only a few % of pairs have
+/// any home, so nearly every attempt falls through and the attempt itself is pure overhead
+/// (~5% of a run); on a whole-genome reference three quarters succeed. A worker that measured
+/// less than one success in five switches the path off for the rest of its run.
+const FAST_HIT_PROBE: u32 = 4096;
+const FAST_HIT_MIN_FIFTHS: u32 = 1;
+
 impl<
         'a,
         const C: usize,
@@ -932,7 +944,7 @@ impl<
         stats.time_get_kmers += duration;
 
         // The fast-hit path: a pair pinned by its unique k-mers is written here and never seeded.
-        if self.options.args.fast_hit && self.output.has_b() {
+        if self.options.args.fast_hit_on() && !self.fast.off && self.output.has_b() {
             let done = fast_hit_pair::<C, F, RE, SO, D>(
                 &self.options.args,
                 self.db,
@@ -948,9 +960,15 @@ impl<
                 self.output.b.as_mut().unwrap(),
                 stats,
             );
+            self.fast.tried += 1;
             if done {
+                self.fast.succeeded += 1;
                 stats.fast_hit_pairs += 1;
                 return;
+            }
+            if self.fast.tried == FAST_HIT_PROBE && self.fast.succeeded * 5 < FAST_HIT_PROBE * FAST_HIT_MIN_FIFTHS {
+                self.fast.off = true;
+                stats.fast_hit_workers_off += 1;
             }
         }
 

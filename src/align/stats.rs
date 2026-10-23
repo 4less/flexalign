@@ -125,6 +125,8 @@ pub struct Stats {
     pub fast_hit_off_reference: usize,
     pub fast_hit_mismatches: usize,
     pub fast_hit_unpaired: usize,
+    /// Workers that switched the fast-hit path off after the probe (see FAST_HIT_PROBE).
+    pub fast_hit_workers_off: usize,
     pub rescue_succeeded: usize,
     /// Why a rescue did not happen or was refused. `skipped_weak` is the anchored side failing the
     /// quality gate (its position is not worth trusting); `rejected_ambiguous` is the scan finding a
@@ -246,6 +248,7 @@ impl Stats {
             ("fast_hit_off_reference",      self.fast_hit_off_reference as f64, "count"),
             ("fast_hit_mismatches",         self.fast_hit_mismatches as f64, "count"),
             ("fast_hit_unpaired",           self.fast_hit_unpaired as f64, "count"),
+            ("fast_hit_workers_off",        self.fast_hit_workers_off as f64, "count"),
             ("rescue_succeeded",            self.rescue_succeeded as f64, "count"),
             ("rescue_skipped_weak",         self.rescue_skipped_weak as f64, "count"),
             ("rescue_rejected_ambiguous",   self.rescue_rejected_ambiguous as f64, "count"),
@@ -364,6 +367,7 @@ impl Merge for Stats {
         self.fast_hit_off_reference += other.fast_hit_off_reference;
         self.fast_hit_mismatches += other.fast_hit_mismatches;
         self.fast_hit_unpaired += other.fast_hit_unpaired;
+        self.fast_hit_workers_off += other.fast_hit_workers_off;
         self.rescue_succeeded += other.rescue_succeeded;
         self.rescue_skipped_weak += other.rescue_skipped_weak;
         self.rescue_rejected_ambiguous += other.rescue_rejected_ambiguous;
@@ -439,6 +443,7 @@ impl Display for Stats {
             ....mates off the reference end.............{:?}\n\
             ....mates over the mismatch cap.............{:?}\n\
             ....pairs whose mates did not pair..........{:?}\n\
+            ....workers that switched it off (probe)....{:?}\n\
             Mate rescue attempted.......................{:?}\n\
             Mate rescue succeeded.......................{:?}\n\
             ....skipped, anchored side too weak.........{:?}\n\
@@ -518,6 +523,7 @@ impl Display for Stats {
             self.fast_hit_off_reference,
             self.fast_hit_mismatches,
             self.fast_hit_unpaired,
+            self.fast_hit_workers_off,
             self.rescue_attempted,
             self.rescue_succeeded,
             self.rescue_skipped_weak,
@@ -608,6 +614,7 @@ impl Default for Stats {
             fast_hit_off_reference: 0,
             fast_hit_mismatches: 0,
             fast_hit_unpaired: 0,
+            fast_hit_workers_off: 0,
             rescue_succeeded: 0,
             rescue_skipped_weak: 0,
             rescue_rejected_ambiguous: 0,

@@ -139,8 +139,16 @@ pub struct Args {
     /// and the pair is written as two gapless records without seeding, anchoring or alignment,
     /// with MAPQ from the vote margin over the runner-up locus as the full path scores anchors.
     /// Everything else takes the full path. Modelled on protal 2.0's sparse-first gate.
+    /// On by default; `--no-fast-hit` turns it off. Each worker probes it on its first 4096 pairs
+    /// and switches it off for the rest of its run when fewer than one in five succeed (a
+    /// marker-gene reference, where few reads have any home), so it costs nothing where it does
+    /// not pay. (`--fast-hit` is accepted and means the default.)
     #[arg(long = "fast-hit", action)]
     pub fast_hit: bool,
+
+    /// Never take the fast-hit path: every pair goes through seeding, anchoring and alignment.
+    #[arg(long = "no-fast-hit", action, conflicts_with = "fast_hit")]
+    pub no_fast_hit: bool,
 
     /// Most mismatches a fast-hit mate may carry (`--fast-hit`).
     #[arg(long = "fast-hit-max-mismatch", default_value_t = 6)]
@@ -363,6 +371,11 @@ impl Args {
     /// Should this run emit SAM? SAM is the default, but the single-end pipeline never runs gapped
     /// alignment and so has no CIGAR to put in a record -- there PAF is the only possible output,
     /// not a preference. Resolved here so the format is decided once rather than at each writer.
+    /// Whether the fast-hit path is on (default yes; `--no-fast-hit` turns it off).
+    pub fn fast_hit_on(&self) -> bool {
+        !self.no_fast_hit
+    }
+
     pub fn emit_sam(&self) -> bool {
         !self.paf && !self.single_end()
     }
