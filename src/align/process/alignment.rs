@@ -1,5 +1,5 @@
 
-use libwfa2::affine_wavefront::{AffineWavefronts, AlignmentSpan, AlignmentStatus};
+use libwfa2::affine_wavefront::{AffineWavefronts, AlignmentSpan, AlignmentStatus, HeuristicStrategy};
 
 use crate::align::{common::{penalties, Align, Heuristic, Status}, sam::Cigar};
 
@@ -80,33 +80,11 @@ unsafe impl Send for LIBWFA2Alignment{}
 
 impl Clone for LIBWFA2Alignment {
     fn clone(&self) -> Self {
-        // Penalties must be carried over explicitly. `AffineWavefronts::default()` comes up with
-        // WFA2-lib's built-in scheme (mismatch 4, gap 6/2), *not* ours -- and since the whole
-        // pipeline struct is cloned once per worker thread, a clone that forgets them leaves every
-        // thread but one scoring on a different scale than `align_middle`, which charges
-        // `penalties::MISMATCH` in Rust. That produced per-thread-varying scores for identical
-        // alignments. It went unnoticed while the configured penalties happened to equal WFA2-lib's
-        // defaults; it stops being invisible the moment they differ.
-        let p = unsafe { *self.aligner.aligner() }.penalties;
-        let mut new_aligner = AffineWavefronts::with_penalties(
-            p.match_,
-            p.mismatch,
-            p.gap_opening1,
-            p.gap_extension1,
-        );
-
-        new_aligner.set_alignment_scope(self.aligner.get_alignment_scope());
-        new_aligner.set_alignment_span(self.aligner.get_alignment_span());
-        new_aligner.set_memory_mode(self.aligner.get_memory_mode());
-        
-        self.aligner.get_heuristics().iter().for_each(|h| {
-            new_aligner.set_heuristic(h);
-        });
-
-        new_aligner.set_max_alignment_score(self.aligner.get_max_alignment_steps());
-
+        // libwfa2 >= 0.1.2 clones into a new C aligner with all settings (penalties, scope, span,
+        // memory mode, heuristic, max steps). The pipeline struct is cloned once per worker thread,
+        // so every thread must score exactly like the original.
         Self {
-            aligner: new_aligner,
+            aligner: self.aligner.clone(),
             cigar: self.cigar.clone(),
             span: self.span,
         }
@@ -181,8 +159,11 @@ impl LIBWFA2Alignment {
     }
 
     pub fn with_penalties(match_: i32, mismatch: i32, gap_opening: i32, gap_extension: i32) -> Self {
+        let mut aligner = AffineWavefronts::with_penalties(match_, mismatch, gap_opening, gap_extension);
+        // WFA2-lib's default WF-adaptive heuristic would prune wavefronts: align exactly.
+        aligner.set_heuristic(&HeuristicStrategy::None);
         Self {
-            aligner: AffineWavefronts::with_penalties(match_, mismatch, gap_opening, gap_extension),
+            aligner,
             cigar: Cigar(Vec::new()),
             span: None,
         }
@@ -210,6 +191,8 @@ impl Default for LIBWFA2Alignment {
             penalties::GAP_OPENING,
             penalties::GAP_EXTENSION,
         );
+        // WFA2-lib's default WF-adaptive heuristic would prune wavefronts: align exactly.
+        aligner.set_heuristic(&HeuristicStrategy::None);
         // aligner.set_heuristic(&HeuristicStrategy::XDrop { xdrop: std::i32::MIN, score_steps: 2 });
         // aligner.set_heuristic(&HeuristicStrategy::BandedStatic { band_min_k: -1, band_max_k: 1 });
         aligner.set_alignment_scope(libwfa2::affine_wavefront::AlignmentScope::Alignment);
