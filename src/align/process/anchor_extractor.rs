@@ -610,7 +610,9 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
 
 
-        glidesort::sort_by_key(&mut self.anchors, |AnchorPair(a_fwd, a_rev)| {
+        // std's stable sort, in place: ~17 pairs of ~200 bytes a read on a marker DB, and
+        // glidesort's scratch buffer and merges were a tenth of such a run. Same order.
+        self.anchors.sort_by_key(|AnchorPair(a_fwd, a_rev)| {
             let s1 = a_fwd.as_ref().map_or(0, |a| StdAnchorScore::score(a));
             let s2 = a_rev.as_ref().map_or(0, |a| StdAnchorScore::score(a));
 

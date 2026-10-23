@@ -146,15 +146,19 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
         // The first thing done with each anchor is comparing its seeds against the reference, a
         // random access into a multi-GB mmap that misses every cache level. Issue the loads for
         // every anchor up front so they overlap instead of each stalling the loop in turn.
+        let read_len = rec_fwd.seq().len().max(rec_rev.seq().len());
         for AnchorPair(a_fwd, a_rev) in anchors.iter() {
             for a in [a_fwd, a_rev].into_iter().flatten() {
                 if let Some(reference) = self.db.get_reference(a.reference as usize) {
-                    if let (Some(first), Some(last)) = (a.seeds.first(), a.seeds.last()) {
-                        for seed in [first, last] {
-                            let r = seed.rrange();
-                            if r.end <= reference.len() {
-                                prefetch(&reference[r.start..]);
-                            }
+                    if let Some(first) = a.seeds.first() {
+                        // The screen compares the whole read on the first seed's diagonal:
+                        // touch every line of that window.
+                        let start = (first.rpos as usize).saturating_sub(first.qpos as usize);
+                        let end = (start + read_len).min(reference.len());
+                        let mut off = start;
+                        while off < end {
+                            prefetch(&reference[off..]);
+                            off += 64;
                         }
                     }
                 }
