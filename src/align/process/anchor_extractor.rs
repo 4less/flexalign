@@ -567,6 +567,12 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
             }
         }
 
+        // The loop clears these at the top of each iteration, but the trailing group is handled out
+        // here. Without this, anchors a preceding cross-product left behind are re-emitted as
+        // single-mate candidates -- duplicating a mate of a full pair, which then outranks it.
+        self.anchors_fwd.clear();
+        self.anchors_rev.clear();
+
         if current_idx < self.groups.len() {
             let current = &self.groups[current_idx];
             if current.forward {
@@ -620,5 +626,41 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
     fn retrieve_mut(&mut self) -> &mut [AnchorPair] {
         &mut self.anchors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Three seeds on one diagonal: a single anchor at `rpos` on reference `rval`.
+    fn locus(rval: u64, rpos: u64) -> Vec<Seed> {
+        (0..3u32)
+            .map(|i| Seed { rpos: rpos + 40 * i as u64, rval, qpos: 40 * i, mismatch: 0, length: 31, flag: 0 })
+            .collect()
+    }
+
+    #[test]
+    fn trailing_group_does_not_reemit_leftover_anchors() {
+        // Mate 2 has two loci on ref 1 (forcing the cross-product branch, which pairs only the near
+        // one and leaves both in its buffer) and the LAST group is mate 2 alone on ref 3.
+        let seeds_fwd = locus(1, 1_200);
+        let mut seeds_rev = locus(1, 1_000);
+        seeds_rev.extend(locus(1, 500_000));
+        seeds_rev.extend(locus(3, 7_000));
+
+        let mut ex = StdPairedAnchorExtractor::new();
+        let mut stats = Stats::default();
+        let anchors = ex.generate(&seeds_fwd, &seeds_rev, 150, 150, &mut stats);
+
+        let lone_on_ref1 = anchors
+            .iter()
+            .filter(|AnchorPair(a, b)| a.is_none() && b.as_ref().is_some_and(|b| b.reference == 1))
+            .count();
+        assert_eq!(lone_on_ref1, 0, "ref-1 anchors leaked into the trailing single-mate group");
+        assert!(anchors.iter().any(|AnchorPair(a, b)| a.is_some() && b.is_some()));
+        assert!(anchors
+            .iter()
+            .any(|AnchorPair(a, b)| a.is_none() && b.as_ref().is_some_and(|b| b.reference == 3)));
     }
 }
