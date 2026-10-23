@@ -164,11 +164,19 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
         let n_smers = n - S + 1;
         self.fwd.resize(n_smers, 0);
         self.rev.resize(n_smers, 0);
-        {
+        let mut done = 0usize;
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if S == 4 {
+            // 16 s-mers a step: codes of 19 bases via a nibble shuffle, validated against the four
+            // letters, widened to 16-bit lanes and combined from four shifted loads.
+            done = unsafe { smers4_avx2(seq, self.fwd.as_mut_slice(), self.rev.as_mut_slice()) };
+        }
+        if done < n_smers {
             let (fwd, rev) = (self.fwd.as_mut_slice(), self.rev.as_mut_slice());
             let (mut f, mut r) = (0u32, 0u32);
             let mut run = 0usize;
-            for (i, &b) in seq.iter().enumerate() {
+            // Resume the recurrence at base `done`: the s-mer at `done` needs bases done..done+S.
+            for (i, &b) in seq.iter().enumerate().skip(done) {
                 let code = CODE[b as usize] as u32;
                 if code > 3 {
                     run = 0;
@@ -177,9 +185,7 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
                     f = ((f << 2) | code) & Self::SMASK;
                     r = (r >> 2) | ((3 - code) << Self::STOP);
                 }
-                if i + 1 >= S {
-                    // 0 where the window holds a non-ACGT base: such windows lie only inside
-                    // k-mers pass 2 skips, so they are never consulted.
+                if i + 1 >= S + done {
                     let ok = run >= S;
                     // SAFETY: i + 1 - S < n - S + 1 = n_smers.
                     unsafe {
@@ -239,6 +245,52 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
         stats.minimizer += self.kmers.len();
         &self.kmers
     }
+}
+
+/// The forward and reverse-complement 4-mer value at 16 positions a step, as long as 32 bases
+/// remain, 0 where a window holds a non-ACGT base. Returns how many
+/// positions were written; the caller finishes the tail with the scalar recurrence.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn smers4_avx2(seq: &[u8], fwd: &mut [u16], rev: &mut [u16]) -> usize {
+    use std::arch::x86_64::*;
+    let n = seq.len();
+    if n < 32 {
+        return 0;
+    }
+    // low nibble -> code: A(0x41)->0, C(0x43)->1, G(0x47)->2, T(0x54)->3; anything else is
+    // caught by the exact-letter comparison below.
+    let table = _mm_setr_epi8(0, 0, 0, 1, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0);
+    let nib = _mm_set1_epi8(0x0f);
+    let (la, lc, lg, lt) = (_mm_set1_epi8(b'A' as i8), _mm_set1_epi8(b'C' as i8), _mm_set1_epi8(b'G' as i8), _mm_set1_epi8(b'T' as i8));
+    let three = _mm256_set1_epi16(3);
+    let mut p = 0usize;
+    while p + 32 <= n {
+        // bases p..p+16 and p+16..p+32 as codes (u8) and validity (0xff where ACGT); the views
+        // at offsets 1, 2, 3 come from the concatenation (alignr takes the LOW half second).
+        let raw0 = _mm_loadu_si128(seq.as_ptr().add(p) as *const __m128i);
+        let raw1 = _mm_loadu_si128(seq.as_ptr().add(p + 16) as *const __m128i);
+        let code = |v: __m128i| _mm_shuffle_epi8(table, _mm_and_si128(v, nib));
+        let valid = |v: __m128i| _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, la), _mm_cmpeq_epi8(v, lc)), _mm_or_si128(_mm_cmpeq_epi8(v, lg), _mm_cmpeq_epi8(v, lt)));
+        let (c0, v0) = (code(raw0), valid(raw0));
+        let (ch, vh) = (code(raw1), valid(raw1));
+        let c1 = _mm_alignr_epi8(ch, c0, 1);
+        let c2 = _mm_alignr_epi8(ch, c0, 2);
+        let c3 = _mm_alignr_epi8(ch, c0, 3);
+        let v1 = _mm_alignr_epi8(vh, v0, 1);
+        let v2 = _mm_alignr_epi8(vh, v0, 2);
+        let v3 = _mm_alignr_epi8(vh, v0, 3);
+        // widen to 16 lanes of u16
+        let w = |v: __m128i| _mm256_cvtepu8_epi16(v);
+        let (w0, w1, w2, w3) = (w(c0), w(c1), w(c2), w(c3));
+        let f = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi16(w0, 6), _mm256_slli_epi16(w1, 4)), _mm256_or_si256(_mm256_slli_epi16(w2, 2), w3));
+        let r = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi16(_mm256_sub_epi16(three, w3), 6), _mm256_slli_epi16(_mm256_sub_epi16(three, w2), 4)), _mm256_or_si256(_mm256_slli_epi16(_mm256_sub_epi16(three, w1), 2), _mm256_sub_epi16(three, w0)));
+        let ok = _mm256_cvtepi8_epi16(_mm_and_si128(_mm_and_si128(v0, v1), _mm_and_si128(v2, v3)));
+        _mm256_storeu_si256(fwd.as_mut_ptr().add(p) as *mut __m256i, _mm256_and_si256(f, ok));
+        _mm256_storeu_si256(rev.as_mut_ptr().add(p) as *mut __m256i, _mm256_and_si256(r, ok));
+        p += 16;
+    }
+    p
 }
 
 impl<const K: usize, const C: usize, const S: usize, const L: usize> KmerExtractor<K>
