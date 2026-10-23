@@ -17,8 +17,18 @@ pub fn set_stage_timing(on: bool) {
     STAGE_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Always measures: for the few one-off timings (index and reference load).
 #[inline]
 pub fn time<F, T>(f: F) -> (Duration, T)
+    where F: FnOnce() -> T {
+    let start: Instant = Instant::now();
+    let result = f();
+    (start.elapsed(), result)
+}
+
+/// Measures only when the stage timers are on: for the per-read pipeline stages.
+#[inline]
+pub fn stage_time<F, T>(f: F) -> (Duration, T)
     where F: FnOnce() -> T {
     if !STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
         return (Duration::ZERO, f());

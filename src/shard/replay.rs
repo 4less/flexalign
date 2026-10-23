@@ -12,7 +12,7 @@ use flexmap::VD;
 
 use crate::align::data_structures::common::Seed;
 use crate::align::process::seed_extractor::{walk_ranges, RangeVerdict, SeedRange};
-use crate::flexalign::time;
+use crate::flexalign::stage_time;
 
 use super::record::{GroupRecord, RangeRecord};
 
@@ -107,7 +107,7 @@ impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F
             &mut self.seeds,
         );
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             glidesort::sort_by_key(&mut self.seeds, |seed: &Seed| (seed.rval, seed.rpos));
         });
         *time_sorting += duration;

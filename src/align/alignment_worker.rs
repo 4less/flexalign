@@ -82,7 +82,7 @@ impl<'a, const C: usize, const S: usize, const L: usize> FnMut<(&'_ RefFastqReco
         }
         
 
-        let (duration, _) = time(|| seedlist.sort_unstable());
+        let (duration, _) = stage_time(|| seedlist.sort_unstable());
         
         stats.seeds_fwd += seedlist.len();
         stats.time_seed_sorting_fwd += duration;

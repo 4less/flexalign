@@ -7,7 +7,7 @@ use crate::{
         common::{Print},
     },
     database::common::FlexalignDatabase,
-    flexalign::time,
+    flexalign::stage_time,
     options::Options,
     GOLDSTD_EVAL, STAGE_TRACE,
 };
@@ -779,17 +779,17 @@ impl<
     pub fn run(&mut self, rec: &RefFastqRecord, stats: &mut Stats) -> () {
         stats.reads_processed += 1;
 
-        let (duration, kmers) = time(|| self.kmer_extractor.generate(rec, stats));
+        let (duration, kmers) = stage_time(|| self.kmer_extractor.generate(rec, stats));
         stats.time_get_kmers += duration;
 
-        let (duration, ranges) = time(|| self.range_extractor.generate(kmers, rec, stats));
+        let (duration, ranges) = stage_time(|| self.range_extractor.generate(kmers, rec, stats));
         stats.time_get_ranges += duration;
 
-        let (duration, seeds) = time(|| self.seed_extractor.generate(ranges, stats));
+        let (duration, seeds) = stage_time(|| self.seed_extractor.generate(ranges, stats));
         stats.time_range_header += duration;
         stats.seeds += seeds.len();
 
-        let (duration, anchors) = time(|| {
+        let (duration, anchors) = stage_time(|| {
             self.anchor_extractor
                 .generate(seeds, rec.seq().len(), stats)
         });
@@ -803,13 +803,13 @@ impl<
             return;
         }
 
-        let (_duration, _) = time(|| {
+        let (_duration, _) = stage_time(|| {
             anchors.sort_unstable_by_key(|a| {
                 -((a.core_matches() - a.mismatches as usize - a.indels()) as i64)
             });
         });
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             rec.reverse_complement(&mut self.rec_rev);
         });
         stats.time_reverse_complement += duration;
@@ -975,9 +975,9 @@ impl<
         log::trace!("{}\n{}", rec_fwd.to_string(), rec_rev.to_string());
 
         // Extract minimizer
-        let (duration, kmers_fwd) = time(|| self.kmer_extractor_fwd.generate(rec_fwd, stats));
+        let (duration, kmers_fwd) = stage_time(|| self.kmer_extractor_fwd.generate(rec_fwd, stats));
         stats.time_get_kmers += duration;
-        let (duration, kmers_rev) = time(|| self.kmer_extractor_rev.generate(rec_rev, stats));
+        let (duration, kmers_rev) = stage_time(|| self.kmer_extractor_rev.generate(rec_rev, stats));
         stats.time_get_kmers += duration;
 
         // The fast-hit path: a pair pinned by its unique k-mers is written here and never seeded.
@@ -1006,11 +1006,11 @@ impl<
 
         // Get ranges from minimizers
         let (duration, ranges_fwd) =
-            time(|| self.range_extractor_fwd.generate(kmers_fwd, rec_fwd, stats));
+            stage_time(|| self.range_extractor_fwd.generate(kmers_fwd, rec_fwd, stats));
 
         stats.time_get_ranges += duration;
         let (duration, ranges_rev) =
-            time(|| self.range_extractor_rev.generate(kmers_rev, rec_rev, stats));
+            stage_time(|| self.range_extractor_rev.generate(kmers_rev, rec_rev, stats));
         stats.time_get_ranges += duration;
 
         log::trace!(
@@ -1210,9 +1210,9 @@ impl<
         // Taken out of the extractors (not copied) for the duration of the `&mut self` call below,
         // and put back afterwards so their capacity is reused: two `to_vec()` per pair were a
         // visible share of the allocator time.
-        let (duration, _) = time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats));
+        let (duration, _) = stage_time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats));
         stats.time_range_header += duration;
-        let (duration, _) = time(|| self.seed_extractor_rev.generate(ranges_rev, stats));
+        let (duration, _) = stage_time(|| self.seed_extractor_rev.generate(ranges_rev, stats));
         stats.time_range_header += duration;
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
@@ -1301,7 +1301,7 @@ impl<
         //     eprintln!("R: {}", String::from_utf8_lossy(&reference[seed.reference_range()]));
         // }
 
-        let (duration, anchors) = time(|| {
+        let (duration, anchors) = stage_time(|| {
             self.anchor_extractor.generate(
                 seeds_fwd,
                 seeds_rev,
@@ -1390,7 +1390,7 @@ impl<
         // Between query and reference is done
         // ######################################################################################################
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             rec_fwd.reverse_complement(&mut self.rec_fwd_revc);
             rec_rev.reverse_complement(&mut self.rec_rev_revc);
         });
@@ -1513,7 +1513,7 @@ impl<
             stats.funnel_true_in_screen_mates += holds_truth_mates(&anchors[0..screen_z]);
         }
         let pair_bonus = self.options.args.proper_pair_bonus;
-        let (duration, extended_count) = time(|| {
+        let (duration, extended_count) = stage_time(|| {
             let extended_count = self.anchor_extender.extend(
                 &mut anchors[0..extend_top_z],
                 rec_fwd,
@@ -1756,7 +1756,7 @@ impl<
         // Hoisted out of the closure below, which mutably borrows `self.align`.
         let min_ani = self.options.args.min_ani;
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             let mut min_score_1 = None;
             let mut min_score_2 = None;
 
@@ -1836,7 +1836,7 @@ impl<
                                 }
 
                                 // let (qr, rr) = a.whole(query.len(), reference.len());
-                                // let (duration, (score, cigar, status)) = time(|| self.align.align(&query[qr], &reference[rr]));
+                                // let (duration, (score, cigar, status)) = stage_time(|| self.align.align(&query[qr], &reference[rr]));
 
                                 match status {
                                     super::common::Status::OK => stats.alignments_successful += 1,
@@ -1925,7 +1925,7 @@ impl<
                                 }
 
                                 // let (qr, rr) = a.whole(query.len(), reference.len());
-                                // let (duration, (score, cigar, status)) = time(|| self.align.align(&query[qr], &reference[rr]));
+                                // let (duration, (score, cigar, status)) = stage_time(|| self.align.align(&query[qr], &reference[rr]));
 
                                 match status {
                                     super::common::Status::OK => stats.alignments_successful += 1,

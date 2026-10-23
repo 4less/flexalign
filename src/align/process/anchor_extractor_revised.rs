@@ -12,7 +12,7 @@ use crate::{
         data_structures::{anchor::{Anchor, SeedGroupPaired}, common::Seed},
         stats::{Stats},
     },
-    flexalign::time,
+    flexalign::stage_time,
 };
 
 
@@ -332,7 +332,7 @@ impl AnchorExtractor for StdAnchorExtractor {
         //TODO: Revisit and check function
         let max_size = seed_group_indices_module(seeds, &mut self.groups);
 
-        let (_duration, _) = time(|| {
+        let (_duration, _) = stage_time(|| {
             glidesort::sort_by_key(&mut self.groups, |(start, end)| {
                 -1i32 * (end - start) as i32
             });

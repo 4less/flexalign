@@ -1,6 +1,6 @@
 
 
-use crate::{align::{common::SeedExtractor, data_structures::common::Seed, stats::Stats}, flexalign::time};
+use crate::{align::{common::SeedExtractor, data_structures::common::Seed, stats::Stats}, flexalign::stage_time};
 
 use super::range_extractor::Range;
 
@@ -275,7 +275,7 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
         stats.seeds += self.seeds.len();
 
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             // std's stable sort: a read's seeds are few, and it sorts them in place without the
             // scratch buffer glidesort allocates per call. Same order (both stable).
             self.seeds.sort_by_key(|seed: &Seed| {

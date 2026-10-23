@@ -1,7 +1,7 @@
 use std::{fs::File, io::{self}, path::PathBuf, str::FromStr, sync::{Arc, Mutex}};
 
 use bioreader::{fastq_byte_reader::FastqPairedByteReader, fastq_reader::PairedFastqReader, parallel::fastq::{read_fastq_paired_end_state_par, read_fastq_single_end_state_par}, sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord}, utils::is_gzip};
-use flate2::read::GzDecoder;
+use flate2::read::{GzDecoder, MultiGzDecoder};
 use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 use log::info;
 
@@ -13,7 +13,7 @@ use crate::{
         }, 
         stats::Stats, 
         workflow
-    }, database::common::FlexalignDatabase, io::output_buffer::{OutputBuffer, OutputTarget}, options::Options};
+    }, database::common::FlexalignDatabase, io::{output_buffer::{OutputBuffer, OutputTarget}, threaded_reader::ThreadedReader}, options::Options};
 
 
 /// Where the false-positive reads of `reads_file` are written (gold-standard evaluation only).
@@ -388,9 +388,11 @@ pub fn process_fastq_wrapper_modular<
 
 
                 if fwd_gzip {
+                    // Each mate file is inflated on a thread of its own, ahead of the workers
+                    // (io::threaded_reader): under the shared reader lock the inflate starved them.
                     stats = read_fastq_paired_end_state_par(
-                        GzDecoder::new(file_fwd),
-                        GzDecoder::new(file_rev),
+                        ThreadedReader::new(MultiGzDecoder::new(file_fwd)),
+                        ThreadedReader::new(MultiGzDecoder::new(file_rev)),
                         READ_BATCH_BYTES,
                         options.args.threads,
                         state,

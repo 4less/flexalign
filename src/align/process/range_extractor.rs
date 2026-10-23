@@ -67,7 +67,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         self.sorted.extend(self.order.iter().map(|&(_, i)| self.ranges[i as usize].clone()));
         std::mem::swap(&mut self.ranges, &mut self.sorted);
         
-        // let (duration, _) = time(|| self.ranges.sort_unstable_by_key(|r| r.2.positions.len()));
+        // let (duration, _) = stage_time(|| self.ranges.sort_unstable_by_key(|r| r.2.positions.len()));
         // stats.time_range_sorting += duration;
         stats.ranges += self.ranges.len();
 

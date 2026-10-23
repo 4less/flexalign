@@ -6,7 +6,7 @@ use bioreader::sequence::fastq_record::{print_color_qualities, OwnedFastqRecord,
 use kmerrs::{consecutive::kmer::{Kmer, KmerIter}, minimizer::context_free::Minimizer};
 use colored::Colorize;
 
-use crate::{database::common::FlexalignDatabase, flexalign::time, io::output_buffer::OutputBuffer, options::Options};
+use crate::{database::common::FlexalignDatabase, flexalign::stage_time, io::output_buffer::OutputBuffer, options::Options};
 
 use super::data_structures::common::Seed;
 use super::data_structures::anchor::Anchor;
@@ -105,12 +105,12 @@ impl<
         // }
         // eprintln!("---------");
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             self.seeds_to_anchors(stats, rec.seq().len());
         });
         stats.time_get_anchors += duration;
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             self.anchors.sort_unstable_by_key(|a| {
                 - ((a.core_matches() - a.mismatches as usize - a.indels()) as i64)
             });
@@ -125,7 +125,7 @@ impl<
             return
         }
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             rec.reverse_complement(&mut self.rev_rec);
         });
         stats.time_reverse_complement += duration;
@@ -133,13 +133,13 @@ impl<
 
         let extend_anchors = true;
         if extend_anchors {
-            let (duration, _) = time(|| {
+            let (duration, _) = stage_time(|| {
                 self.extend_anchors(rec);
             });
             stats.time_hamming_screen += duration;
         }
 
-        // let (duration, _) = time(|| {
+        // let (duration, _) = stage_time(|| {
         //     for anchor in &self.anchors {
         //         let sane = self.sanity_check_anchor(&anchor, rec, &self.rev_rec);
         //         if !sane { 
@@ -505,7 +505,7 @@ impl<
         &mut self, stats: &mut Stats
     ) -> () {
         eprintln!("Get seeds");
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             // eprintln!("----------------- Get Ranges....");
             let (_ranges, _discarded_max_flex_count) = self.retrieve_seeds(
                 self.options.args.max_best_flex,
@@ -530,7 +530,7 @@ impl<
         stats.time_range_header += duration;
         stats.seeds += self.seeds.len();
 
-        let (duration, _) = time(|| {
+        let (duration, _) = stage_time(|| {
             glidesort::sort_by_key(&mut self.seeds, |seed: &Seed| {
                 (seed.rval, seed.rpos)//, seed.length) // seed.offset
             });
@@ -570,7 +570,7 @@ impl<
 
             let fmer = kmer.flanks::<F>();
 
-            let (duration, result) = time(|| self.db.get_vrange(cmer.0));
+            let (duration, result) = stage_time(|| self.db.get_vrange(cmer.0));
             stats.time_get_ranges += duration;
 
             let range: flexmap::range::AnyRange<'a> = match result {
@@ -585,7 +585,7 @@ impl<
         }
 
 
-        let (duration, _) = time(|| self.sort_ranges(stats));
+        let (duration, _) = stage_time(|| self.sort_ranges(stats));
         stats.ranges += self.ranges.len();
         stats.time_range_sorting += duration;
         
