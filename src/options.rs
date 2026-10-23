@@ -146,18 +146,30 @@ pub struct Args {
     #[arg(long = "fast-hit", action)]
     pub fast_hit: bool,
 
-    /// Drop candidate anchors that rest on a single core-only seed: an anchor pair is kept only
-    /// if one of its anchors has at least two seeds or an exact full-k-mer seed. Modelled on
-    /// protal 2.0's threshold-score gate. NOT lossless: it trades a little sensitivity for the
-    /// screening and alignment of spurious anchors, which on a marker-gene reference is most of
-    /// the work. Off by default; measure before using.
-    #[arg(long = "anchor-gate", action)]
+    /// The anchor gate is on by default; this turns it off. An anchor pair is kept only if one
+    /// of its anchors has two seeds, an exact full-k-mer seed, or a lone core-only seed whose
+    /// flanks mismatch the read in at most `--anchor-gate-flank` bases. Modelled on protal 2.0's
+    /// threshold-score gate; the flank rule is what keeps it lossless -- a chance 15-mer match
+    /// has ~12 of 16 flank bases wrong, a real read with errors a few. Measured: the reduced
+    /// marker DB keeps every correct mate and runs 11% fewer instructions; bacteroides is
+    /// identical; the 5 GB mixed set places 8 more correct and 2 more wrong of 4 M mates.
+    #[arg(long = "no-anchor-gate", action)]
+    pub no_anchor_gate: bool,
+
+    /// Accepted and ignored: the gate is the default now (`--no-anchor-gate` turns it off).
+    #[arg(long = "anchor-gate", action, hide = true)]
     pub anchor_gate: bool,
 
-    /// With `--anchor-gate`: when no anchor pair of a read passes, keep this many of the best
-    /// weak ones instead of none (0 drops the read).
+    /// When no anchor pair of a read passes the gate, keep this many of the best weak ones
+    /// instead of none (0 drops the read).
     #[arg(long = "anchor-gate-keep", default_value_t = 0)]
     pub anchor_gate_keep: usize,
+
+    /// A lone core-only seed passes the anchor gate when its flanks mismatch the read in at
+    /// most this many bases (a chance 15-mer match has ~12 of 16 wrong; a real read with errors
+    /// has a few). 16 lets every lone seed through.
+    #[arg(long = "anchor-gate-flank", default_value_t = 6)]
+    pub anchor_gate_flank: u32,
 
     /// Never take the fast-hit path: every pair goes through seeding, anchoring and alignment.
     #[arg(long = "no-fast-hit", action, conflicts_with = "fast_hit")]

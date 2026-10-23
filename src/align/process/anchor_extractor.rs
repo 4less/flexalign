@@ -44,6 +44,8 @@ pub struct StdPairedAnchorExtractor {
     pub gate_min_core: Option<usize>,
     /// `--anchor-gate-keep`: weak pairs kept when none passes.
     pub gate_keep: usize,
+    /// `--anchor-gate-flank`: flank mismatches a lone core-only seed may carry and still pass.
+    pub gate_flank: u32,
 }
 
 #[inline(always)]
@@ -368,13 +370,15 @@ impl StdPairedAnchorExtractor {
                     sort_scratch: Vec::new(),
             gate_min_core: None,
             gate_keep: 0,
+            gate_flank: 16,
         }
     }
 
     /// `--anchor-gate` with the full k-mer length as the lone-seed threshold.
-    pub fn with_gate(mut self, min_core: Option<usize>, keep: usize) -> Self {
+    pub fn with_gate(mut self, min_core: Option<usize>, keep: usize, flank: u32) -> Self {
         self.gate_min_core = min_core;
         self.gate_keep = keep;
+        self.gate_flank = flank;
         self
     }
 }
@@ -628,7 +632,8 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
         // --anchor-gate: a pair rests on something more than one core-only seed on one mate.
         if let Some(min_core) = self.gate_min_core {
-            let passes = |a: &Option<Anchor>| a.as_ref().is_some_and(|a| a.seeds.len() >= 2 || a.core_matches() >= min_core);
+            let max_flank = self.gate_flank;
+            let passes = |a: &Option<Anchor>| a.as_ref().is_some_and(|a| a.seeds.len() >= 2 || a.core_matches() >= min_core || a.mismatches <= max_flank);
             let any = self.anchors.iter().any(|AnchorPair(a_fwd, a_rev)| passes(a_fwd) || passes(a_rev));
             if any {
                 self.anchors.retain(|AnchorPair(a_fwd, a_rev)| passes(a_fwd) || passes(a_rev));
