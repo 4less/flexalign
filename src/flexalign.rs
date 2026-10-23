@@ -75,16 +75,8 @@ pub fn run(args: Args) {
     crate::database::common::EAGER_REF
         .store(!options.args.lazy_ref, std::sync::atomic::Ordering::Relaxed);
 
-    // The sharded pipeline and the slicer read the Flexmap blob; everything else uses the format
-    // asked for (the packed index by default).
-    {
-        use crate::database::common::{set_index_format, IndexFormat};
-        let sharded = options.args.shard_slice.is_some() || options.args.shards.is_some();
-        if sharded && options.args.index_format != IndexFormat::Blob {
-            eprintln!("Sharded runs and --shard-slice use the Flexmap blob (--index-format blob).");
-        }
-        set_index_format(if sharded { IndexFormat::Blob } else { options.args.index_format });
-    }
+    // The format asked for (the packed index by default), for the whole index and for shards alike.
+    crate::database::common::set_index_format(options.args.index_format);
 
     if !options.reference.exists() {
         eprintln!("Reference does not exist {:?}", options.reference);
@@ -170,7 +162,7 @@ pub fn run(args: Args) {
     if let Some(n_shards) = options.args.shard_slice {
         drop(db); // the slicer re-reads the keys file; free the in-RAM copy first
         let (duration, manifest) = time(|| {
-            crate::shard::slice::slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, n_shards)
+            crate::shard::slice::slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, n_shards, options.args.index_format)
                 .expect("slicing the index")
         });
         eprintln!(

@@ -6,7 +6,7 @@
 //!
 //! Run:
 //!   cargo +nightly run --release --example shard_slice_verify -- \
-//!       <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards>
+//!       <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards> [compact|blob]
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use flate2::read::GzDecoder;
 
 use bioreader::utils::is_gzip;
-use flexalign::database::common::{DBPaths, FlexalignDatabase};
+use flexalign::database::common::{set_index_format, DBPaths, FlexalignDatabase, IndexFormat};
 use flexalign::database::flexmap::DB;
 use flexalign::shard::acceptance::compare_seeds_with_shards;
 use flexalign::shard::slice::{slice_index, PhysicalShardDB, SliceManifest};
@@ -57,30 +57,38 @@ fn file_mib(path: &str) -> f64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        eprintln!("usage: {} <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards>", args[0]);
+        eprintln!("usage: {} <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards> [compact|blob]", args[0]);
         std::process::exit(2);
     }
     let reference = &args[1];
     let n_shards: usize = args[4].parse().expect("n_shards must be an integer");
+    let format = match args.get(5).map(String::as_str) {
+        None | Some("compact") => IndexFormat::Compact,
+        Some("blob") => IndexFormat::Blob,
+        Some(other) => panic!("unknown index format {other}"),
+    };
+    // The oracle below loads the whole index in the format the shards are cut from.
+    set_index_format(format);
     let paths = DBPaths::new(PathBuf::from(reference));
 
-    eprintln!("Slicing index into {n_shards} physical shards ...");
+    eprintln!("Slicing index into {n_shards} physical shards ({format:?}) ...");
     let manifest: SliceManifest =
-        slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&paths, n_shards).expect("slice");
+        slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&paths, n_shards, format).expect("slice");
 
-    let full_keys_mib = file_mib(&paths.index_keys_file());
-    eprintln!("  full keys : {:.1} MiB", full_keys_mib);
+    let full_file = match format {
+        IndexFormat::Blob => paths.index_blob_file(),
+        _ => paths.index_packed_file(format),
+    };
+    let full_mib = file_mib(&full_file);
+    eprintln!("  full index : {:.1} MiB ({full_file})", full_mib);
     for (i, e) in manifest.shards.iter().enumerate() {
-        eprintln!("  shard {i:>2} : blob {:>7.1} MiB  keyspace [{}, {})", file_mib(&e.blob_file), e.lo, e.hi);
+        eprintln!("  shard {i:>2} : {:>7.1} MiB  keyspace [{}, {})", file_mib(&e.file), e.lo, e.hi);
     }
-    eprintln!(
-        "  -> each pass now loads ~1/{} of the {:.1} MiB keys array instead of all of it",
-        n_shards, full_keys_mib
-    );
+    eprintln!("  -> each pass loads ~1/{} of the {:.1} MiB index instead of all of it", n_shards, full_mib);
 
     eprintln!("\nLoading full index (oracle) and physical shards ...");
     let full: FullDb = DB::load(&paths, 1);
-    let shards: Vec<Shard> = (0..manifest.shards.len()).map(|i| Shard::load(&manifest, i)).collect();
+    let shards: Vec<Shard> = (0..manifest.shards.len()).map(|i| Shard::load(&manifest, i, THREADS as usize)).collect();
 
     let reads1 = read_all(&args[2]);
     let reads2 = read_all(&args[3]);

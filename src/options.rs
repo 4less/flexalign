@@ -299,8 +299,9 @@ pub struct Args {
     /// The k-mer index to build, convert to and load. `compact` (default): flexmap's packed index,
     /// bit-packed values and a key table of the used keys only (about half the memory of the blob,
     /// faster lookups). `hashed`: the same with a line-hashed key table (one cache line a lookup,
-    /// a little more memory). `blob`: the Flexmap blob, memory-mapped; the sharded pipeline and
-    /// `--shard-slice` use it. An existing blob is converted to the packed index on first use.
+    /// a little more memory). `blob`: the Flexmap blob, memory-mapped. An existing blob is converted
+    /// to the packed index on first use. `--shard-slice` and sharded runs slice into this format
+    /// (compact or blob; a hashed index cannot be sharded).
     #[arg(long = "index-format", value_enum, default_value = "compact")]
     pub index_format: IndexFormat,
 
@@ -438,12 +439,13 @@ pub fn get_styles() -> clap::builder::Styles {
 }
 
 /// The k-mer index a run builds, converts to and loads (`--index-format`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum IndexFormat {
     /// Packed values, compact key table: the least memory.
     Compact,
     /// Packed values, line-hashed key table: one cache line a lookup, ~10 bytes a used key more.
     Hashed,
-    /// The Flexmap blob (memory-mapped); the sharded pipeline and `--shard-slice` need it.
+    /// The Flexmap blob (memory-mapped).
     Blob,
 }

@@ -23,7 +23,7 @@ they are linked to working copies (see "Local dependency linking" below).
 | ------------- | --------------------- | ----------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bioreader` | `4less/bioreader`   | `main`          | `../bioreader`                     | Buffered & parallel FASTA/FASTQ readers and sequence record types (`FastaReader`, `RefFastqRecord`, `read_fastq_*_state_par`, `is_gzip`). Drives read input in `align/process_fastq.rs`. |
 | `kmerrs`    | `4less/kmerr`       | `main`          | `../kmerr` (crate name `kmerrs`) | k-mer / syncmer / minimizer extraction (`ClosedSyncmer`, `Kmer`, `Minimizer`). Backs the `KmerExtractor` stage.                                                                            |
-| `flexmap`   | `4less/flexmap`     | `zeroable_load` | `../flexmap`                       | The flexible k-mer index itself — build, on-disk blob storage, and range lookup (`Flexmap`, `FlexmapBlob`, `VRange`, `build::default_build`). Wrapped by `database::flexmap::DB`.       |
+| `flexmap`   | `4less/flexmap`     | `main`          | `../flexmap`                       | The flexible k-mer index itself — build, on-disk blob storage, and range lookup (`Flexmap`, `FlexmapBlob`, `VRange`, `build::default_build`). Wrapped by `database::flexmap::DB`.       |
 
 ### Local dependency linking
 
@@ -160,8 +160,10 @@ construction in `src/align/process_fastq.rs`.
 `DBPaths` (the `.flex.*` file naming). `flexmap.rs` implements it over a `FlexmapStore`:
 flexmap's packed index (`--index-format compact`, the default, or `hashed`; file
 `.flex.index.compact` / `.hashed`, read into memory on all threads) or the Flexmap blob
-(`--index-format blob`, memory-mapped; the sharded pipeline and `--shard-slice` always use it). An
-existing blob is converted to the packed index on the first run that asks for it. Lookups return
+(`--index-format blob`, memory-mapped). An existing blob is converted to the packed index on the
+first run that asks for it. `--shard-slice` and sharded runs slice into the run's format: compact
+shards (`.s<n>.shard<i>.compact`, cut by flexmap's `PackedFlexmap::slice`) or blob shards; a hashed
+index cannot be sharded (its key table needs a power-of-two key space). Lookups return
 `flexmap::range::AnyRange`, which reads either index; `for_each_vrange` looks up one read's keys
 in one call so that the packed index can fetch them ahead. `build.rs` handles index
 construction. `GLOBAL_VERSION` (`src/lib.rs`) is the on-disk format version checked

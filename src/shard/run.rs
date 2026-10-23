@@ -29,6 +29,7 @@ use crate::database::flexmap::DB;
 use crate::io::output_buffer::{OutputBuffer, OutputTarget};
 use crate::options::Options;
 use crate::shard::disk::{count_batches, run_disk_rejoin_align, run_shard_pass_to_disk};
+use crate::database::common::index_format;
 use crate::shard::slice::{slice_index, PhysicalShardDB, SliceManifest};
 
 const BUFFER_SIZE: usize = 1 << 24;
@@ -87,14 +88,31 @@ pub fn run_sharded<
     // were benchmarked at 4 workers against everything else's 16 -- most of an apparent slowdown.
     let threads: u32 = options.args.threads.max(1);
 
+    let format = index_format();
+    if format == crate::database::common::IndexFormat::Hashed {
+        eprintln!(
+            "A hashed index cannot be sharded (its key table needs a power-of-two key space). \
+             Use --index-format compact (the default) or blob, or --no-shards."
+        );
+        std::process::exit(5);
+    }
     let manifest = match SliceManifest::load(&SliceManifest::path_for(paths, n_shards)) {
-        Ok(m) if m.shards.len() == n_shards => {
-            eprintln!("Reusing existing slice ({n_shards} shards)");
+        Ok(m) if m.shards.len() == n_shards && m.format == format => {
+            eprintln!("Reusing existing slice ({n_shards} shards, {format:?})");
             m
         }
+        Ok(m) if m.format != format => {
+            eprintln!(
+                "The existing {n_shards}-shard slice is {:?}, not {format:?}; slicing again. Its shard \
+                 files are left in place: {}",
+                m.format,
+                m.shards.iter().map(|s| s.file.as_str()).collect::<Vec<_>>().join(", ")
+            );
+            slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(paths, n_shards, format).expect("slice")
+        }
         _ => {
-            eprintln!("Slicing index into {n_shards} physical shards ...");
-            slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(paths, n_shards).expect("slice")
+            eprintln!("Slicing index into {n_shards} physical shards ({format:?}) ...");
+            slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(paths, n_shards, format).expect("slice")
         }
     };
 
@@ -123,7 +141,7 @@ pub fn run_sharded<
     let t_pass = Instant::now();
     for i in 0..manifest.shards.len() {
         let shard: ShardOf<C, F, CELLS_PER_BODY, HEADER_THRESHOLD> =
-            ShardOf::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&manifest, i);
+            ShardOf::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&manifest, i, threads as usize);
         for (j, s) in samples.iter().enumerate() {
             let emit = run_shard_pass_to_disk::<
                 K, C, F, S, L,
@@ -139,7 +157,7 @@ pub fn run_sharded<
                 s.r1, emit.headered, emit.headerless
             );
         }
-        // `shard` drops here (mmap unmaps), freeing it before the next shard loads.
+        // `shard` drops here (unmapped or freed), before the next shard loads.
     }
     let pass_secs = t_pass.elapsed().as_secs_f64();
 
