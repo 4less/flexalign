@@ -159,12 +159,13 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
             return &self.kmers;
         }
 
-        // Pass 1: s-mers of both strands at every position, then their window minima.
-        self.fwd.clear();
-        self.rev.clear();
-        self.fwd.reserve(n);
-        self.rev.reserve(n);
+        // Pass 1: s-mers of both strands at every position, then their window minima. Written
+        // through pre-sized slices: a push per base re-checked capacity and re-read the Vec.
+        let n_smers = n - S + 1;
+        self.fwd.resize(n_smers, 0);
+        self.rev.resize(n_smers, 0);
         {
+            let (fwd, rev) = (self.fwd.as_mut_slice(), self.rev.as_mut_slice());
             let (mut f, mut r) = (0u32, 0u32);
             let mut run = 0usize;
             for (i, &b) in seq.iter().enumerate() {
@@ -180,19 +181,24 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
                     // 0 where the window holds a non-ACGT base: such windows lie only inside
                     // k-mers pass 2 skips, so they are never consulted.
                     let ok = run >= S;
-                    self.fwd.push(if ok { f as u16 } else { 0 });
-                    self.rev.push(if ok { r as u16 } else { 0 });
+                    // SAFETY: i + 1 - S < n - S + 1 = n_smers.
+                    unsafe {
+                        *fwd.get_unchecked_mut(i + 1 - S) = if ok { f as u16 } else { 0 };
+                        *rev.get_unchecked_mut(i + 1 - S) = if ok { r as u16 } else { 0 };
+                    }
                 }
             }
         }
         window_min(&self.fwd, L, &mut self.scratch, &mut self.fwd_min);
         window_min(&self.rev, L, &mut self.scratch, &mut self.rev_min);
 
-        // Pass 2: roll the k-mers and decide each.
-        let n_smers = n - S + 1;
-        debug_assert!(self.fwd.len() == n_smers && self.fwd_min.len() == n_smers - L + 1);
-        let (fwd, rev, fwd_min, rev_min) = (&self.fwd, &self.rev, &self.fwd_min, &self.rev_min);
-        let kmers = &mut self.kmers;
+        // Pass 2: roll the k-mers and decide each. Everything the loop reads is a local slice
+        // and the output a local Vec, so nothing is re-read from `self` per base.
+        debug_assert!(self.fwd_min.len() == n_smers - L + 1);
+        let (fwd, rev) = (self.fwd.as_slice(), self.rev.as_slice());
+        let (fwd_min, rev_min) = (self.fwd_min.as_slice(), self.rev_min.as_slice());
+        let mut kmers = std::mem::take(&mut self.kmers);
+        kmers.reserve(n / 8);
         let (mut kf, mut kr) = (0u64, 0u64);
         let mut run = 0usize;
         let mut processed = 0usize;
@@ -214,8 +220,8 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
             let cmer_rev = (kr >> Self::CSHIFT) & Self::CMASK;
             let p = pos + Self::CORE_OFFSET;
             let forward = cmer_fwd < cmer_rev;
-            // In range by construction: p + L - 1 = pos + K - S - ... <= i - S + 1 < n_smers, and
-            // p <= n_smers - L (the last full window), since p + L - 1 <= i + 1 - S.
+            // In range by construction: p + L - 1 <= i + 1 - S < n_smers, and p <= n_smers - L
+            // (the last full window), since p + L - 1 <= i + 1 - S.
             debug_assert!(p + L - 1 < n_smers && p < fwd_min.len());
             let selected = unsafe {
                 if forward {
@@ -228,6 +234,7 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
                 kmers.push((pos, Kmer::<K>(if forward { kf } else { kr })));
             }
         }
+        self.kmers = kmers;
         stats.kmers_processed += processed;
         stats.minimizer += self.kmers.len();
         &self.kmers
