@@ -1,4 +1,5 @@
 pub mod kmer_extractor;
+pub mod syncmer_extractor;
 pub mod range_extractor;
 pub mod seed_extractor;
 pub mod anchor_extractor;
