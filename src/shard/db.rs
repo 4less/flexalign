@@ -13,7 +13,7 @@
 //! property `shards_partition_the_key_space` pins down, and it is the reason every semantic
 //! question in ProjectShard is about *cross-key* decisions only.
 
-use flexmap::values::VRange;
+use flexmap::range::AnyRange;
 
 use crate::database::common::{DBPaths, FlexalignDatabase};
 use crate::options::Options;
@@ -105,7 +105,7 @@ impl<D: FlexalignDatabase> ShardedDB<D> {
 impl<D: FlexalignDatabase> FlexalignDatabase for ShardedDB<D> {
     /// The whole point: a key outside this shard reads as absent, exactly as it would if the
     /// shard's slice of the index were the only thing loaded.
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>> {
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<AnyRange<'_>> {
         if !self.range.contains(canonical_kmer) {
             return None;
         }

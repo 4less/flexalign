@@ -36,11 +36,11 @@ impl MockDb {
 }
 
 impl FlexalignDatabase for MockDb {
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>> {
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::range::AnyRange<'_>> {
         let i = canonical_kmer as usize;
         // A shard restricts keys before delegating, and core-mers are < KEY_SPACE, so this is in
         // bounds; guard anyway rather than risk a panic corrupting a test.
-        self.cells.get(i..i + 1).map(|slice| VRange::new(None, slice))
+        self.cells.get(i..i + 1).map(|slice| VRange::new(None, slice).into())
     }
     fn get_rid(&self, _reference: &str) -> Option<&usize> {
         None

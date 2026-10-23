@@ -3,7 +3,6 @@ use std::{cmp::{max, min}, io::stdin, mem::swap};
 
 use super::{super::GOLDSTD_EVAL, stats::Stats};
 use bioreader::sequence::fastq_record::{print_color_qualities, OwnedFastqRecord, RefFastqRecord};
-use flexmap::{values::VRange, VD};
 use kmerrs::{consecutive::kmer::{Kmer, KmerIter}, minimizer::context_free::Minimizer};
 use colored::Colorize;
 
@@ -27,7 +26,7 @@ pub struct Standard<
 > {
     pub options: &'a Options,
 
-    pub ranges: Vec<(usize, Kmer<F>, VRange<'a>, usize)>,
+    pub ranges: Vec<(usize, Kmer<F>, flexmap::range::AnyRange<'a>, usize)>,
     pub seeds: Vec<Seed>,
     pub anchors: Vec<Anchor>,
     pub indices: Vec<usize>,
@@ -474,50 +473,27 @@ impl<
         let mut matches = 0;
         let mut discarded_max_flex_count = 0;
         for (qpos, flex, range, _range_size) in &self.ranges {
-            match range.header {
-                Some(headers) => {
-                    let mut min_dist = u32::MAX;
-                    let mut count = 0;
-                    for header in headers {
-                        let dist = header.dist(flex.0 as u32);
-                        if dist < min_dist { min_dist = dist; count = 0; }
-                        if dist == min_dist { count += 1};
+            if range.has_header() {
+                let mut dists = Vec::new();
+                let min_dist = range.flank_distances(flex.0 as u32, &mut dists);
+                let count = dists.iter().filter(|&&d| d as u32 == min_dist).count();
+                if count > max_best_flex {
+                    log::info!("byby {} {}", count, max_best_flex);
+                    discarded_max_flex_count += 1;
+                    continue;
+                }
+                for (index, &dist) in dists.iter().enumerate() {
+                    if dist as u32 == min_dist {
+                        let (value, rpos) = range.value(index);
+                        self.seeds.push(Seed::from_flexmer::<K,C,F>(*qpos, rpos, value, min_dist));
                     }
-                    
-                    let take = count <= max_best_flex;
-                    // eprintln!("{} Range count = {}/{} < {}", if take { "X".green() } else { "O".red() }, count, range.positions.len(), self.options.args.max_best_flex);
-                    if !take {
-                        log::info!("byby {} {}", count, max_best_flex);
-                        discarded_max_flex_count += 1;
-                        continue;
-                    }
-
-                    // for header in headers {
-                    //     let dist = header.dist(flex.0 as u32);
-                    //     if dist < min_dist { min_dist = dist }
-                    // }
-
-
-                    // eprintln!("Header------");
-                    for (index, header) in headers.iter().enumerate() {
-                        let dist = header.dist(flex.0 as u32);
-                        if dist == min_dist {
-                            // self.seeds.push((*pos, range.positions[index].clone()))
-                            let (value, rpos) = VD::get(range.positions[index].0);
-                            self.seeds.push(Seed::from_flexmer::<K,C,F>(*qpos, rpos, value, dist));
-                            // eprintln!("H Push: {} {} {}", self.seeds.last().unwrap().to_string(), *pos, rpos);
-                        }
-                    }
-                },
-                None => {
-                    for cell in range.positions {
-                        // self.seeds.push((*pos, cell.clone()));
-                        let (value, rpos) = VD::get(cell.0);
-                        self.seeds.push(Seed::from_coremer::<K,C,F>(*qpos, rpos, value));
-                        // eprintln!("N Push: {} {} {}", self.seeds.last().unwrap().to_string(), *pos, rpos);
-                    }
-                },
-            };
+                }
+            } else {
+                for index in 0..range.len() {
+                    let (value, rpos) = range.value(index);
+                    self.seeds.push(Seed::from_coremer::<K,C,F>(*qpos, rpos, value));
+                }
+            }
             matches += 1;
             log::info!("{} {}", matches, ranges);
             if matches >= ranges { break }
@@ -597,11 +573,11 @@ impl<
             let (duration, result) = time(|| self.db.get_vrange(cmer.0));
             stats.time_get_ranges += duration;
 
-            let range: VRange<'a> = match result {
+            let range: flexmap::range::AnyRange<'a> = match result {
                 Some(range) => range,
                 None => continue,
             };
-            let range_len = (&range).positions.len();
+            let range_len = range.len();
             self.ranges.push((pos, fmer, range, range_len));
 
             // eprintln!("{}: {} / {} -> {} .. Is own rc? {}", 
@@ -649,7 +625,7 @@ impl<
 
     pub fn sort_ranges(&mut self, _stats: &mut Stats) {
         // Faster than glidesort in this example
-        self.ranges.sort_unstable_by_key(|r| r.2.positions.len());
+        self.ranges.sort_unstable_by_key(|r| r.2.len());
     }
 
     pub fn get_anchors(&mut self, _stats: &mut Stats) {

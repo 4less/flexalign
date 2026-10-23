@@ -1,6 +1,4 @@
 
-use flexmap::values::HeaderSeq;
-use flexmap::VD;
 
 use crate::{align::{common::SeedExtractor, data_structures::common::Seed, stats::Stats}, flexalign::time};
 
@@ -117,26 +115,16 @@ impl<'a, const F: usize> Range<'a, F> {
     /// >= `max_best_flex`; [`MAX_KEPT_TIES`] is the standard size.
     pub fn resolve_flex(
         &self,
-        headers: &[HeaderSeq],
         max_best_flex: usize,
         flank_slack: u32,
         dist_buf: &mut Vec<u8>,
         out: &mut [u32],
     ) -> Option<(u32, usize)> {
         debug_assert!(max_best_flex <= out.len(), "out[] must hold a full kept set");
-        dist_buf.clear();
-        if headers.is_empty() {
+        // dist is a hamming distance over F<=16 flank bases, fits u8
+        let min_dist = self.vrange.flank_distances(self.fmer.0 as u32, dist_buf);
+        if dist_buf.is_empty() {
             return Some((0, 0));
-        }
-        dist_buf.reserve(headers.len());
-        let flex = self.fmer.0 as u32;
-        let mut min_dist = u32::MAX;
-        for header in headers {
-            let d = header.dist(flex);
-            dist_buf.push(d as u8); // dist is a hamming distance over F<=16 flank bases, fits u8
-            if d < min_dist {
-                min_dist = d;
-            }
         }
         let threshold = min_dist + flank_slack;
         let mut count = 0usize;
@@ -167,14 +155,14 @@ impl<'a, const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for 
         dist_buf: &mut Vec<u8>,
         seeds: &mut Vec<Seed>,
     ) -> RangeVerdict {
-        match self.vrange.header {
-            Some(headers) => {
+        match self.vrange.has_header() {
+            true => {
                 let mut idx = [0u32; MAX_KEPT_TIES];
-                match self.resolve_flex(headers, max_best_flex, flank_slack, dist_buf, &mut idx) {
+                match self.resolve_flex(max_best_flex, flank_slack, dist_buf, &mut idx) {
                     None => RangeVerdict::Discarded,
                     Some((_min_dist, n)) => {
                         for &i in &idx[..n] {
-                            let (value, rpos) = VD::get(self.vrange.positions[i as usize].0);
+                            let (value, rpos) = self.vrange.value(i as usize);
                             // Each seed carries its own flank distance, not the range minimum.
                             let dist = dist_buf[i as usize] as u32;
                             seeds.push(Seed::from_flexmer::<K, C, F>(self.qpos, rpos, value, dist));
@@ -183,10 +171,10 @@ impl<'a, const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for 
                     }
                 }
             }
-            None => {
+            false => {
                 dist_buf.clear(); // no flanks scanned; keep dist_buf.len() an honest scan count
-                for cell in self.vrange.positions {
-                    let (value, rpos) = VD::get(cell.0);
+                for i in 0..self.vrange.len() {
+                    let (value, rpos) = self.vrange.value(i);
                     seeds.push(Seed::from_coremer::<K, C, F>(self.qpos, rpos, value));
                 }
                 RangeVerdict::Headerless

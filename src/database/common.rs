@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Read, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 use bioreader::{fasta_byte_reader::FastaByteReader, fasta_reader::FastaReader, sequence::fasta_record::OwnedFastaRecord};
-use flexmap::values::VRange;
+use flexmap::range::AnyRange;
 use crate::options::Options;
 
 /// Read the reference sequences during the load instead of faulting them in during alignment.
@@ -16,6 +16,30 @@ pub static EAGER_REF: std::sync::atomic::AtomicBool =
 
 pub fn eager_ref() -> bool {
     EAGER_REF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The index a run builds, converts to and loads (`--index-format`): flexmap's packed index with a
+/// compact key table (the default), with a line-hashed key table, or the Flexmap blob. A process-wide
+/// switch for the same reason as `EAGER_REF`: `FlexalignDatabase::load` takes only paths.
+pub use crate::options::IndexFormat;
+
+pub static INDEX_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn index_format() -> IndexFormat {
+    match INDEX_FORMAT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => IndexFormat::Compact,
+        1 => IndexFormat::Hashed,
+        _ => IndexFormat::Blob,
+    }
+}
+
+pub fn set_index_format(format: IndexFormat) {
+    let v = match format {
+        IndexFormat::Compact => 0,
+        IndexFormat::Hashed => 1,
+        IndexFormat::Blob => 2,
+    };
+    INDEX_FORMAT.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Budget in kB for resident reference pages; 0 = unbounded (the default).
@@ -216,13 +240,27 @@ impl DBPaths {
         format!("{}.refseq", self.index_path.to_string_lossy())
     }
 
-    pub fn valid_paths(&self) -> bool {
+    /// The packed index file of `format` (`Compact` or `Hashed`).
+    pub fn index_packed_file(&self, format: IndexFormat) -> String {
+        match format {
+            IndexFormat::Hashed => format!("{}.hashed", self.index_path.to_string_lossy()),
+            _ => format!("{}.compact", self.index_path.to_string_lossy()),
+        }
+    }
+
+    /// The reference and its name tables, which every index format needs.
+    pub fn names_valid(&self) -> bool {
         Path::exists(&self.reference_path) &
-        Path::exists(Path::new(&self.index_blob_file())) &
-        Path::exists(Path::new(&self.index_keys_file())) &
-        Path::exists(Path::new(&self.index_values_file())) &
         Path::exists(&self.reference2id_path) &
         Path::exists(&self.id2reference_path)
+    }
+
+    /// The Flexmap blob and its split key/value files (for the shard slicer).
+    pub fn valid_paths(&self) -> bool {
+        self.names_valid() &
+        Path::exists(Path::new(&self.index_blob_file())) &
+        Path::exists(Path::new(&self.index_keys_file())) &
+        Path::exists(Path::new(&self.index_values_file()))
     }
 }
 
@@ -238,7 +276,14 @@ pub trait FlexalignDatabase {
     /// a full shard. Calling this at a batch boundary bounds residency to one batch's worth
     /// instead. Default is a no-op (owned records cannot be dropped).
     fn release_references(&self) {}
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>>;
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<AnyRange<'_>>;
+    /// `f(i, get_vrange(keys[i]))` for every key in order; an index may fetch the keys ahead (one
+    /// read's keys are one call), which a loop over `get_vrange` cannot.
+    fn for_each_vrange<'s>(&'s self, keys: &[u64], f: &mut dyn FnMut(usize, Option<AnyRange<'s>>)) {
+        for (i, &k) in keys.iter().enumerate() {
+            f(i, self.get_vrange(k));
+        }
+    }
     fn build(options: &Options) -> Self;
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error>;
     fn load(paths: &DBPaths, version: u32) -> Self;
@@ -258,8 +303,11 @@ impl<D: FlexalignDatabase> FlexalignDatabase for &D {
     fn get_reference(&self, id: usize) -> Option<&[u8]> {
         (**self).get_reference(id)
     }
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>> {
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<AnyRange<'_>> {
         (**self).get_vrange(canonical_kmer)
+    }
+    fn for_each_vrange<'s>(&'s self, keys: &[u64], f: &mut dyn FnMut(usize, Option<AnyRange<'s>>)) {
+        (**self).for_each_vrange(keys, f)
     }
     fn build(_options: &Options) -> Self {
         unimplemented!("&DB is a borrowed read-only view; build the owned database instead")

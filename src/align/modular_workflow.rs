@@ -709,7 +709,7 @@ impl<
             let mut correct = false;
             let mut _correct_id = 0;
             for (idx, range) in ranges_rev.iter().enumerate() {
-                let kmer_len = if range.vrange.header.is_some() {
+                let kmer_len = if range.vrange.has_header() {
                     31
                 } else {
                     15
@@ -777,7 +777,7 @@ impl<
             let mut _correct_id = 0;
             //(qpos, flex, vrange, len)
             for (idx, range) in ranges_rev.iter().enumerate() {
-                let kmer_len = if range.vrange.header.is_some() {
+                let kmer_len = if range.vrange.has_header() {
                     31
                 } else {
                     15

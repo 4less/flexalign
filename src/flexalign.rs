@@ -75,6 +75,17 @@ pub fn run(args: Args) {
     crate::database::common::EAGER_REF
         .store(!options.args.lazy_ref, std::sync::atomic::Ordering::Relaxed);
 
+    // The sharded pipeline and the slicer read the Flexmap blob; everything else uses the format
+    // asked for (the packed index by default).
+    {
+        use crate::database::common::{set_index_format, IndexFormat};
+        let sharded = options.args.shard_slice.is_some() || options.args.shards.is_some();
+        if sharded && options.args.index_format != IndexFormat::Blob {
+            eprintln!("Sharded runs and --shard-slice use the Flexmap blob (--index-format blob).");
+        }
+        set_index_format(if sharded { IndexFormat::Blob } else { options.args.index_format });
+    }
+
     if !options.reference.exists() {
         eprintln!("Reference does not exist {:?}", options.reference);
         exit(9);
@@ -129,9 +140,8 @@ pub fn run(args: Args) {
     // build (wrong blob version / const params). The last check is what stops a stale index -- e.g.
     // one written before a flexmap key-format change -- from being memory-mapped and silently
     // misread (which collapses sensitivity to ~zero), forcing a clean rebuild instead.
-    let index_compatible =
-        db_paths.valid_paths() && DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::index_compatible(&db_paths);
-    if db_paths.valid_paths() && !index_compatible && !options.args.force_build {
+    let index_compatible = DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::index_compatible(&db_paths);
+    if db_paths.names_valid() && !index_compatible && !options.args.force_build {
         log::warn!("On-disk index is incompatible with this build (format/params changed); rebuilding it.");
     }
     let build = options.args.force_build || !index_compatible;

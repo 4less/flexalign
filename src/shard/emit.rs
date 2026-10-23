@@ -68,15 +68,10 @@ pub fn emit_ranges<const F: usize>(
     let mut idx = [0u32; MAX_KEPT_TIES];
 
     for range in ranges {
-        match range.vrange.header {
-            Some(headers) => {
-                debug_assert!(
-                    !headers.is_empty(),
-                    "a headered block has size > HEADER_THRESHOLD, so it always has a header"
-                );
-
+        match range.vrange.has_header() {
+            true => {
                 // flank_slack = 0: the sharded record stores one distance per range.
-                let (min_dist, count) = match range.resolve_flex(headers, max_best_flex, 0, dist_buf, &mut idx) {
+                let (min_dist, count) = match range.resolve_flex(max_best_flex, 0, dist_buf, &mut idx) {
                     None => {
                         stats.discarded += 1;
                         continue;
@@ -90,25 +85,25 @@ pub fn emit_ranges<const F: usize>(
 
                 debug_assert!(min_dist <= F as u32, "dist {} exceeds {} flank bases", min_dist, F);
                 let cells: Vec<u64> =
-                    idx[..count].iter().map(|&i| range.vrange.positions[i as usize].0).collect();
+                    idx[..count].iter().map(|&i| range.vrange.cell(i as usize)).collect();
 
                 stats.headered += 1;
                 stats.cells += cells.len();
                 out.push(RangeRecord {
                     qpos: range.qpos as u32,
-                    n_positions: range.vrange.positions.len() as u32,
+                    n_positions: range.vrange.len() as u32,
                     headered: true,
                     min_dist: min_dist as u8,
                     cells,
                 });
             }
-            None => {
-                let cells: Vec<u64> = range.vrange.positions.iter().map(|c| c.0).collect();
+            false => {
+                let cells: Vec<u64> = (0..range.vrange.len()).map(|i| range.vrange.cell(i)).collect();
                 stats.headerless += 1;
                 stats.cells += cells.len();
                 out.push(RangeRecord {
                     qpos: range.qpos as u32,
-                    n_positions: range.vrange.positions.len() as u32,
+                    n_positions: range.vrange.len() as u32,
                     headered: false,
                     // Meaningless without headers; the replay reads it only when `headered`.
                     min_dist: 0,

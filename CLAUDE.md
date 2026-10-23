@@ -157,8 +157,13 @@ construction in `src/align/process_fastq.rs`.
 
 `src/database/` — `common.rs` defines the `FlexalignDatabase` trait
 (`get_rname` / `get_reference` / `get_vrange` / `build` / `save` / `load`) and
-`DBPaths` (the `.flex.*` file naming). `flexmap.rs` implements it over
-`flexmap::FlexmapBlob`, persisted with `savefile`. `build.rs` handles index
+`DBPaths` (the `.flex.*` file naming). `flexmap.rs` implements it over a `FlexmapStore`:
+flexmap's packed index (`--index-format compact`, the default, or `hashed`; file
+`.flex.index.compact` / `.hashed`, read into memory on all threads) or the Flexmap blob
+(`--index-format blob`, memory-mapped; the sharded pipeline and `--shard-slice` always use it). An
+existing blob is converted to the packed index on the first run that asks for it. Lookups return
+`flexmap::range::AnyRange`, which reads either index; `for_each_vrange` looks up one read's keys
+in one call so that the packed index can fetch them ahead. `build.rs` handles index
 construction. `GLOBAL_VERSION` (`src/lib.rs`) is the on-disk format version checked
 on save/load.
 

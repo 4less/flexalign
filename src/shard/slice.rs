@@ -18,7 +18,7 @@
 
 use flexmap::flexmap::{Flexmap, FlexmapBlob, VRangeGetter};
 use flexmap::keys::FMKeys;
-use flexmap::values::{FMValues, VRange};
+use flexmap::values::FMValues;
 use serde::{Deserialize, Serialize};
 
 use crate::database::common::{DBPaths, FlexalignDatabase};
@@ -273,13 +273,13 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
 impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THRESHOLD: usize>
     FlexalignDatabase for PhysicalShardDB<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>
 {
-    fn get_vrange(&self, canonical_kmer: u64) -> Option<VRange<'_>> {
+    fn get_vrange(&self, canonical_kmer: u64) -> Option<flexmap::range::AnyRange<'_>> {
         if canonical_kmer < self.lo || canonical_kmer >= self.hi {
             return None;
         }
         // `lo` is block-aligned, so `k - lo` selects the same block/slot in the slice, and the
         // rebased heads make the resulting offsets index this shard's own value slice.
-        self.blob.get_vrange(canonical_kmer - self.lo)
+        self.blob.get_vrange(canonical_kmer - self.lo).map(flexmap::range::AnyRange::from)
     }
 
     fn get_rid(&self, _reference: &str) -> Option<&usize> {
