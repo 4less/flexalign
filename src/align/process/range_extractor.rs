@@ -33,6 +33,8 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     /// Set by `unique_hits`, which already fetched every range of these keys into `ranges`:
     /// `generate` on the same k-mers then skips the lookup (the fast path's fallback pairs).
     prefetched: bool,
+    /// The strided round's k-mers, reused across reads.
+    subset: Vec<(usize, Kmer<K>)>,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
@@ -70,11 +72,30 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         &self.ranges
     }
 
+    fn unique_hits_strided(&mut self, kmers: &[(usize, Kmer<K>)], stride: usize, max_positions: usize, out: &mut Vec<UniqueHit>) -> bool {
+        self.subset.clear();
+        self.subset.extend(kmers.iter().step_by(stride.max(1)).cloned());
+        let subset = std::mem::take(&mut self.subset);
+        self.lookup(&subset);
+        self.subset = subset;
+        self.prefetched = false;
+        out.clear();
+        Self::hits_of(&self.ranges, max_positions, out);
+        true
+    }
+
     fn unique_hits(&mut self, kmers: &[(usize, Kmer<K>)], max_positions: usize, out: &mut Vec<UniqueHit>) -> bool {
         self.lookup(kmers);
         self.prefetched = true;
         out.clear();
-        for r in &self.ranges {
+        Self::hits_of(&self.ranges, max_positions, out);
+        true
+    }
+}
+
+impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
+    fn hits_of(ranges: &[Range<'a, F>], max_positions: usize, out: &mut Vec<UniqueHit>) {
+        for r in ranges {
             // Headerless keys (at most HEADER_THRESHOLD positions) hold the positions directly.
             let n = r.vrange.len();
             if n <= max_positions && !r.vrange.has_header() {
@@ -84,7 +105,6 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
                 }
             }
         }
-        true
     }
 }
 
@@ -116,6 +136,6 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new() }
     }
 }

@@ -152,6 +152,11 @@ pub struct Args {
     #[arg(long = "fast-hit-min-hits", default_value_t = 2)]
     pub fast_hit_min_hits: usize,
 
+    /// First round of the fast-hit path looks up every N-th k-mer only; the rest are fetched when
+    /// that round does not place the pair. 1 looks everything up at once (`--fast-hit`).
+    #[arg(long = "fast-hit-stride", default_value_t = 2)]
+    pub fast_hit_stride: usize,
+
     /// Most index positions a k-mer's key may have for the fast-hit path to use it; keys with more
     /// carry flank headers and are left to the full path (`--fast-hit`).
     #[arg(long = "fast-hit-max-positions", default_value_t = 2)]

@@ -256,6 +256,11 @@ pub trait RangeExtractor<const C: usize, const F: usize> {
     fn unique_hits(&mut self, _kmers: &[(usize, Kmer<C>)], _max_positions: usize, _out: &mut Vec<UniqueHit>) -> bool {
         false
     }
+    /// `unique_hits` over every `stride`-th k-mer only: the fast path's first, cheaper round.
+    /// The ranges it fetches are not kept for `generate`.
+    fn unique_hits_strided(&mut self, _kmers: &[(usize, Kmer<C>)], _stride: usize, _max_positions: usize, _out: &mut Vec<UniqueHit>) -> bool {
+        false
+    }
     fn retrieve(&self) -> &[Range<'_, F>];
 }
 

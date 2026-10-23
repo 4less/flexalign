@@ -556,6 +556,7 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
 ) -> bool {
     const MAX_INSERT: usize = 1000;
     let (min_hits, max_mm, max_pos) = (args.fast_hit_min_hits, args.fast_hit_max_mismatch, args.fast_hit_max_positions);
+    let stride = args.fast_hit_stride.max(1);
     let mut miss = |m: FastMiss, stats: &mut Stats| {
         match m {
             FastMiss::FewVotes => stats.fast_hit_few_votes += 1,
@@ -564,19 +565,44 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
         }
         false
     };
-    if !re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd) {
-        return false;
+    // Two rounds: every `stride`-th k-mer first, which places most pairs; the full set when that
+    // leaves a mate short of votes (any other miss is final: more k-mers change neither the
+    // window nor its mismatches). The full round's ranges are kept for the fallback's generate().
+    let mut placed = None;
+    for round in 0..2 {
+        let full = round == 1 || stride == 1;
+        let ok = if full {
+            re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd)
+        } else {
+            re_fwd.unique_hits_strided(kmers_fwd, stride, max_pos, &mut scratch.hits_fwd)
+        };
+        if !ok {
+            return false;
+        }
+        let m1 = match fast_hit_mate::<K, D>(db, &scratch.hits_fwd, rec_fwd, revc_fwd, &mut scratch.cigar_fwd, &mut scratch.votes, min_hits, max_mm) {
+            Ok(m) => m,
+            Err(FastMiss::FewVotes) if !full => continue,
+            Err(e) => { if !full { re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd); } return miss(e, stats); }
+        };
+        let ok = if full {
+            re_rev.unique_hits(kmers_rev, max_pos, &mut scratch.hits_rev)
+        } else {
+            re_rev.unique_hits_strided(kmers_rev, stride, max_pos, &mut scratch.hits_rev)
+        };
+        if !ok {
+            return false;
+        }
+        let m2 = match fast_hit_mate::<K, D>(db, &scratch.hits_rev, rec_rev, revc_rev, &mut scratch.cigar_rev, &mut scratch.votes, min_hits, max_mm) {
+            Ok(m) => m,
+            Err(FastMiss::FewVotes) if !full => continue,
+            Err(e) => { if !full { re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd); re_rev.unique_hits(kmers_rev, max_pos, &mut scratch.hits_rev); } return miss(e, stats); }
+        };
+        placed = Some((m1, m2));
+        break;
     }
-    let m1 = match fast_hit_mate::<K, D>(db, &scratch.hits_fwd, rec_fwd, revc_fwd, &mut scratch.cigar_fwd, &mut scratch.votes, min_hits, max_mm) {
-        Ok(m) => m,
-        Err(e) => return miss(e, stats),
-    };
-    if !re_rev.unique_hits(kmers_rev, max_pos, &mut scratch.hits_rev) {
-        return false;
-    }
-    let m2 = match fast_hit_mate::<K, D>(db, &scratch.hits_rev, rec_rev, revc_rev, &mut scratch.cigar_rev, &mut scratch.votes, min_hits, max_mm) {
-        Ok(m) => m,
-        Err(e) => return miss(e, stats),
+    let (m1, m2) = match placed {
+        Some(p) => p,
+        None => return miss(FastMiss::FewVotes, stats),
     };
     let leftmost = m1.start.min(m2.start);
     let rightmost = m1.end.max(m2.end);
