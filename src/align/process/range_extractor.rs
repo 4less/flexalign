@@ -6,7 +6,7 @@ use flexmap::range::AnyRange;
 use kmerrs::consecutive::kmer::Kmer;
 use kmerrs::kmer_utils::mask_coremer;
 
-use crate::{align::{common::{RangeExtractor, UniqueHit}, stats::Stats}, database::common::FlexalignDatabase};
+use crate::{align::{common::{RangeExtractor, UniqueHit}, process::seed_extractor::MAX_KEPT_TIES, stats::Stats}, database::common::FlexalignDatabase};
 
 // pub type Range<'a, const F: usize> = (usize, Kmer<F>, VRange<'a>, usize);
 
@@ -35,6 +35,8 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     prefetched: bool,
     /// The strided round's k-mers, reused across reads.
     subset: Vec<(usize, Kmer<K>)>,
+    /// Per-flank distance scratch of the fast path's header resolution.
+    flex_scratch: Vec<u8>,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
@@ -80,7 +82,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         self.subset = subset;
         self.prefetched = false;
         out.clear();
-        Self::hits_of(&self.ranges, max_positions, out);
+        self.hits_of(max_positions, out);
         true
     }
 
@@ -88,20 +90,36 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         self.lookup(kmers);
         self.prefetched = true;
         out.clear();
-        Self::hits_of(&self.ranges, max_positions, out);
+        self.hits_of(max_positions, out);
         true
     }
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
-    fn hits_of(ranges: &[Range<'a, F>], max_positions: usize, out: &mut Vec<UniqueHit>) {
-        for r in ranges {
-            // Headerless keys (at most HEADER_THRESHOLD positions) hold the positions directly.
+    /// The hits the fast path votes with. A headerless key (at most HEADER_THRESHOLD positions)
+    /// gives every position; a headered key with at most `FAST_HIT_MAX_CELLS` positions gives
+    /// the cells whose flanks match the read's exactly (a full K-mer match), resolved the way the
+    /// seed extractor resolves them. A 15-mer core occurs several times in a few Gbp of
+    /// reference, so on anything but a small reference nearly every key is headered: without
+    /// these the path placed 1% of pairs on a 5 GB reference, against 78% on 1 GB.
+    fn hits_of(&mut self, max_positions: usize, out: &mut Vec<UniqueHit>) {
+        const FAST_HIT_MAX_CELLS: usize = 64;
+        let mut idx = [0u32; MAX_KEPT_TIES];
+        for r in &self.ranges {
             let n = r.vrange.len();
-            if n <= max_positions && !r.vrange.has_header() {
-                for j in 0..n {
-                    let (rval, rpos) = r.vrange.value(j);
-                    out.push(UniqueHit { qpos: r.qpos as u32, rval, rpos });
+            if !r.vrange.has_header() {
+                if n <= max_positions {
+                    for j in 0..n {
+                        let (rval, rpos) = r.vrange.value(j);
+                        out.push(UniqueHit { qpos: r.qpos as u32, rval, rpos });
+                    }
+                }
+            } else if n <= FAST_HIT_MAX_CELLS {
+                if let Some((0, kept)) = r.resolve_flex(max_positions.max(1), 0, &mut self.flex_scratch, &mut idx) {
+                    for &i in &idx[..kept] {
+                        let (rval, rpos) = r.vrange.value(i as usize);
+                        out.push(UniqueHit { qpos: r.qpos as u32, rval, rpos });
+                    }
                 }
             }
         }
@@ -136,6 +154,6 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new() }
     }
 }
