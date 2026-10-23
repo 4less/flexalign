@@ -24,18 +24,21 @@
 //! `R[q]` that of its reverse complement. The window minima come from the van Herk / Gil-Werman
 //! block decomposition (two passes, three compares per entry, no branches on data).
 //!
+//! Pass 1 walks the bases once for the s-mers of both strands and their window minima; pass 2
+//! rolls the k-mers in registers and decides each with one compare. All buffers are reused.
+//!
 //! The result is identical to the standard extractor by construction -- the test at the bottom
 //! checks that on random reads with N's, where the k-mer iterator restarts.
 
 use bioreader::sequence::fastq_record::RefFastqRecord;
-use kmerrs::consecutive::kmer::{Kmer, KmerIter};
-use kmerrs::kmer_utils::NUC_U8_TO_BIT;
+use kmerrs::consecutive::kmer::Kmer;
 
 use crate::align::{common::KmerExtractor, stats::Stats};
 
 #[derive(Clone)]
 pub struct SyncmerKmerExtractor<const K: usize, const C: usize, const S: usize, const L: usize> {
     pub kmers: Vec<(usize, Kmer<K>)>,
+    /// Forward / reverse-complement s-mer starting at each read position (2S <= 16 bits).
     fwd: Vec<u16>,
     rev: Vec<u16>,
     fwd_min: Vec<u16>,
@@ -51,6 +54,17 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> Default
     }
 }
 
+/// ASCII -> 2-bit code, 4 for anything that is not upper-case A/C/G/T. Lower case counts as N,
+/// exactly as `kmerr::kmer_utils::allowed` has it, so the two selectors see the same k-mers.
+static CODE: [u8; 256] = {
+    let mut t = [4u8; 256];
+    t[b'A' as usize] = 0;
+    t[b'C' as usize] = 1;
+    t[b'G' as usize] = 2;
+    t[b'T' as usize] = 3;
+    t
+};
+
 /// Sliding-window minimum, window `w`, over `v`: `out[i] = min(v[i..i+w])` for every full window.
 /// Van Herk / Gil-Werman: a suffix-min pass inside each block of `w` and a prefix-min pass, then
 /// every window is the min of one suffix entry and one prefix entry.
@@ -63,18 +77,15 @@ fn window_min(v: &[u16], w: usize, prefix: &mut Vec<u16>, out: &mut Vec<u16>) {
     }
     prefix.clear();
     prefix.resize(n, 0);
-    // suffix minima, written into `out` first (it is resized to n, then truncated to n - w + 1)
     out.resize(n, 0);
     let mut i = 0;
     while i < n {
         let end = (i + w).min(n);
-        // prefix within the block
         let mut m = v[i];
         for j in i..end {
             m = m.min(v[j]);
             prefix[j] = m;
         }
-        // suffix within the block
         let mut m = v[end - 1];
         for j in (i..end).rev() {
             m = m.min(v[j]);
@@ -91,44 +102,99 @@ fn window_min(v: &[u16], w: usize, prefix: &mut Vec<u16>, out: &mut Vec<u16>) {
 impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmerExtractor<K, C, S, L> {
     /// Core start inside the k-mer: `middle::<C>()` takes the central `C` bases.
     const CORE_OFFSET: usize = (K - C) / 2;
+    const KMASK: u64 = (1u64 << (2 * K)) - 1;
+    const KTOP: u32 = 2 * (K as u32 - 1);
+    const SMASK: u32 = (1u32 << (2 * S)) - 1;
+    const STOP: u32 = 2 * (S as u32 - 1);
+    const CMASK: u64 = (1u64 << (2 * C)) - 1;
+    /// What `Kmer::middle::<C>` shifts by (bits).
+    const CSHIFT: u32 = K as u32 - C as u32;
 
-    /// Fills `fwd`/`rev` with the s-mer value at every read position (0 where the window holds a
-    /// non-ACGT base; such windows lie only inside k-mers the iterator skips, so they are never
-    /// consulted) and the window minima over `L` entries.
-    fn prepare(&mut self, seq: &[u8]) {
+    /// The selection proper, on a bare sequence. Pass 1 walks the bases once for the s-mers of
+    /// both strands and their window minima; pass 2 rolls the forward and reverse-complement
+    /// k-mers in registers (the recurrence of `KmerIter<K, true>`, restarting after any non-ACGT
+    /// base, so it yields the same k-mers) and decides each with one compare.
+    pub fn select(&mut self, seq: &[u8], stats: &mut Stats) -> &[(usize, Kmer<K>)] {
         debug_assert_eq!(L, C - S + 1, "L must be C - S + 1, as in ClosedSyncmer");
+        debug_assert!(2 * K < 64 && 2 * S <= 16);
+        self.kmers.clear();
         let n = seq.len();
+        if n < K {
+            return &self.kmers;
+        }
+
+        // Pass 1: s-mers of both strands at every position, then their window minima.
         self.fwd.clear();
         self.rev.clear();
-        if n < S {
-            self.fwd_min.clear();
-            self.rev_min.clear();
-            return;
-        }
-        let mask: u32 = (1u32 << (2 * S)) - 1;
-        let top = 2 * (S - 1);
-        let mut f: u32 = 0;
-        let mut r: u32 = 0;
-        let mut valid = 0usize; // consecutive ACGT bases ending at the current position
-        for (i, &b) in seq.iter().enumerate() {
-            let code = if b >= b'A' && b < b'A' + 20 { NUC_U8_TO_BIT[(b - b'A') as usize] } else { 4 };
-            if code > 3 {
-                valid = 0;
-                f = 0;
-                r = 0;
-            } else {
-                valid += 1;
-                f = ((f << 2) | code as u32) & mask;
-                r = (r >> 2) | ((3 - code as u32) << top);
-            }
-            if i + 1 >= S {
-                let ok = valid >= S;
-                self.fwd.push(if ok { f as u16 } else { 0 });
-                self.rev.push(if ok { r as u16 } else { 0 });
+        self.fwd.reserve(n);
+        self.rev.reserve(n);
+        {
+            let (mut f, mut r) = (0u32, 0u32);
+            let mut run = 0usize;
+            for (i, &b) in seq.iter().enumerate() {
+                let code = CODE[b as usize] as u32;
+                if code > 3 {
+                    run = 0;
+                } else {
+                    run += 1;
+                    f = ((f << 2) | code) & Self::SMASK;
+                    r = (r >> 2) | ((3 - code) << Self::STOP);
+                }
+                if i + 1 >= S {
+                    // 0 where the window holds a non-ACGT base: such windows lie only inside
+                    // k-mers pass 2 skips, so they are never consulted.
+                    let ok = run >= S;
+                    self.fwd.push(if ok { f as u16 } else { 0 });
+                    self.rev.push(if ok { r as u16 } else { 0 });
+                }
             }
         }
         window_min(&self.fwd, L, &mut self.scratch, &mut self.fwd_min);
         window_min(&self.rev, L, &mut self.scratch, &mut self.rev_min);
+
+        // Pass 2: roll the k-mers and decide each.
+        let n_smers = n - S + 1;
+        debug_assert!(self.fwd.len() == n_smers && self.fwd_min.len() == n_smers - L + 1);
+        let (fwd, rev, fwd_min, rev_min) = (&self.fwd, &self.rev, &self.fwd_min, &self.rev_min);
+        let kmers = &mut self.kmers;
+        let (mut kf, mut kr) = (0u64, 0u64);
+        let mut run = 0usize;
+        let mut processed = 0usize;
+        for (i, &b) in seq.iter().enumerate() {
+            let code = CODE[b as usize] as u64;
+            if code > 3 {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            kf = ((kf << 2) | code) & Self::KMASK;
+            kr = (kr >> 2) | ((3 - code) << Self::KTOP);
+            if run < K {
+                continue;
+            }
+            processed += 1;
+            let pos = i + 1 - K;
+            let cmer_fwd = (kf >> Self::CSHIFT) & Self::CMASK;
+            let cmer_rev = (kr >> Self::CSHIFT) & Self::CMASK;
+            let p = pos + Self::CORE_OFFSET;
+            let forward = cmer_fwd < cmer_rev;
+            // In range by construction: p + L - 1 = pos + K - S - ... <= i - S + 1 < n_smers, and
+            // p <= n_smers - L (the last full window), since p + L - 1 <= i + 1 - S.
+            debug_assert!(p + L - 1 < n_smers && p < fwd_min.len());
+            let selected = unsafe {
+                if forward {
+                    *fwd.get_unchecked(p) == *fwd_min.get_unchecked(p)
+                } else {
+                    *rev.get_unchecked(p + L - 1) == *rev_min.get_unchecked(p)
+                }
+            };
+            if selected {
+                kmers.push((pos, Kmer::<K>(if forward { kf } else { kr })));
+            }
+        }
+        stats.kmers_processed += processed;
+        stats.minimizer += self.kmers.len();
+        &self.kmers
     }
 }
 
@@ -144,38 +210,10 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> KmerExtract
     }
 }
 
-impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmerExtractor<K, C, S, L> {
-    /// The selection proper, on a bare sequence.
-    pub fn select(&mut self, seq: &[u8], stats: &mut Stats) -> &[(usize, Kmer<K>)] {
-        self.kmers.clear();
-        self.prepare(seq);
-        let (fwd, rev, fwd_min, rev_min) = (&self.fwd, &self.rev, &self.fwd_min, &self.rev_min);
-        let mut processed = 0usize;
-        for (pos, kmer_fwd, kmer_rev) in KmerIter::<K, true>::new(seq) {
-            processed += 1;
-            let cmer_fwd = kmer_fwd.middle::<C>();
-            let cmer_rev = kmer_rev.middle::<C>();
-            let p = pos + Self::CORE_OFFSET;
-            let selected = if cmer_fwd < cmer_rev {
-                fwd[p] == fwd_min[p]
-            } else {
-                rev[p + L - 1] == rev_min[p]
-            };
-            if !selected {
-                continue;
-            }
-            let kmer = if cmer_fwd < cmer_rev { kmer_fwd } else { kmer_rev };
-            self.kmers.push((pos, kmer));
-        }
-        stats.kmers_processed += processed;
-        stats.minimizer += self.kmers.len();
-        &self.kmers
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kmerrs::consecutive::kmer::KmerIter;
     use kmerrs::minimizer::context_free::Minimizer;
     use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 
@@ -196,7 +234,7 @@ mod tests {
         (0..len)
             .map(|_| {
                 let x = rng(seed);
-                if n_rate > 0 && x % n_rate == 0 { b'N' } else { b"ACGT"[(x >> 8) as usize % 4] }
+                if n_rate > 0 && x % n_rate == 0 { b"NRYacgt"[(x >> 16) as usize % 7] } else { b"ACGT"[(x >> 8) as usize % 4] }
             })
             .collect()
     }

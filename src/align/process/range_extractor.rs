@@ -27,6 +27,9 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     /// The read's keys and their (query position, flank), reused across reads.
     keys: Vec<u64>,
     key_info: Vec<(usize, Kmer<F>)>,
+    /// (range size, index) sort keys and the reordered ranges, reused across reads.
+    order: Vec<(u32, u32)>,
+    sorted: Vec<Range<'a, F>>,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
@@ -62,8 +65,14 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
             // eprintln!("{} {} ... sort by {}", range.core_min_phredq, range.vrange.positions.len(), range.vrange.positions.len() * (41 - range.core_min_phredq as usize));
         }
 
-        // self.ranges.sort_unstable_by_key(|r| r.vrange.positions.len() * (41 - r.core_min_phredq as usize));
-        self.ranges.sort_unstable_by_key(|r| r.vrange.len());
+        // Rarest first. Sorted through (len, index) keys rather than the ~70-byte ranges
+        // themselves (the element moves were a visible share of a run); ties keep query order.
+        self.order.clear();
+        self.order.extend(self.ranges.iter().enumerate().map(|(i, r)| (r.vrange.len() as u32, i as u32)));
+        self.order.sort_unstable();
+        self.sorted.clear();
+        self.sorted.extend(self.order.iter().map(|&(_, i)| self.ranges[i as usize].clone()));
+        std::mem::swap(&mut self.ranges, &mut self.sorted);
         
         // let (duration, _) = time(|| self.ranges.sort_unstable_by_key(|r| r.2.positions.len()));
         // stats.time_range_sorting += duration;
@@ -75,6 +84,6 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new() }
     }
 }
