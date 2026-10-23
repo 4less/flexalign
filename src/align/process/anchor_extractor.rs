@@ -315,7 +315,7 @@ impl AnchorExtractor for StdAnchorExtractor {
         let max_size = seed_group_indices_module(seeds, &mut self.groups);
 
         let (_duration, _) = stage_time(|| {
-            glidesort::sort_by_key(&mut self.groups, |(start, end)| {
+            crate::align::common::sort_short_by_key(&mut self.groups, |(start, end)| {
                 -1i32 * (end - start) as i32
             });
         });
@@ -439,7 +439,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
 
         // eprintln!("Anchors (Fwd -> Rev): {} -> {}", fwd_size, self.groups.len());
 
-        glidesort::sort_by_key(&mut self.groups, |e| (e.reference, e.forward));
+        crate::align::common::sort_short_by_key(&mut self.groups, |e| (e.reference, e.forward));
 
         let mut current_idx = 0;
         let mut next_idx;
