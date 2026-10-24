@@ -1,48 +1,81 @@
 
-use libwfa2::affine_wavefront::{AffineWavefronts, AlignmentSpan, AlignmentStatus, HeuristicStrategy};
+use wfa2lib_rs::aligner::{AffineAligner, AlignStatus, AlignmentScope};
+use wfa2lib_rs::heuristic::HeuristicStrategy;
+use wfa2lib_rs::penalties::{AffinePenalties, WavefrontPenalties};
 
 use crate::align::{common::{penalties, Align, Heuristic, Status}, sam::Cigar};
 
 
-// pub struct FastAlignment {
-    
-// }
-
-
-
 /// The gapped-alignment heuristic. WF-adaptive prunes wavefronts far behind the best diagonal;
 /// alignments are optimal unless the optimum strays that far.
-pub const HEURISTIC: HeuristicStrategy = HeuristicStrategy::WFAdaptive {
+pub const HEURISTIC: HeuristicStrategy = HeuristicStrategy::WfAdaptive {
     min_wavefront_length: 10,
     max_distance_threshold: 50,
-    score_steps: 1,
+    steps_between_cutoffs: 1,
 };
 
+/// Gapped alignment with `wfa2lib-rs`, the Rust port of WFA2-lib.
+///
+/// (The name is kept from when this wrapped the C library through `libwfa2`; the behaviour is the
+/// same: gap-affine penalties, CIGAR scope, WF-adaptive, `set_max_alignment_score` as the step
+/// limit, scores in WFA2-lib's convention -- the negated penalty with a zero match score.)
 pub struct LIBWFA2Alignment {
-    pub aligner: AffineWavefronts,
+    pub aligner: AffineAligner,
     pub cigar: Cigar,
+    /// The penalties the aligner was built with (the aligner has no `Clone`; see `rebuilt`).
+    penalties: AffinePenalties,
+    /// The step limit last set through `set_max_alignment_score`.
+    max_steps: i32,
     /// The ends-free span requested by `set_ends_free`, applied (clamped) at align time.
     ///
     /// WFA2 rejects an ends-free span whose free-length exceeds the sequence it applies to
-    /// (`P0<=|P|`, `Tf<=|T|`, ...) by aborting the whole process. The dovetail offsets the callers
-    /// pass can exceed a slice that turns out shorter than the offset -- which never happened on
-    /// uniform 150 bp simulated reads but does on real data (short fragments, adapters). Storing the
-    /// request and clamping it against the actual `q`/`r` lengths inside `align` makes every caller
-    /// safe at once, instead of each having to know the WFA constraint.
+    /// (`P0<=|P|`, `Tf<=|T|`, ...). The dovetail offsets the callers pass can exceed a slice that
+    /// turns out shorter than the offset -- which never happened on uniform 150 bp simulated reads
+    /// but does on real data (short fragments, adapters). Storing the request and clamping it
+    /// against the actual `q`/`r` lengths inside `align` makes every caller safe at once.
     span: Option<(i32, i32, i32, i32)>,
 }
 
 impl LIBWFA2Alignment {
-    /// Apply the requested ends-free span, each component clamped to the sequence it constrains.
-    fn apply_span(&mut self, qlen: usize, rlen: usize) {
-        if let Some((qs, qe, rs, re)) = self.span {
-            let (ql, rl) = (qlen as i32, rlen as i32);
-            self.aligner.set_alignment_span(AlignmentSpan::EndsFree {
-                pattern_begin_free: qs.min(ql),
-                pattern_end_free: qe.min(ql),
-                text_begin_free: rs.min(rl),
-                text_end_free: re.min(rl),
-            });
+    fn new_aligner(penalties: &AffinePenalties, max_steps: i32) -> AffineAligner {
+        let mut aligner = AffineAligner::new(WavefrontPenalties::new_affine(penalties.clone()));
+        aligner.set_alignment_scope(AlignmentScope::ComputeAlignment);
+        // WF-adaptive (10, 50, 1): what flexalign has always run (WFA2-lib's default).
+        aligner.set_heuristic(HEURISTIC);
+        aligner.set_max_alignment_steps(max_steps);
+        aligner
+    }
+
+    /// Align `q` (pattern) against `r` (text) with the stored span, as `wavefront_align` did.
+    fn run(&mut self, q: &[u8], r: &[u8]) -> (i32, AlignStatus) {
+        let wfa_score = match self.span {
+            Some((qs, qe, rs, re)) => {
+                let (ql, rl) = (q.len() as i32, r.len() as i32);
+                self.aligner.set_alignment_free_ends(qs.min(ql), qe.min(ql), rs.min(rl), re.min(rl));
+                self.aligner.align_endsfree(q, r)
+            }
+            None => self.aligner.align_end2end(q, r),
+        };
+        let status = self.aligner.status();
+        // WFA2-lib's classic score: the negated penalty without a match reward; with one, the
+        // score of the CIGAR in the same convention.
+        let score = if self.penalties.match_ == 0 {
+            -wfa_score
+        } else {
+            self.aligner.cigar().score_gap_affine(&self.penalties)
+        };
+        (score, status)
+    }
+
+    /// Map an alignment outcome to flexalign's (score, status), as the C-backed wrapper did.
+    fn outcome(score: i32, status: AlignStatus) -> (i32, Status) {
+        match status {
+            AlignStatus::Completed => (score, Status::OK),
+            // A heuristic made the end unreachable: no usable score (WFA2-lib reported i32::MIN).
+            AlignStatus::Partial => (std::i32::MIN, Status::Partial),
+            AlignStatus::MaxStepsReached => (std::i32::MIN, Status::Dropped),
+            AlignStatus::Oom => panic!("Out of memory error."),
+            other => panic!("Unexpected alignment status {:?}", other),
         }
     }
 }
@@ -84,16 +117,20 @@ pub fn hamming_ani(hamming: u64, length: usize) -> f64 {
 }
 
 
+// The aligner owns plain heap buffers (raw pointers into its own arena) and is never shared:
+// each worker thread gets its own clone.
 unsafe impl Send for LIBWFA2Alignment{}
 
 impl Clone for LIBWFA2Alignment {
     fn clone(&self) -> Self {
-        // libwfa2 >= 0.1.2 clones into a new C aligner with all settings (penalties, scope, span,
-        // memory mode, heuristic, max steps). The pipeline struct is cloned once per worker thread,
-        // so every thread must score exactly like the original.
+        // A fresh aligner with every setting (penalties, scope, heuristic, step limit, span). The
+        // pipeline struct is cloned once per worker thread, so every thread must score exactly
+        // like the original.
         Self {
-            aligner: self.aligner.clone(),
+            aligner: Self::new_aligner(&self.penalties, self.max_steps),
             cigar: self.cigar.clone(),
+            penalties: self.penalties.clone(),
+            max_steps: self.max_steps,
             span: self.span,
         }
     }
@@ -102,119 +139,68 @@ impl Clone for LIBWFA2Alignment {
 impl Align for LIBWFA2Alignment {
     fn align(&mut self, q: &[u8], r: &[u8]) -> (i32, &Cigar, Status) {
         self.cigar.0.clear();
-        self.apply_span(q.len(), r.len());
-
-        // Perform alignment
-        match self.aligner.align(q, r) {
-            AlignmentStatus::Completed => {
-                self.cigar.0.extend_from_slice(self.aligner.cigar());
-                (self.aligner.score(), &self.cigar, Status::OK)
-            },
-            AlignmentStatus::Partial => {
-                self.cigar.0.extend_from_slice(self.aligner.cigar());
-                if self.aligner.score() != std::i32::MIN {
-                    eprintln!("Yooo score {}", self.aligner.score());
-                    panic!("Yoo");
-                }
-                if !self.cigar.0.is_empty() {
-                    eprintln!("{} {} {}", self.aligner.score(), self.cigar.0.len(), String::from_utf8_lossy(&self.cigar.0))
-                }
-
-                (self.aligner.score(), &self.cigar, Status::Partial)
-            },
-            AlignmentStatus::MaxStepsReached => {
-                (std::i32::MIN, &self.cigar, Status::Dropped)
-            },
-            AlignmentStatus::OOM => panic!("Out of memory error."),
-            AlignmentStatus::Unattainable => panic!("Alignment status unattainable"),
-            AlignmentStatus::Undefined => panic!("Undefined alignment status"),
+        let (score, status) = self.run(q, r);
+        if matches!(status, AlignStatus::Completed | AlignStatus::Partial) {
+            self.cigar.0.extend_from_slice(self.aligner.cigar().operations_slice());
         }
+        let (score, status) = Self::outcome(score, status);
+        (score, &self.cigar, status)
     }
-    
+
     fn align_into(&mut self, q: &[u8], r: &[u8], cigar: &mut Cigar) -> (i32, Status) {
-        self.apply_span(q.len(), r.len());
-        // Perform alignment
-        match self.aligner.align(q, r) {
-            AlignmentStatus::Completed => {
-                cigar.0.extend_from_slice(self.aligner.cigar());
-                (self.aligner.score(), Status::OK)
-            },
-            AlignmentStatus::Partial => {
-                cigar.0.extend_from_slice(self.aligner.cigar());
-                (self.aligner.score(), Status::Partial)
-            },
-            AlignmentStatus::MaxStepsReached => {
-                (std::i32::MIN, Status::Dropped)
-            },
-            AlignmentStatus::OOM => panic!("Out of memory error."),
-            AlignmentStatus::Unattainable => panic!("Alignment status unattainable"),
-            AlignmentStatus::Undefined => panic!("Undefined alignment status"),
+        let (score, status) = self.run(q, r);
+        if matches!(status, AlignStatus::Completed | AlignStatus::Partial) {
+            cigar.0.extend_from_slice(self.aligner.cigar().operations_slice());
         }
+        Self::outcome(score, status)
     }
-    
+
     fn set_ends_free(&mut self, qstart: i32, qend: i32, rstart: i32, rend: i32) {
         // Stored, not applied: the clamp needs the sequence lengths, which are known only at align
-        // time (see `span` / `apply_span`).
+        // time (see `span` / `run`).
         self.span = Some((qstart, qend, rstart, rend));
     }
-
-
 }
 
 impl LIBWFA2Alignment {
     pub fn set_penalties(&mut self, match_: i32, mismatch: i32, gap_opening: i32, gap_extension: i32) {
-        self.aligner.set_penalties(match_, mismatch, gap_opening, gap_extension);
+        self.penalties = AffinePenalties { match_, mismatch, gap_opening, gap_extension };
+        self.aligner = Self::new_aligner(&self.penalties, self.max_steps);
     }
 
     pub fn with_penalties(match_: i32, mismatch: i32, gap_opening: i32, gap_extension: i32) -> Self {
-        let mut aligner = AffineWavefronts::with_penalties(match_, mismatch, gap_opening, gap_extension);
-        // WF-adaptive (10, 50, 1): what flexalign has always run (WFA2-lib's default, inherited
-        // silently before libwfa2 0.1.2), now set explicitly so every aligner and clone has it.
-        aligner.set_heuristic(&HEURISTIC);
+        let penalties = AffinePenalties { match_, mismatch, gap_opening, gap_extension };
         Self {
-            aligner,
+            aligner: Self::new_aligner(&penalties, i32::MAX),
             cigar: Cigar(Vec::new()),
+            penalties,
+            max_steps: i32::MAX,
             span: None,
         }
     }
 
     pub fn set_below_ani_abort(&mut self, min_ani: f64, overlap_length: usize) {
-        // (std::ceil((1 - min_ani) * static_cast<double>(overlap_length)) * mismatch_penalty) + 1;
-        let mismatch = unsafe{ *self.aligner.aligner() }.penalties.mismatch;
-        let score = ani_abort_score(min_ani, mismatch, overlap_length as i32);
-        self.aligner.set_max_alignment_score(score);
+        let score = ani_abort_score(min_ani, self.penalties.mismatch, overlap_length as i32);
+        self.set_max_alignment_score(score);
     }
 }
 
 impl Heuristic for LIBWFA2Alignment {
     fn set_max_alignment_score(&mut self, score: i32) {
-        self.aligner.set_max_alignment_score(score);
+        // WFA2-lib's max alignment score is its step limit (`max_alignment_steps`).
+        self.max_steps = score;
+        self.aligner.set_max_alignment_steps(score);
     }
 }
 
 impl Default for LIBWFA2Alignment {
     fn default() -> Self {
-        let mut aligner = AffineWavefronts::with_penalties(
+        Self::with_penalties(
             penalties::MATCH,
             penalties::MISMATCH,
             penalties::GAP_OPENING,
             penalties::GAP_EXTENSION,
-        );
-        // WF-adaptive (10, 50, 1): what flexalign has always run (WFA2-lib's default, inherited
-        // silently before libwfa2 0.1.2), now set explicitly so every aligner and clone has it.
-        aligner.set_heuristic(&HEURISTIC);
-        // aligner.set_heuristic(&HeuristicStrategy::XDrop { xdrop: std::i32::MIN, score_steps: 2 });
-        // aligner.set_heuristic(&HeuristicStrategy::BandedStatic { band_min_k: -1, band_max_k: 1 });
-        aligner.set_alignment_scope(libwfa2::affine_wavefront::AlignmentScope::Alignment);
-        aligner.set_alignment_span(libwfa2::affine_wavefront::AlignmentSpan::End2End);
-
-        // unsafe { wavefront_aligner_set_heuristic_xdrop(aligner.aligner_mut(), std::i32::MIN, 2) };
-
-        Self { 
-            aligner: aligner,
-            cigar: Cigar(Vec::new()),
-            span: None,
-        }
+        )
     }
 }
 

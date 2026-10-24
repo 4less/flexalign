@@ -11,7 +11,7 @@ and emits alignments (currently PAF; SAM support is in progress on the
 `paf_sam_support` branch — see `src/align/sam.rs`).
 
 The codebase depends on several sibling crates pulled from git
-(`kmerrs`, `flexmap`, `bioreader`) and on `libwfa2` for gapped alignment.
+(`kmerrs`, `flexmap`, `bioreader`) and on `wfa2lib-rs` (pure-Rust port of WFA2-lib) for gapped alignment.
 
 ## Dependency ecosystem (4less sibling crates)
 
