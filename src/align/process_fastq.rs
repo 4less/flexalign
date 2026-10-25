@@ -9,7 +9,7 @@ use crate::{
     GOLDSTD_EVAL, align::{
         modular_workflow::{self, FastHitScratch, Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, kmer_extractor::StdKmerExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
+            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
         }, 
         stats::Stats, 
         workflow
@@ -235,7 +235,7 @@ pub fn process_fastq_wrapper_modular<
         let mut modular_fwd = Modular {
             options,
             db,
-            kmer_extractor: StdKmerExtractor::<K, C, ClosedSyncmer<C, S, L>>::default(),
+            kmer_extractor: SyncmerKmerExtractor::<K, C, S, L>::default(),
             range_extractor: StdRangeExtractor::<K, C, F, FM>::new(db),
             seed_extractor: StdSeedExtractor::<K, C, F>::new(
                 options.args.max_best_flex,
@@ -275,7 +275,7 @@ pub fn process_fastq_wrapper_modular<
                 let mut modular_rev = Modular {
                     options,
                     db,
-                    kmer_extractor: StdKmerExtractor::<K, C, ClosedSyncmer<C, S, L>>::default(),
+                    kmer_extractor: SyncmerKmerExtractor::<K, C, S, L>::default(),
                     range_extractor: StdRangeExtractor::<K, C, F, FM>::new(db),
                     seed_extractor: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
