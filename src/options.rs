@@ -438,7 +438,8 @@ impl Options {
 
     pub fn init(&mut self) {
         self.fwd.extend(self.args.fwd.iter().map(|x| x.into()));
-        self.rev.extend(self.args.rev.iter().map(|x| Some(x.into())));
+        // `-2` defaults to one empty string: no reverse mate, the single-end pipeline.
+        self.rev.extend(self.args.rev.iter().map(|x| (!x.is_empty()).then(|| x.into())));
 
         if self.fwd.len() > 1 {
             if self.args.output.is_none() {
