@@ -26,7 +26,8 @@ channel = "nightly"
 kmerrs = { git = "https://github.com/4less/kmerr.git", rev = "3b86438d083ba83d334ba19a5f5a45ad045f247d" }
 flexmap = { git = "https://github.com/4less/flexmap.git", rev = "2fde119c833088dc8a9f4227148c42697d3e0478" }
 bioreader = { git = "https://github.com/4less/bioreader.git", rev = "1ba00bb9055ec71334c87576e12023f994dd1390" }
-libwfa2 = { git = "https://github.com/4less/libwfa2.git", rev = "ca5af926661b7e3ce41a9a122cde8273b1ea675f" }
+# Gapped alignment: the Rust port of WFA2-lib (replaces the C library through `libwfa2`).
+wfa2lib-rs = { git = "https://github.com/4less/wfa2lib-rs.git", rev = "9d67892ad787dd81e3fff94e87b43eb7eacd93a9", default-features = false }
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
 clap_derive = "4.5.3"
 flate2 = "1.0.28"

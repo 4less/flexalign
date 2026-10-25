@@ -18,8 +18,9 @@ or the output will be corrupt.
 ## Install
 
 flexalign needs the **Rust nightly** toolchain (it uses unstable language features and the
-`profile-rustflags` cargo feature) and a host C toolchain — `cc`, `make`, `cmake` — to build
-libwfa2's vendored WFA2-lib.
+`profile-rustflags` cargo feature) and a host C toolchain — `cc`, `make`, `cmake` — for the
+compression libraries (zlib, libdeflate). Gapped alignment uses `wfa2lib-rs`, a pure-Rust port of
+WFA2-lib, so no C build of WFA2-lib is involved.
 
 ```sh
 git clone https://github.com/4less/flexalign.git

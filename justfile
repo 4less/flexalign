@@ -68,7 +68,7 @@ install:
 # developer machine. Without that step a cluster build either fails or silently builds different
 # code than the pinned revisions.
 #
-# Needs: rustup (for nightly) and a host C toolchain (cc, make, cmake) for libwfa2. Load those with
+# Needs: rustup (for nightly) and a host C toolchain (cc, make, cmake) for zlib/libdeflate. Load those with
 # `module load` first if your cluster provides them that way.
 #
 #   just install-cluster                 # -> ~/bin
@@ -77,7 +77,7 @@ install-cluster PREFIX="~/bin":
     #!/usr/bin/env bash
     set -euo pipefail
     command -v rustup >/dev/null || { echo "rustup not found -- install from https://rustup.rs"; exit 1; }
-    for t in cc make cmake; do command -v $t >/dev/null || { echo "missing $t (needed by libwfa2)"; exit 1; }; done
+    for t in cc make cmake; do command -v $t >/dev/null || { echo "missing $t (needed by zlib/libdeflate)"; exit 1; }; done
     rustup toolchain install nightly --profile minimal
     # A local path override would defeat the point of a reproducible cluster build.
     if [ -f .cargo/config.toml ]; then
