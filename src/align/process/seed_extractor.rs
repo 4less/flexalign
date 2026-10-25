@@ -2,7 +2,67 @@
 
 use crate::{align::{common::SeedExtractor, data_structures::common::Seed, stats::Stats}, flexalign::stage_time};
 
+use flexmap::range::AnyRange;
+
 use super::range_extractor::Range;
+
+/// `AnyRange::flank_distances`: each flank cell's distance to `flex` into `out`, and the minimum
+/// (`u32::MAX` for none). A packed range's cells go 8 to an AVX2 step.
+#[inline]
+pub fn flank_distances(range: &AnyRange, flex: u32, out: &mut Vec<u8>) -> u32 {
+    match range {
+        AnyRange::Packed(p) => flank_distances_bytes(p.flex_bytes(), flex, out),
+        _ => range.flank_distances(flex, out),
+    }
+}
+
+/// [`flank_distances`] over packed flank cells (4 bytes each, little-endian).
+#[inline]
+fn flank_distances_bytes(cells: &[u8], flex: u32, out: &mut Vec<u8>) -> u32 {
+    let n = cells.len() / 4;
+    out.clear();
+    out.reserve(n);
+    let mut min = u32::MAX;
+    let mut i = 0usize;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use core::arch::x86_64::*;
+        let want = _mm256_set1_epi32(flex as i32);
+        let m55 = _mm256_set1_epi32(0x5555_5555);
+        let m33 = _mm256_set1_epi32(0x3333_3333);
+        let m0f = _mm256_set1_epi32(0x0F0F_0F0F);
+        let m3f = _mm256_set1_epi32(0x3F);
+        // The low byte of each 32-bit lane to the front of its 128-bit half, then both halves'
+        // fronts together.
+        let low_bytes = _mm256_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+        let fronts = _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0);
+        let mut vmin = _mm256_set1_epi32(-1);
+        let dst = out.as_mut_ptr();
+        while i + 8 <= n {
+            let x = _mm256_xor_si256(_mm256_loadu_si256(cells.as_ptr().add(4 * i) as *const __m256i), want);
+            // A base differs where either of its two bits does (flank_distance).
+            let v = _mm256_and_si256(_mm256_or_si256(x, _mm256_srli_epi32(x, 1)), m55);
+            let v = _mm256_add_epi32(_mm256_and_si256(v, m33), _mm256_and_si256(_mm256_srli_epi32(v, 2), m33));
+            let v = _mm256_and_si256(_mm256_add_epi32(v, _mm256_srli_epi32(v, 4)), m0f);
+            let v = _mm256_add_epi32(v, _mm256_srli_epi32(v, 8));
+            let d = _mm256_and_si256(_mm256_add_epi32(v, _mm256_srli_epi32(v, 16)), m3f);
+            vmin = _mm256_min_epu32(vmin, d);
+            let packed = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(d, low_bytes), fronts);
+            _mm_storel_epi64(dst.add(i) as *mut __m128i, _mm256_castsi256_si128(packed));
+            i += 8;
+        }
+        let mut lanes = [0u32; 8];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, vmin);
+        min = lanes.iter().copied().fold(min, u32::min);
+        out.set_len(i);
+    }
+    for c in cells[4 * i..].chunks_exact(4) {
+        let d = flexmap::packed::flank_distance(u32::from_le_bytes([c[0], c[1], c[2], c[3]]), flex);
+        out.push(d as u8);
+        min = min.min(d);
+    }
+    min
+}
 
 /// What one range did, which is what drives the `--ranges` budget.
 ///
@@ -122,7 +182,7 @@ impl<'a, const F: usize> Range<'a, F> {
     ) -> Option<(u32, usize)> {
         debug_assert!(max_best_flex <= out.len(), "out[] must hold a full kept set");
         // dist is a hamming distance over F<=16 flank bases, fits u8
-        let min_dist = self.vrange.flank_distances(self.fmer.0 as u32, dist_buf);
+        let min_dist = flank_distances(&self.vrange, self.fmer.0 as u32, dist_buf);
         if dist_buf.is_empty() {
             return Some((0, 0));
         }
@@ -298,5 +358,27 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
 
     fn put_seeds(&mut self, seeds: Vec<Seed>) {
         self.seeds = seeds;
+    }
+}
+
+#[cfg(test)]
+mod flank_distance_tests {
+    use super::flank_distances_bytes;
+
+    #[test]
+    fn simd_distances_match_scalar() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x as u32 };
+        let mut out = Vec::new();
+        for n in 0..40usize {
+            let flex = next();
+            // Cells near the flank too, so that small distances and the zero distance occur.
+            let cells: Vec<u32> = (0..n).map(|i| if i % 3 == 0 { flex ^ (next() & next() & next()) } else { next() }).collect();
+            let bytes: Vec<u8> = cells.iter().flat_map(|c| c.to_le_bytes()).collect();
+            let min = flank_distances_bytes(&bytes, flex, &mut out);
+            let want: Vec<u8> = cells.iter().map(|&c| flexmap::packed::flank_distance(c, flex) as u8).collect();
+            assert_eq!(out, want, "n {n}");
+            assert_eq!(min, want.iter().map(|&d| d as u32).min().unwrap_or(u32::MAX), "n {n}");
+        }
     }
 }
