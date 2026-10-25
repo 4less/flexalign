@@ -204,7 +204,13 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
         let (fwd, rev) = (self.fwd.as_slice(), self.rev.as_slice());
         let (fwd_min, rev_min) = (self.fwd_min.as_slice(), self.rev_min.as_slice());
         let mut kmers = std::mem::take(&mut self.kmers);
-        kmers.reserve(n / 8);
+        kmers.clear();
+        // At most one k-mer a base. Every k-mer is written to the next free slot and kept only
+        // if selected: the strand (canonical orientation) and the selection are coin flips to
+        // the branch predictor, so both tests are computed and picked, not branched on.
+        kmers.reserve(n);
+        let out = kmers.spare_capacity_mut();
+        let mut kept = 0usize;
         let (mut kf, mut kr) = (0u64, 0u64);
         let mut run = 0usize;
         let mut processed = 0usize;
@@ -229,17 +235,17 @@ impl<const K: usize, const C: usize, const S: usize, const L: usize> SyncmerKmer
             // In range by construction: p + L - 1 <= i + 1 - S < n_smers, and p <= n_smers - L
             // (the last full window), since p + L - 1 <= i + 1 - S.
             debug_assert!(p + L - 1 < n_smers && p < fwd_min.len());
-            let selected = unsafe {
-                if forward {
-                    *fwd.get_unchecked(p) == *fwd_min.get_unchecked(p)
-                } else {
-                    *rev.get_unchecked(p + L - 1) == *rev_min.get_unchecked(p)
-                }
+            let (sel_fwd, sel_rev) = unsafe {
+                (*fwd.get_unchecked(p) == *fwd_min.get_unchecked(p), *rev.get_unchecked(p + L - 1) == *rev_min.get_unchecked(p))
             };
-            if selected {
-                kmers.push((pos, Kmer::<K>(if forward { kf } else { kr })));
-            }
+            let selected = (forward & sel_fwd) | (!forward & sel_rev);
+            let kmer = if forward { kf } else { kr };
+            // SAFETY: kept <= processed - 1 < n = the reserved capacity.
+            unsafe { out.get_unchecked_mut(kept).write((pos, Kmer::<K>(kmer))) };
+            kept += selected as usize;
         }
+        // SAFETY: the first `kept` slots were written above.
+        unsafe { kmers.set_len(kept) };
         self.kmers = kmers;
         stats.kmers_processed += processed;
         stats.minimizer += self.kmers.len();
