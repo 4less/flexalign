@@ -2,13 +2,14 @@ use std::{collections::HashMap, fs::File, io::BufWriter};
 
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
 use flexmap::flexmap::{Flexmap, FlexmapBlob, VRangeGetter};
-use flexmap::packed::{CompactKeys, HashedKeys, PackedFlexmap};
+use flexmap::packed::{CompactKeys, HashedKeys, PackedFlexmap, SlotLocator};
 use flexmap::range::AnyRange;
 use std::sync::Arc;
 use savefile::{load, save};
 
 use crate::flexalign::time;
 
+use super::hashed_lines::HashedLines;
 use super::common::{DBPaths, load_references, FlexalignDatabase, IndexFormat, index_format};
 
 
@@ -23,7 +24,8 @@ pub enum FlexmapStore<const C: usize, const F: usize, const CELLS_PER_BODY: u64,
     Owned(Flexmap<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>),
     Mmap(FlexmapBlob<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>),
     Compact(Arc<PackedFlexmap<CompactKeys, C, F, HEADER_THRESHOLD>>),
-    Hashed(Arc<PackedFlexmap<HashedKeys, C, F, HEADER_THRESHOLD>>),
+    /// With a faster reader of its key table (`HashedLines`), which shares the table's memory.
+    Hashed(Arc<PackedFlexmap<HashedKeys, C, F, HEADER_THRESHOLD>>, HashedLines),
     /// No index: a reference-only load (`DB::load_reference_only`) of a packed index, which has no
     /// blob to map. Every key reads as absent.
     Absent,
@@ -38,7 +40,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
             FlexmapStore::Owned(f) => f.get_vrange(canonical_kmer).map(AnyRange::from),
             FlexmapStore::Mmap(b) => b.get_vrange(canonical_kmer).map(AnyRange::from),
             FlexmapStore::Compact(p) => p.get(canonical_kmer).map(AnyRange::from),
-            FlexmapStore::Hashed(p) => p.get(canonical_kmer).map(AnyRange::from),
+            FlexmapStore::Hashed(p, h) => h.locate(canonical_kmer).map(|(start, slots)| AnyRange::from(p.values.range(start, slots))),
             FlexmapStore::Absent => None,
         }
     }
@@ -48,7 +50,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
     fn for_each_vrange<'s>(&'s self, keys: &[u64], f: &mut dyn FnMut(usize, Option<AnyRange<'s>>)) {
         match self {
             FlexmapStore::Compact(p) => p.for_each_prefetched(keys, |i, r| f(i, r.map(AnyRange::from))),
-            FlexmapStore::Hashed(p) => p.for_each_prefetched(keys, |i, r| f(i, r.map(AnyRange::from))),
+            FlexmapStore::Hashed(p, h) => h.for_each(p, keys, |i, r| f(i, r.map(AnyRange::from))),
             FlexmapStore::Mmap(b) => {
                 let mut i = 0;
                 b.for_each_vrange_prefetched(keys, |_, r| {
@@ -69,21 +71,34 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         }
     }
 
+    fn hashed(index: PackedFlexmap<HashedKeys, C, F, HEADER_THRESHOLD>) -> Self {
+        let lines = HashedLines::new(&index.keys);
+        FlexmapStore::Hashed(Arc::new(index), lines)
+    }
+
+    /// Fetches the key-table lines of `keys`, ahead of a lookup of them.
+    #[inline]
+    fn prefetch_keys(&self, keys: &[u64]) {
+        match self {
+            FlexmapStore::Compact(p) => keys.iter().for_each(|&k| p.keys.prefetch_key(k)),
+            FlexmapStore::Hashed(_, h) => keys.iter().for_each(|&k| h.prefetch_key(k)),
+            _ => {}
+        }
+    }
+
     /// The packed index of `format` from this one (a built map or a blob); `self` if it already is one.
     fn into_packed(self, format: IndexFormat) -> Self {
         let compact = match (&self, format) {
-            (_, IndexFormat::Blob) | (FlexmapStore::Compact(_), IndexFormat::Compact) | (FlexmapStore::Hashed(_), IndexFormat::Hashed) => return self,
+            (_, IndexFormat::Blob) | (FlexmapStore::Compact(_), IndexFormat::Compact) | (FlexmapStore::Hashed(..), IndexFormat::Hashed) => return self,
             (FlexmapStore::Owned(m), _) => Arc::new(PackedFlexmap::from_flexmap(m)),
             (FlexmapStore::Mmap(b), _) => Arc::new(PackedFlexmap::from_blob(b)),
             (FlexmapStore::Compact(p), _) => Arc::clone(p),
-            (FlexmapStore::Hashed(_), _) => panic!("a hashed index cannot be converted to a compact one; rebuild"),
+            (FlexmapStore::Hashed(..), _) => panic!("a hashed index cannot be converted to a compact one; rebuild"),
             (FlexmapStore::Absent, _) => panic!("no index to convert"),
         };
         match format {
             IndexFormat::Compact => FlexmapStore::Compact(compact),
-            _ => FlexmapStore::Hashed(Arc::new(
-                PackedFlexmap::from_compact(&compact).expect("the hashed key table's fields fit 64 bits"),
-            )),
+            _ => Self::hashed(PackedFlexmap::from_compact(&compact).expect("the hashed key table's fields fit 64 bits")),
         }
     }
 
@@ -91,7 +106,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
     fn save_packed(&self, file: &str) -> std::io::Result<()> {
         match self {
             FlexmapStore::Compact(p) => p.save(file),
-            FlexmapStore::Hashed(p) => p.save(file),
+            FlexmapStore::Hashed(p, _) => p.save(file),
             _ => Ok(()),
         }
     }
@@ -102,7 +117,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
             FlexmapStore::Owned(m) => m.keys.data.len() * 2 + m.values.data.len() * 8,
             FlexmapStore::Mmap(b) => b.file_size(),
             FlexmapStore::Compact(p) => p.memory_bytes().0 + p.memory_bytes().1,
-            FlexmapStore::Hashed(p) => p.memory_bytes().0 + p.memory_bytes().1,
+            FlexmapStore::Hashed(p, _) => p.memory_bytes().0 + p.memory_bytes().1,
             FlexmapStore::Absent => 0,
         }
     }
@@ -119,8 +134,8 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         let file = paths.index_packed_file(format);
         if Self::packed_compatible(paths, format) {
             let store = match format {
-                IndexFormat::Hashed if index_mmap() => FlexmapStore::Hashed(Arc::new(PackedFlexmap::mmap(&file).expect("mappable hashed index"))),
-                IndexFormat::Hashed => FlexmapStore::Hashed(Arc::new(PackedFlexmap::load(&file, threads).expect("readable hashed index"))),
+                IndexFormat::Hashed if index_mmap() => Self::hashed(PackedFlexmap::mmap(&file).expect("mappable hashed index")),
+                IndexFormat::Hashed => Self::hashed(PackedFlexmap::load(&file, threads).expect("readable hashed index")),
                 _ if index_mmap() => FlexmapStore::Compact(Arc::new(PackedFlexmap::mmap(&file).expect("mappable compact index"))),
                 _ => FlexmapStore::Compact(Arc::new(PackedFlexmap::load(&file, threads).expect("readable compact index"))),
             };
@@ -405,6 +420,10 @@ impl<
         self.flexmap.for_each_vrange(keys, f)
     }
 
+    fn prefetch_keys(&self, keys: &[u64]) {
+        self.flexmap.prefetch_keys(keys)
+    }
+
     fn release_references(&self) {
         self.references.release();
     }
@@ -585,7 +604,7 @@ impl<
                 std::fs::write(paths.index_blob_file(), b.backing_bytes())?;
             }
             // A packed index is one file, read in full at load; no blob is written for it.
-            packed @ (FlexmapStore::Compact(_) | FlexmapStore::Hashed(_)) => {
+            packed @ (FlexmapStore::Compact(_) | FlexmapStore::Hashed(..)) => {
                 packed.save_packed(&paths.index_packed_file(index_format()))?;
             }
             FlexmapStore::Absent => {}

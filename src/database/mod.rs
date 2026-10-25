@@ -4,3 +4,4 @@ pub mod common;
 // hash API. The module file is retained but not compiled.
 // pub mod build;
 pub mod flexmap;
+pub mod hashed_lines;
