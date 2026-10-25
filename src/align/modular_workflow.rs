@@ -976,11 +976,15 @@ impl<
 
         log::trace!("{}\n{}", rec_fwd.to_string(), rec_rev.to_string());
 
-        // Extract minimizer
+        // Extract minimizer. Each mate's key lines are fetched as soon as its k-mers are known, so
+        // the second mate's extraction hides the first's misses: one read's keys are too few for
+        // the lookup's own fetch-ahead to cover them.
         let (duration, kmers_fwd) = stage_time(|| self.kmer_extractor_fwd.generate(rec_fwd, stats));
         stats.time_get_kmers += duration;
+        self.range_extractor_fwd.prefetch(kmers_fwd);
         let (duration, kmers_rev) = stage_time(|| self.kmer_extractor_rev.generate(rec_rev, stats));
         stats.time_get_kmers += duration;
+        self.range_extractor_rev.prefetch(kmers_rev);
 
         // The fast-hit path: a pair pinned by its unique k-mers is written here and never seeded.
         if self.options.args.fast_hit_on() && fast_hit_enabled() && self.output.has_b() {

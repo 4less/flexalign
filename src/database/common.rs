@@ -284,6 +284,8 @@ pub trait FlexalignDatabase {
             f(i, self.get_vrange(k));
         }
     }
+    /// Starts fetching the key-table lines of `keys` (a hint; the default does nothing).
+    fn prefetch_keys(&self, _keys: &[u64]) {}
     fn build(options: &Options) -> Self;
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error>;
     fn load(paths: &DBPaths, version: u32) -> Self;
@@ -308,6 +310,9 @@ impl<D: FlexalignDatabase> FlexalignDatabase for &D {
     }
     fn for_each_vrange<'s>(&'s self, keys: &[u64], f: &mut dyn FnMut(usize, Option<AnyRange<'s>>)) {
         (**self).for_each_vrange(keys, f)
+    }
+    fn prefetch_keys(&self, keys: &[u64]) {
+        (**self).prefetch_keys(keys)
     }
     fn build(_options: &Options) -> Self {
         unimplemented!("&DB is a borrowed read-only view; build the owned database instead")

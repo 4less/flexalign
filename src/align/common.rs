@@ -261,6 +261,9 @@ pub trait RangeExtractor<const C: usize, const F: usize> {
     fn unique_hits_strided(&mut self, _kmers: &[(usize, Kmer<C>)], _stride: usize, _max_positions: usize, _out: &mut Vec<UniqueHit>) -> bool {
         false
     }
+    /// Starts fetching the index lines of these k-mers' keys, so that a lookup of them soon after
+    /// finds them in cache. A hint: it changes no result.
+    fn prefetch(&mut self, _kmers: &[(usize, Kmer<C>)]) {}
     fn retrieve(&self) -> &[Range<'_, F>];
 }
 

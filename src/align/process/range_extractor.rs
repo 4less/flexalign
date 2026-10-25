@@ -37,11 +37,19 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     subset: Vec<(usize, Kmer<K>)>,
     /// Per-flank distance scratch of the fast path's header resolution.
     flex_scratch: Vec<u8>,
+    /// The keys `prefetch` fetches ahead, reused across reads.
+    prefetch_keys: Vec<u64>,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
     fn retrieve(&self) -> &[Range<'_, F>] {
         &self.ranges
+    }
+
+    fn prefetch(&mut self, kmers: &[(usize, Kmer<K>)]) {
+        self.prefetch_keys.clear();
+        self.prefetch_keys.extend(kmers.iter().map(|(_, kmer)| mask_coremer::<C>(kmer.middle::<C>().0)));
+        self.db.prefetch_keys(&self.prefetch_keys);
     }
     
     fn generate(&mut self, kmers: &[(usize, Kmer<K>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>] {
@@ -115,7 +123,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
                     }
                 }
             } else if n <= FAST_HIT_MAX_CELLS {
-                if let Some((0, kept)) = r.resolve_flex(max_positions.max(1), 0, &mut self.flex_scratch, &mut idx) {
+                if let Some(kept) = r.exact_flank_cells(max_positions.max(1), &mut self.flex_scratch, &mut idx) {
                     for &i in &idx[..kept] {
                         let (rval, rpos) = r.vrange.value(i as usize);
                         out.push(UniqueHit { qpos: r.qpos as u32, rval, rpos });
@@ -123,6 +131,34 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
                 }
             }
         }
+    }
+}
+
+impl<'a, const F: usize> Range<'a, F> {
+    /// The cells whose flank equals the read's: what `resolve_flex(max, 0, ..)` keeps when the
+    /// best flank distance is 0, found without the distances. Distance 0 means every flank base
+    /// matches, so the 32-bit flank cell equals the read's flank exactly. None when no cell
+    /// matches or more than `max` do. `out` holds at least `max` (<= `MAX_KEPT_TIES`) indices.
+    #[inline]
+    pub fn exact_flank_cells(&self, max: usize, dist_buf: &mut Vec<u8>, out: &mut [u32]) -> Option<usize> {
+        let AnyRange::Packed(p) = &self.vrange else {
+            return match self.resolve_flex(max, 0, dist_buf, out) {
+                Some((0, kept)) if kept > 0 => Some(kept),
+                _ => None,
+            };
+        };
+        let flex = self.fmer.0 as u32;
+        let mut count = 0usize;
+        for (i, c) in p.flex_bytes().chunks_exact(4).enumerate() {
+            if u32::from_le_bytes([c[0], c[1], c[2], c[3]]) == flex {
+                if count == max {
+                    return None;
+                }
+                out[count] = i as u32;
+                count += 1;
+            }
+        }
+        (count > 0).then_some(count)
     }
 }
 
@@ -154,6 +190,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new() }
     }
 }
+

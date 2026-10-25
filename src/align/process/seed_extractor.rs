@@ -129,13 +129,14 @@ impl<'a, const F: usize> Range<'a, F> {
         let threshold = min_dist + flank_slack;
         let mut count = 0usize;
         let mut stored = 0usize;
+        // Branch-free on the distance (which is data, and mispredicted): every index is written to
+        // the next free slot and kept only if within the threshold.
         for (i, &d) in dist_buf.iter().enumerate() {
-            if d as u32 <= threshold {
-                count += 1;
-                if stored < out.len() {
-                    out[stored] = i as u32;
-                    stored += 1;
-                }
+            let keep = (d as u32 <= threshold) as usize;
+            count += keep;
+            if stored < out.len() {
+                out[stored] = i as u32;
+                stored += keep;
             }
         }
         if count > max_best_flex {
