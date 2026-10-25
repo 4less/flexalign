@@ -31,6 +31,8 @@ pub struct StdAnchorExtractor {
 pub struct StdPairedAnchorExtractor {
     pub groups: SeedGroupPairedList,
     pub groups_paired: SeedGroupPairList,
+    /// Merge buffer of `merge_groups`, reused across reads.
+    pub groups_scratch: SeedGroupPairedList,
 
     pub indices: Vec<usize>,
     pub other_indices: Vec<usize>,
@@ -150,8 +152,8 @@ pub fn group_into_anchor_module<'a>(
         while !indices.is_empty() {
             let first = seeds.get(*indices.first().unwrap()).unwrap();
 
-            // Set first seed as an anchor.
-            let mut a: Anchor = Anchor::from_seed(first);
+            // Set first seed as an anchor, built in its slot (see `push_from_seed`).
+            let a = Anchor::push_from_seed(anchors, first);
 
             let mut offset = None;
             let mut forward = None;
@@ -182,11 +184,12 @@ pub fn group_into_anchor_module<'a>(
                 }
             }
 
-            anchors.push(a);
             _added_anchors += 1;
 
-            indices.clear();
+            // Swap before clearing: the swap's wide loads would otherwise stall on the store of
+            // the cleared length.
             swap(other_indices, indices);
+            other_indices.clear();
         }
 
         // let mut local_anchors = &anchors[anchor_group_index..];
@@ -367,6 +370,7 @@ impl StdPairedAnchorExtractor {
             other_indices: Vec::new(),
             groups: Vec::new(),
             groups_paired: Vec::new(),
+            groups_scratch: Vec::new(),
                     sort_scratch: Vec::new(),
             gate_min_core: None,
             gate_keep: 0,
@@ -381,6 +385,62 @@ impl StdPairedAnchorExtractor {
         self.gate_flank = flank;
         self
     }
+}
+
+/// Moves `from`'s anchors, last first, into `out` as one-mate pairs (`fwd`: the forward mate's),
+/// as popping them one by one would. Each anchor is copied straight from `from`'s buffer into its
+/// pair; wrapping a popped anchor goes through a stack temporary that is read back with wide loads
+/// right after narrow stores, which stall on store forwarding.
+fn push_singles(out: &mut Vec<AnchorPair>, from: &mut Vec<Anchor>, fwd: bool) {
+    use std::ptr::{addr_of_mut, read};
+    let n = from.len();
+    out.reserve(n);
+    unsafe {
+        from.set_len(0);
+        let mut len = out.len();
+        for i in (0..n).rev() {
+            let p = out.as_mut_ptr().add(len);
+            let a = read(from.as_ptr().add(i));
+            if fwd {
+                addr_of_mut!((*p).1).write(None);
+                addr_of_mut!((*p).0).write(Some(a));
+            } else {
+                addr_of_mut!((*p).0).write(None);
+                addr_of_mut!((*p).1).write(Some(a));
+            }
+            len += 1;
+        }
+        out.set_len(len);
+    }
+}
+
+/// Orders `groups` by (reference, forward) as a stable sort would. The first `split` groups
+/// (one mate) and the rest (the other) each come in increasing reference order when the seeds
+/// were sorted by reference, so the two runs are merged in one pass; keys never tie across runs,
+/// as their `forward` differs. Falls back to the sort when a run is out of order.
+fn merge_groups(groups: &mut SeedGroupPairedList, split: usize, scratch: &mut SeedGroupPairedList) {
+    let key = |e: &SeedGroupPaired| (e.reference, e.forward);
+    let (a, b) = groups.split_at(split);
+    let sorted = |r: &[SeedGroupPaired]| r.windows(2).all(|w| key(&w[0]) < key(&w[1]));
+    if !sorted(a) || !sorted(b) {
+        crate::align::common::sort_short_by_key(groups, key);
+        return;
+    }
+    scratch.clear();
+    scratch.reserve(groups.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if key(&b[j]) < key(&a[i]) {
+            scratch.push(b[j].clone());
+            j += 1;
+        } else {
+            scratch.push(a[i].clone());
+            i += 1;
+        }
+    }
+    scratch.extend_from_slice(&a[i..]);
+    scratch.extend_from_slice(&b[j..]);
+    swap(groups, scratch);
 }
 
 pub fn insert_size(
@@ -434,12 +494,10 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
         self.anchors.clear();
 
         seed_group_indices_paired_module(seeds_fwd, &mut self.groups, true);
-        let _fwd_size = self.groups.len();
+        let fwd_size = self.groups.len();
         seed_group_indices_paired_module(seeds_rev, &mut self.groups, false);
 
-        // eprintln!("Anchors (Fwd -> Rev): {} -> {}", fwd_size, self.groups.len());
-
-        crate::align::common::sort_short_by_key(&mut self.groups, |e| (e.reference, e.forward));
+        merge_groups(&mut self.groups, fwd_size, &mut self.groups_scratch);
 
         let mut current_idx = 0;
         let mut next_idx;
@@ -565,9 +623,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                     &mut self.anchors_fwd,
                 );
 
-                while !self.anchors_fwd.is_empty() {
-                    self.anchors.push(AnchorPair(self.anchors_fwd.pop(), None));
-                }
+                push_singles(&mut self.anchors, &mut self.anchors_fwd, true);
                 current_idx += 1;
             } else {
                 // eprintln!("SINGLE REV DEAL WITH REFERENCE:  {}", current.reference);
@@ -580,9 +636,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                     &mut self.other_indices,
                     &mut self.anchors_rev,
                 );
-                while !self.anchors_rev.is_empty() {
-                    self.anchors.push(AnchorPair(None, self.anchors_rev.pop()));
-                }
+                push_singles(&mut self.anchors, &mut self.anchors_rev, false);
                 current_idx += 1;
             }
         }
@@ -607,9 +661,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                     &mut self.anchors_fwd,
                 );
     
-                while !self.anchors_fwd.is_empty() {
-                    self.anchors.push(AnchorPair(self.anchors_fwd.pop(), None));
-                }
+                push_singles(&mut self.anchors, &mut self.anchors_fwd, true);
             } else {
                 // eprintln!("Extra SINGLE REV DEAL WITH REFERENCE:  {}", current.reference);
                 group_into_anchor_module(
@@ -621,9 +673,7 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                     &mut self.other_indices,
                     &mut self.anchors_rev,
                 );
-                while !self.anchors_rev.is_empty() {
-                    self.anchors.push(AnchorPair(None, self.anchors_rev.pop()));
-                }
+                push_singles(&mut self.anchors, &mut self.anchors_rev, false);
             }
         }
 

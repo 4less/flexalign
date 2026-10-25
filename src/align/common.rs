@@ -619,25 +619,75 @@ pub fn sort_pairs_by_key<K: Ord + Copy>(v: &mut [AnchorPair], scratch: &mut Vec<
     }
     scratch.clear();
     scratch.extend(v.iter().enumerate().map(|(i, a)| (key(a), i as u32)));
-    sort_short_by_key(scratch, |&(k, i)| (k, i));
-    // Apply the permutation in place by following its cycles.
-    let mut placed = vec![false; n];
+    // The table starts in index order, so a stable sort by key alone gives the (key, index) order.
+    if n > 48 {
+        scratch.sort_by_key(|&(k, _)| k);
+    } else {
+        for i in 1..n {
+            let cur = scratch[i];
+            let mut j = i;
+            while j > 0 && scratch[j - 1].0 > cur.0 {
+                scratch[j] = scratch[j - 1];
+                j -= 1;
+            }
+            scratch[j] = cur;
+        }
+    }
+    // Apply the permutation in place by following its cycles; a placed slot points at itself.
+    // Pairs move as raw copies of the same width: writing a placeholder pair into a slot and then
+    // copying it out stalls the wide loads on the placeholder's narrow stores.
+    let p = v.as_mut_ptr();
+    let mut tmp = std::mem::MaybeUninit::<AnchorPair>::uninit();
     for start in 0..n {
-        if placed[start] || scratch[start].1 as usize == start {
-            placed[start] = true;
+        if scratch[start].1 as usize == start {
             continue;
         }
-        let mut i = start;
-        let tmp = std::mem::replace(&mut v[i], AnchorPair(None, None));
-        loop {
-            let src = scratch[i].1 as usize;
-            placed[i] = true;
-            if src == start {
-                v[i] = tmp;
-                break;
+        unsafe {
+            std::ptr::copy_nonoverlapping(p.add(start), tmp.as_mut_ptr(), 1);
+            let mut i = start;
+            loop {
+                let src = scratch[i].1 as usize;
+                scratch[i].1 = i as u32;
+                if src == start {
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), p.add(i), 1);
+                    break;
+                }
+                std::ptr::copy_nonoverlapping(p.add(src), p.add(i), 1);
+                i = src;
             }
-            v[i] = std::mem::replace(&mut v[src], AnchorPair(None, None));
-            i = src;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::data_structures::{anchor::Anchor, common::Seed};
+
+    fn pair(id: u64, both: bool) -> AnchorPair {
+        let a = Anchor::from_seed(&Seed { rpos: id, rval: id, qpos: 0, mismatch: 0, length: 31, flag: 0 });
+        AnchorPair(Some(a.clone()), both.then_some(a))
+    }
+
+    #[test]
+    fn sort_pairs_by_key_matches_stable_sort() {
+        let mut scratch = Vec::new();
+        let mut x = 12345u64;
+        for n in [0usize, 1, 2, 3, 7, 17, 48, 49, 100] {
+            for _ in 0..20 {
+                let mut v: Vec<AnchorPair> = (0..n as u64)
+                    .map(|i| {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        pair(i * 8 + (x >> 61), x >> 60 & 1 == 1)
+                    })
+                    .collect();
+                let key = |p: &AnchorPair| (p.0.as_ref().unwrap().reference & 7) as i64 - p.1.is_some() as i64 * 3;
+                let mut want = v.clone();
+                want.sort_by_key(key);
+                sort_pairs_by_key(&mut v, &mut scratch, key);
+                let ids = |v: &[AnchorPair]| v.iter().map(|p| (p.0.as_ref().unwrap().reference, p.1.is_some())).collect::<Vec<_>>();
+                assert_eq!(ids(&v), ids(&want), "n {n}");
+            }
         }
     }
 }

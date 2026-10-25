@@ -338,6 +338,35 @@ impl Anchor {
         }
     }
     
+    /// `from_seed`, written field by field into a new last element of `anchors`, which it
+    /// returns. A pushed `from_seed` value is assembled on the stack and copied out with wide
+    /// loads right after its narrow field stores, and those loads stall on store forwarding.
+    #[inline(always)]
+    pub fn push_from_seed<'a>(anchors: &'a mut Vec<Anchor>, seed: &Seed) -> &'a mut Anchor {
+        use std::ptr::addr_of_mut;
+        anchors.reserve(1);
+        let len = anchors.len();
+        unsafe {
+            let p = anchors.as_mut_ptr().add(len);
+            addr_of_mut!((*p).reference).write(seed.rval);
+            addr_of_mut!((*p).seed_count).write(1);
+            addr_of_mut!((*p).mismatches).write(seed.mismatch as u32);
+            addr_of_mut!((*p).forward).write(true);
+            addr_of_mut!((*p).orientation_set).write(false);
+            addr_of_mut!((*p).flagged_for_indel).write(false);
+            addr_of_mut!((*p).flag).write(0);
+            addr_of_mut!((*p).counter1).write(0);
+            addr_of_mut!((*p).counter2).write(0);
+            addr_of_mut!((*p).score).write(0);
+            addr_of_mut!((*p).seeds).write(vec![AnchorSeed { qpos: seed.qpos, rpos: seed.rpos, length: seed.length as u32 }]);
+            addr_of_mut!((*p).cigar).write(None);
+            addr_of_mut!((*p).reference_cigar_range).write(0..0);
+            addr_of_mut!((*p).seed_status).write(AnchorStatus(false));
+            anchors.set_len(len + 1);
+            &mut *p
+        }
+    }
+
     pub fn deinitialize_anchor(&self) -> Self {
         let mut new_anchor = self.clone();
 
