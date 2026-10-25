@@ -392,6 +392,8 @@ pub struct FastHitScratch {
     cigar_fwd: Vec<u8>,
     cigar_rev: Vec<u8>,
     votes: Vec<(u64, i64, bool, u32)>,
+    /// Open-addressing index into `votes` (index + 1; 0 is empty), reused across mates.
+    vote_slots: Vec<u32>,
     cands_fwd: Vec<FastCand>,
     cands_rev: Vec<FastCand>,
     /// (key, index) table of the anchor-pair sorts, reused across reads.
@@ -436,6 +438,7 @@ fn fast_hit_mate<const K: usize, D: FlexalignDatabase>(
     rec: &RefFastqRecord,
     revc: &mut OwnedFastqRecord,
     votes: &mut Vec<(u64, i64, bool, u32)>,
+    slots: &mut Vec<u32>,
     cands: &mut Vec<FastCand>,
     min_hits: usize,
     max_mismatch: usize,
@@ -446,13 +449,37 @@ fn fast_hit_mate<const K: usize, D: FlexalignDatabase>(
         return Err(FastMiss::FewVotes);
     }
     votes.clear();
+    // Votes in first-seen order (the candidates' tie order), counted through a hash table of at
+    // most half load: two votes a hit, four slots a hit.
+    let size = (4 * hits.len()).next_power_of_two();
+    if slots.len() < size {
+        slots.resize(size, 0);
+    }
+    let slots = &mut slots[..size];
+    slots.fill(0);
+    let mask = size - 1;
     for h in hits {
         let fwd = (h.rval, h.rpos as i64 - h.qpos as i64, true);
         let rev = (h.rval, h.rpos as i64 - (len - K - h.qpos as usize) as i64, false);
         for key in [fwd, rev] {
-            match votes.iter_mut().find(|v| (v.0, v.1, v.2) == key) {
-                Some(v) => v.3 += 1,
-                None => votes.push((key.0, key.1, key.2, 1)),
+            let hash = (key.0 ^ (key.1 as u64).rotate_left(24) ^ (key.2 as u64) << 63).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut s = (hash >> 32) as usize & mask;
+            loop {
+                match slots[s] {
+                    0 => {
+                        slots[s] = votes.len() as u32 + 1;
+                        votes.push((key.0, key.1, key.2, 1));
+                        break;
+                    }
+                    v => {
+                        let e = &mut votes[v as usize - 1];
+                        if (e.0, e.1, e.2) == key {
+                            e.3 += 1;
+                            break;
+                        }
+                    }
+                }
+                s = (s + 1) & mask;
             }
         }
     }
@@ -570,7 +597,7 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
         if !ok {
             return false;
         }
-        match fast_hit_mate::<K, D>(db, &scratch.hits_fwd, rec_fwd, revc_fwd, &mut scratch.votes, &mut scratch.cands_fwd, min_hits, max_mm) {
+        match fast_hit_mate::<K, D>(db, &scratch.hits_fwd, rec_fwd, revc_fwd, &mut scratch.votes, &mut scratch.vote_slots, &mut scratch.cands_fwd, min_hits, max_mm) {
             Ok(()) => {}
             Err(FastMiss::FewVotes) if !full => continue,
             Err(e) => { if !full { re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd); } return miss(e, stats); }
@@ -583,7 +610,7 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
         if !ok {
             return false;
         }
-        match fast_hit_mate::<K, D>(db, &scratch.hits_rev, rec_rev, revc_rev, &mut scratch.votes, &mut scratch.cands_rev, min_hits, max_mm) {
+        match fast_hit_mate::<K, D>(db, &scratch.hits_rev, rec_rev, revc_rev, &mut scratch.votes, &mut scratch.vote_slots, &mut scratch.cands_rev, min_hits, max_mm) {
             Ok(()) => {}
             Err(FastMiss::FewVotes) if !full => continue,
             Err(e) => { if !full { re_fwd.unique_hits(kmers_fwd, max_pos, &mut scratch.hits_fwd); re_rev.unique_hits(kmers_rev, max_pos, &mut scratch.hits_rev); } return miss(e, stats); }
