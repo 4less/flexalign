@@ -697,6 +697,7 @@ fn write_sam_record<SO: SAMOutput>(
     mate: Option<&MateOut>,
     first_in_pair: bool,
     mapping_quality: u8,
+    lone_mate_penalty: u8,
     stats: &mut Stats,
 ) {
     let anchor = m.anchor;
@@ -747,6 +748,11 @@ fn write_sam_record<SO: SAMOutput>(
             (None, 0, 0)
         }
     };
+
+    // `--lone-mate-mapq-penalty`: a mate without its partner on the same reference. It stays at 1 or
+    // above when it had MAPQ, so it still ranks over the calls that were ambiguous to begin with.
+    let supported = mate.is_some_and(|mm| !mm.anchor.reference_cigar_range.is_empty() && mm.anchor.reference == anchor.reference);
+    let mapping_quality = if supported || mapping_quality == 0 { mapping_quality } else { mapping_quality.saturating_sub(lone_mate_penalty).max(1) };
 
     // SAM reserves MAPQ 255 for "unavailable". The pipeline's pseudo-mapq is a raw score gap, not a
     // phred-scaled probability, and can land on 255 -- clamp so it is never mistaken for "missing".
@@ -2467,6 +2473,7 @@ impl<
                     rev_mate,
                     true,
                     pseudo_mapq,
+                    self.options.args.lone_mate_mapq_penalty,
                     stats,
                 );
             }
@@ -2545,6 +2552,7 @@ impl<
                     fwd_mate,
                     false,
                     pseudo_mapq,
+                    self.options.args.lone_mate_mapq_penalty,
                     stats,
                 );
             }

@@ -100,9 +100,17 @@ pub struct Args {
     /// whose alignment cost passes below this identity is dropped mid-alignment rather than
     /// finished, and it gates the output, so no record is emitted below it. The identity is
     /// approximated from the alignment cost (gap cost is priced as mismatch cost), so indel-rich
-    /// alignments read slightly lower than their true identity.
-    #[arg(long = "min-ani", default_value_t = 0.85)]
+    /// alignments read slightly lower than their true identity. The default is the usual species
+    /// boundary: on a marker database most alignments below it are reads of a species the database
+    /// lacks, placed on a relative's marker.
+    #[arg(long = "min-ani", default_value_t = 0.95)]
     pub min_ani: f64,
+
+    /// MAPQ subtracted from a mate whose partner did not align to the same reference. Such lone
+    /// mates are far less often right than paired ones of the same MAPQ (on protal-mini, 63-83% vs
+    /// 93-96% at MAPQ 20-39), so without it a MAPQ cutoff drops good pairs before bad lone mates.
+    #[arg(long = "lone-mate-mapq-penalty", default_value_t = 25)]
+    pub lone_mate_mapq_penalty: u8,
 
     /// Minimum number of read bases an alignment must actually place for the record to be emitted.
     ///
