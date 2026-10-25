@@ -600,11 +600,33 @@ pub fn sort_short_by_key<T, K: Ord>(v: &mut [T], key: impl Fn(&T) -> K) {
         v.sort_by_key(key);
         return;
     }
+    // Insertion by a hole, as std's small sort does: the element being placed is read out once,
+    // its key computed once, and the larger ones shift up a slot each instead of being swapped.
+    // `Hole` writes the element back on drop, so a panicking `key` leaves `v` a permutation.
+    struct Hole<T> {
+        tmp: std::mem::ManuallyDrop<T>,
+        dst: *mut T,
+    }
+    impl<T> Drop for Hole<T> {
+        fn drop(&mut self) {
+            unsafe { std::ptr::copy_nonoverlapping(&*self.tmp as *const T, self.dst, 1) };
+        }
+    }
+    let p = v.as_mut_ptr();
     for i in 1..v.len() {
-        let mut j = i;
-        while j > 0 && key(&v[j - 1]) > key(&v[j]) {
-            v.swap(j - 1, j);
-            j -= 1;
+        unsafe {
+            if key(&*p.add(i - 1)) <= key(&*p.add(i)) {
+                continue;
+            }
+            let mut hole = Hole { tmp: std::mem::ManuallyDrop::new(std::ptr::read(p.add(i))), dst: p.add(i - 1) };
+            std::ptr::copy_nonoverlapping(p.add(i - 1), p.add(i), 1);
+            let k = key(&hole.tmp);
+            let mut j = i - 1;
+            while j > 0 && key(&*p.add(j - 1)) > k {
+                std::ptr::copy_nonoverlapping(p.add(j - 1), p.add(j), 1);
+                j -= 1;
+                hole.dst = p.add(j);
+            }
         }
     }
 }
@@ -667,6 +689,26 @@ mod tests {
     fn pair(id: u64, both: bool) -> AnchorPair {
         let a = Anchor::from_seed(&Seed { rpos: id, rval: id, qpos: 0, mismatch: 0, length: 31, flag: 0 });
         AnchorPair(Some(a.clone()), both.then_some(a))
+    }
+
+    #[test]
+    fn sort_short_by_key_matches_stable_sort() {
+        let mut x = 99u64;
+        for n in [0usize, 1, 2, 5, 16, 48, 49, 80] {
+            for _ in 0..50 {
+                let v: Vec<(u8, u32, String)> = (0..n as u32)
+                    .map(|i| {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        ((x >> 61) as u8, i, i.to_string())
+                    })
+                    .collect();
+                let mut got = v.clone();
+                let mut want = v;
+                want.sort_by_key(|e| e.0);
+                sort_short_by_key(&mut got, |e| e.0);
+                assert_eq!(got, want, "n {n}");
+            }
+        }
     }
 
     #[test]
