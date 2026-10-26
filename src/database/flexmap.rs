@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::BufWriter};
+use std::{collections::HashMap, fs::File, io::{BufReader, BufWriter}};
 
 use bioreader::sequence::fasta_record::OwnedFastaRecord;
 use flexmap::flexmap::{Flexmap, FlexmapBlob, VRangeGetter};
@@ -354,7 +354,7 @@ impl<
 
         // Names are part of the reference, needed to label output records.
         let (d_names, rid_to_rname) = time(|| -> Vec<String> {
-            load(&mut File::open(&paths.id2reference_path).expect("Working id2ref file"), crate::GLOBAL_VERSION)
+            load(&mut buffered(&paths.id2reference_path, "id2ref"), crate::GLOBAL_VERSION)
                 .expect("Valid id2ref")
         });
 
@@ -469,8 +469,8 @@ impl<
         let _ = version;
         let io_before = crate::database::common::disk_read_bytes();
 
-        let rid2rname_file = &mut File::open(&paths.id2reference_path).expect("Working id2ref file");
-        let rname2rid_file = &mut File::open(&paths.reference2id_path).expect("Working ref2id file");
+        let rid2rname_file = &mut buffered(&paths.id2reference_path, "id2ref");
+        let rname2rid_file = &mut buffered(&paths.reference2id_path, "ref2id");
         let references_file = &mut File::open(&paths.reference_path).expect("Working references file");
 
         // The blob is memory-mapped (open is near-instant, and it is read in full below); a packed
@@ -623,9 +623,10 @@ impl<
                 paths.id2reference_path.display(),
                 why
             ),
-            Ok(file) => file,
+            Ok(file) => BufWriter::new(file),
         };
         let _ = save(&mut file, version, &self.rid_to_rname);
+        let _ = std::io::Write::flush(&mut file);
     
     
         let mut file = match File::create(&paths.reference2id_path) {
@@ -634,9 +635,10 @@ impl<
                 paths.id2reference_path.display(),
                 why
             ),
-            Ok(file) => file,
+            Ok(file) => BufWriter::new(file),
         };
         let _ = save(&mut file, version, &self.rname_to_rid);
+        let _ = std::io::Write::flush(&mut file);
 
         // let mut ser = PureCopySerializer::<16, 8, 16, 1024, _>::new();
         // let storage = ser.serialize(&self.flexmap);
@@ -659,4 +661,10 @@ pub static INDEX_MMAP: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 fn index_mmap() -> bool {
     INDEX_MMAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A name table opened for savefile, buffered: savefile reads each entry with its own small reads,
+/// so a bare `File` costs two syscalls a name -- 5.4 M for 2.7 M names, seconds on Lustre.
+fn buffered(path: &std::path::Path, what: &str) -> BufReader<File> {
+    BufReader::with_capacity(1 << 20, File::open(path).unwrap_or_else(|e| panic!("{what} file {}: {e}", path.display())))
 }

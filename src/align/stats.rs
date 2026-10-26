@@ -392,47 +392,109 @@ impl Merge for Stats {
 }
 
 impl Display for Stats {
+    /// Only what this build and run measured: stage timings when timing is on (`--time-log`,
+    /// `--debug`, `FLEXALIGN_TIMING=1`), stage stops in a STAGE_TRACE build, the truth funnel in a
+    /// GOLDSTD_EVAL build. Otherwise those counters are all zero and only clutter the log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, 
+        let t = self.threads.max(1) as u32;
+        if crate::flexalign::STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed) || crate::STAGE_TRACE {
+            write!(f,
+                "\
+                Time for getting reverse complement.........{:?}\n\
+                Time for getting kmers......................{:?}\n\
+                ....Time for getting minimizers.............{:?}\n\
+                Time for getting ranges.....................{:?}\n\
+                ....Time for getting vranges................{:?}\n\
+                Time for sorting ranges.....................{:?}\n\
+                Time for getting range headers..............{:?}\n\
+                ....Header elements scanned.................{}\n\
+                ....Seed-extraction time per range..........{:?}\n\
+                ....Seed-extraction time per header elem....{:?}\n\
+                Time for sorting seeds......................{:?}\n\
+                Time for getting anchors....................{:?}\n\
+                Time for sorting anchors....................{:?}\n\
+                Time for the hamming screen.................{:?}\n\
+                Time for calculating offsets................{:?}\n\
+                Time for checking anchors...................{:?}\n\
+                Time for alignment..........................{:?}\n\
+                ....Time for seed extension.................{:?}\n\
+                ....Time for gapless prefilter..............{:?}\n\
+                ....Time for left flank.....................{:?}\n\
+                ....Time for interior.......................{:?}\n\
+                ....Time for right flank....................{:?}\n\n",
+                self.time_reverse_complement / t,
+                self.time_get_kmers / t,
+                self.time_get_minimizer / t,
+                self.time_get_ranges / t,
+                self.time_get_vranges / t,
+                self.time_range_sorting / t,
+                self.time_range_header / t,
+                self.header_elements,
+                // Per-range / per-header: total (thread-summed) seed-extraction time over total counts.
+                self.time_range_header / (self.ranges.min(u32::MAX as usize).max(1) as u32),
+                self.time_range_header / (self.header_elements.min(u32::MAX as usize).max(1) as u32),
+                self.time_seed_sorting / t,
+                self.time_get_anchors / t,
+                self.time_anchor_sorting / t,
+                self.time_hamming_screen / t,
+                self.time_offset / t,
+                self.time_checking_anchors / t,
+                self.time_alignment / t,
+                self.trace.t_seed_extension / t,
+                self.trace.t_prefilter / t,
+                self.trace.t_left_flank / t,
+                self.trace.t_middle / t,
+                self.trace.t_right_flank / t,
+            )?;
+        }
+        if crate::STAGE_TRACE {
+            write!(f,
+                "\
+                Anchor stops gapless prefilter..............{} all, {} true\n\
+                Anchor stops left flank.....................{} all, {} true\n\
+                Anchor stops interior.......................{} all, {} true\n\
+                Anchor stops right flank....................{} all, {} true\n\
+                Anchor stops complete.......................{} all, {} true\n\n",
+                self.align_stage_reached[AlignStage::Prefilter as usize],
+                self.align_stage_reached_true[AlignStage::Prefilter as usize],
+                self.align_stage_reached[AlignStage::LeftFlank as usize],
+                self.align_stage_reached_true[AlignStage::LeftFlank as usize],
+                self.align_stage_reached[AlignStage::Middle as usize],
+                self.align_stage_reached_true[AlignStage::Middle as usize],
+                self.align_stage_reached[AlignStage::RightFlank as usize],
+                self.align_stage_reached_true[AlignStage::RightFlank as usize],
+                self.align_stage_reached[AlignStage::Complete as usize],
+                self.align_stage_reached_true[AlignStage::Complete as usize],
+            )?;
+        }
+        if crate::GOLDSTD_EVAL {
+            write!(f,
+                "\
+                Truth funnel reads checked..................{}\n\
+                ....Truth anchor formed.....................{}\n\
+                ....Truth in hamming screen.................{}\n\
+                ....Truth ranked best after screen..........{}\n\
+                ....Truth in alignment window...............{}\n\
+                ....Truth reported..........................{}\n\n\
+                MATE-level funnel (denominator 2x checked)\n\
+                ....Truth anchor formed (mates).............{}\n\
+                ....Truth in hamming screen (mates).........{}\n\
+                ....Truth in alignment window (mates).......{}\n\
+                ....Truth reported (mates)..................{}\n\n",
+                self.dbg_checked,
+                self.dbg_true_anchor_present,
+                self.funnel_true_in_screen,
+                self.dbg_true_anchor_best,
+                self.funnel_true_in_align_window,
+                self.funnel_true_reported,
+                self.funnel_true_anchor_mates,
+                self.funnel_true_in_screen_mates,
+                self.funnel_true_in_align_window_mates,
+                self.funnel_true_reported_mates,
+            )?;
+        }
+        write!(f,
             "\
-            Time for getting reverse complement.........{:?}\n\
-            Time for getting kmers......................{:?}\n\
-            ....Time for getting minimizers.............{:?}\n\
-            Time for getting ranges.....................{:?}\n\
-            ....Time for getting vranges................{:?}\n\
-            Time for sorting ranges.....................{:?}\n\
-            Time for getting range headers..............{:?}\n\
-            ....Header elements scanned.................{}\n\
-            ....Seed-extraction time per range..........{:?}\n\
-            ....Seed-extraction time per header elem....{:?}\n\
-            Time for sorting seeds......................{:?}\n\
-            Time for getting anchors....................{:?}\n\
-            Time for sorting anchors....................{:?}\n\
-            Time for the hamming screen.................{:?}\n\
-            Time for calculating offsets................{:?}\n\
-            Time for checking anchors...................{:?}\n\
-            Time for alignment..........................{:?}\n\
-            ....Time for seed extension.................{:?}\n\
-            ....Time for gapless prefilter..............{:?}\n\
-            ....Time for left flank.....................{:?}\n\
-            ....Time for interior.......................{:?}\n\
-            ....Time for right flank....................{:?}\n\
-            Anchor stops gapless prefilter..............{} all, {} true\n\
-            Anchor stops left flank.....................{} all, {} true\n\
-            Anchor stops interior.......................{} all, {} true\n\
-            Anchor stops right flank....................{} all, {} true\n\
-            Anchor stops complete.......................{} all, {} true\n\
-            Truth funnel reads checked..................{}\n\
-            ....Truth anchor formed.....................{}\n\
-            ....Truth in hamming screen.................{}\n\
-            ....Truth ranked best after screen..........{}\n\
-            ....Truth in alignment window...............{}\n\
-            ....Truth reported..........................{}\n\n\
-            MATE-level funnel (denominator 2x checked)\n\
-            ....Truth anchor formed (mates).............{}\n\
-            ....Truth in hamming screen (mates).........{}\n\
-            ....Truth in alignment window (mates).......{}\n\
-            ....Truth reported (mates)..................{}\n\n\
             Pairs emitting only ONE mate................{:?}\n\
             ....dropped mate never anchored (seeding)...{:?}\n\
             ....dropped mate lost ranking (selection)...{:?}\n\
@@ -470,49 +532,6 @@ impl Display for Stats {
             Total Alignments partial per read...........{:.2}x\n\
             Total Alignments dropped per read...........{:.2}x\
             {}",
-            self.time_reverse_complement / self.threads as u32,
-            self.time_get_kmers / self.threads as u32,
-            self.time_get_minimizer / self.threads as u32,
-            self.time_get_ranges / self.threads as u32,
-            self.time_get_vranges / self.threads as u32,
-            self.time_range_sorting / self.threads as u32,
-            self.time_range_header / self.threads as u32,
-            self.header_elements,
-            // Per-range / per-header: total (thread-summed) seed-extraction time over total counts.
-            self.time_range_header / (self.ranges.min(u32::MAX as usize).max(1) as u32),
-            self.time_range_header / (self.header_elements.min(u32::MAX as usize).max(1) as u32),
-            self.time_seed_sorting / self.threads as u32,
-            self.time_get_anchors / self.threads as u32,
-            self.time_anchor_sorting / self.threads as u32,
-            self.time_hamming_screen / self.threads as u32,
-            self.time_offset / self.threads as u32,
-            self.time_checking_anchors / self.threads as u32,
-            self.time_alignment / self.threads as u32,
-            self.trace.t_seed_extension / self.threads as u32,
-            self.trace.t_prefilter / self.threads as u32,
-            self.trace.t_left_flank / self.threads as u32,
-            self.trace.t_middle / self.threads as u32,
-            self.trace.t_right_flank / self.threads as u32,
-            self.align_stage_reached[AlignStage::Prefilter as usize],
-            self.align_stage_reached_true[AlignStage::Prefilter as usize],
-            self.align_stage_reached[AlignStage::LeftFlank as usize],
-            self.align_stage_reached_true[AlignStage::LeftFlank as usize],
-            self.align_stage_reached[AlignStage::Middle as usize],
-            self.align_stage_reached_true[AlignStage::Middle as usize],
-            self.align_stage_reached[AlignStage::RightFlank as usize],
-            self.align_stage_reached_true[AlignStage::RightFlank as usize],
-            self.align_stage_reached[AlignStage::Complete as usize],
-            self.align_stage_reached_true[AlignStage::Complete as usize],
-            self.dbg_checked,
-            self.dbg_true_anchor_present,
-            self.funnel_true_in_screen,
-            self.dbg_true_anchor_best,
-            self.funnel_true_in_align_window,
-            self.funnel_true_reported,
-            self.funnel_true_anchor_mates,
-            self.funnel_true_in_screen_mates,
-            self.funnel_true_in_align_window_mates,
-            self.funnel_true_reported_mates,
             self.pairs_half_emitted,
             self.halfpair_mate_never_anchored,
             self.halfpair_mate_lost_selection,
@@ -551,8 +570,8 @@ impl Display for Stats {
             self.alignments_dropped as f64 / self.reads_processed as f64,
             if self.gold_std_evaluation.is_some() {
                 "\n\n".to_string() + &self.gold_std_evaluation.as_ref().unwrap().to_string()
-            } else { 
-                "".to_string() 
+            } else {
+                "".to_string()
             })
     }
 }

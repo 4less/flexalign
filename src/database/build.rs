@@ -36,9 +36,10 @@ pub fn default<
             db_paths.id2reference_path.display(),
             why
         ),
-        Ok(file) => file,
+        Ok(file) => BufWriter::new(file),
     };
     let _ = save(&mut file, GLOBAL_VERSION, &id2reference);
+    let _ = std::io::Write::flush(&mut file);
 
 
     let mut file = match File::create(&db_paths.reference2id_path) {
@@ -47,9 +48,10 @@ pub fn default<
             db_paths.id2reference_path.display(),
             why
         ),
-        Ok(file) => file,
+        Ok(file) => BufWriter::new(file),
     };
     let _ = save(&mut file, GLOBAL_VERSION, &reference2id);
+    let _ = std::io::Write::flush(&mut file);
 
 
     return Ok((flexmap, reference2id, id2reference));
@@ -96,9 +98,10 @@ pub fn hash<
             db_paths.id2reference_path.display(),
             why
         ),
-        Ok(file) => file,
+        Ok(file) => BufWriter::new(file),
     };
     let _ = save(&mut file, GLOBAL_VERSION, &id2reference);
+    let _ = std::io::Write::flush(&mut file);
 
 
     let mut file = match File::create(&db_paths.reference2id_path) {
@@ -107,9 +110,10 @@ pub fn hash<
             db_paths.id2reference_path.display(),
             why
         ),
-        Ok(file) => file,
+        Ok(file) => BufWriter::new(file),
     };
     let _ = save(&mut file, GLOBAL_VERSION, &reference2id);
+    let _ = std::io::Write::flush(&mut file);
 
 
     return Ok((flexmap, reference2id, id2reference));

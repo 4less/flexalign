@@ -92,7 +92,6 @@ pub fn process_fastq_wrapper<
                 
                 let mut state = Stats::default();
                 
-                eprintln!("GOLD STANDARD {}", GOLDSTD_EVAL);
                 if GOLDSTD_EVAL {
                     let mapqeval = state.gold_std_evaluation.as_mut().unwrap();
 
@@ -369,7 +368,6 @@ pub fn process_fastq_wrapper_modular<
                 
                 let mut state = Stats::default();
                 
-                eprintln!("GOLD STANDARD {}", GOLDSTD_EVAL);
                 if GOLDSTD_EVAL {
                     let mapqeval = state.gold_std_evaluation.as_mut().unwrap();
 
