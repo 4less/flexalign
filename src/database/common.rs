@@ -240,6 +240,12 @@ impl DBPaths {
         format!("{}.refseq", self.index_path.to_string_lossy())
     }
 
+    /// The bundle of a packed `format`: index, reference sequences and names in one file
+    /// (`database::bundle`). What a packed index is built into and loaded from.
+    pub fn bundle_file(&self, format: IndexFormat) -> String {
+        format!("{}.bundle", self.index_packed_file(format))
+    }
+
     /// The packed index file of `format` (`Compact` or `Hashed`).
     pub fn index_packed_file(&self, format: IndexFormat) -> String {
         match format {

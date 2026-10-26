@@ -182,6 +182,9 @@ pub fn run(args: Args) {
     // Shard-slicing mode: cut the built index into N physical shard files + a manifest, then exit.
     // The index is already built/loaded above, so `.flex.index.keys` exists for the slicer to read.
     if let Some(n_shards) = options.args.shard_slice {
+        // The slicer and the sharded join read the separate files (index, name files, reference
+        // blob), not a bundle.
+        db.save_separate(&db_paths, GLOBAL_VERSION).expect("writing the separate index files for slicing");
         drop(db); // the slicer re-reads the keys file; free the in-RAM copy first
         let (duration, manifest) = time(|| {
             crate::shard::slice::slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, n_shards, options.args.index_format)

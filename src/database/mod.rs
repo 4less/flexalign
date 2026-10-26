@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod common;
 // `build` held the legacy hash-index builder (flexmap::build::hash / FlexmapHash); the live path
 // builds via `flexmap::build::default_build` in `flexmap::DB`. Disabled after flexmap dropped the

@@ -9,6 +9,7 @@ use savefile::{load, save};
 
 use crate::flexalign::time;
 
+use super::bundle::{self, Bundle, NameTable, Names};
 use super::hashed_lines::HashedLines;
 use super::common::{DBPaths, load_references, FlexalignDatabase, IndexFormat, index_format};
 
@@ -168,18 +169,27 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
 const REFSEQ_MAGIC: [u8; 8] = *b"FREFSEQ1";
 
 pub struct RefSeqBlob {
-    // `Arc` so the DB wrapper stays cheaply cloneable per worker while sharing one mapping; the raw
-    // pointers remain valid views into it.
-    backing: std::sync::Arc<memmap2::Mmap>,
+    // Shared so the DB wrapper stays cheaply cloneable per worker; the raw pointers remain valid
+    // views into it.
+    backing: RefBacking,
     offsets: *const u64, // n+1 little-endian offsets into the data section; offsets[0] == 0
     data: *const u8,
     n: usize,
 }
+
+/// What a [`RefSeqBlob`]'s bytes live in: its own mapped file, or the reference section
+/// (offset, length) of a bundle read in or mapped.
+#[derive(Clone)]
+enum RefBacking {
+    File(std::sync::Arc<memmap2::Mmap>),
+    Bundle(flexmap::memory::SharedBytes, usize, usize),
+}
+
 unsafe impl Send for RefSeqBlob {}
 unsafe impl Sync for RefSeqBlob {}
 impl Clone for RefSeqBlob {
     fn clone(&self) -> Self {
-        Self { backing: std::sync::Arc::clone(&self.backing), offsets: self.offsets, data: self.data, n: self.n }
+        Self { backing: self.backing.clone(), offsets: self.offsets, data: self.data, n: self.n }
     }
 }
 impl RefSeqBlob {
@@ -196,56 +206,87 @@ impl RefSeqBlob {
     /// Drop this mapping's resident pages (`MADV_DONTNEED`). Read-only and file-backed, so nothing
     /// is lost: a later access re-faults from the page cache. Used by `--ref-budget` to bound the
     /// resident set to one batch's worth of reference instead of everything the run ever touched.
+    /// A bundle read into memory has no file behind it, so its pages stay.
     ///
     /// There is deliberately no `prefault` counterpart here: the up-front reference read goes
     /// through `common::warm_file`, which reads the file with several threads (~2 GB/s) rather than
     /// touching mapped pages one at a time on a single thread (~1 GB/s). Same bytes, half the time.
     fn release(&self) {
         // `DontNeed` is `unchecked` in memmap2 because on a writable private mapping it discards
-        // un-written changes. This mapping is read-only and file-backed (`Mmap`, never `MmapMut`),
-        // so there is nothing to lose: the pages are clean, and a later `get` re-faults them from
-        // the page cache.
-        unsafe {
-            let _ = self.backing.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
+        // un-written changes. These mappings are read-only and file-backed (`Mmap`, never
+        // `MmapMut`), so there is nothing to lose: the pages are clean, and a later `get` re-faults
+        // them from the page cache.
+        match &self.backing {
+            RefBacking::File(m) => unsafe {
+                let _ = m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
+            },
+            RefBacking::Bundle(bytes, offset, len) => {
+                if let Some(m) = bytes.mapping() {
+                    // Whole pages inside the section only: the index shares the mapping.
+                    let start = (offset + 4095) / 4096 * 4096;
+                    let end = (offset + len) / 4096 * 4096;
+                    if end > start {
+                        unsafe {
+                            let _ = m.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, end - start);
+                        }
+                    }
+                }
+            }
         }
     }
 
-    /// Layout: `MAGIC(8) | n(8) | offsets((n+1)*8) | data`. Little-endian; `offsets[0] == 0`.
-    fn write(filename: &str, records: &[OwnedFastaRecord]) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = BufWriter::new(File::create(filename)?);
+    /// Writes the reference section: `MAGIC(8) | n(8) | offsets((n+1)*8) | data`. Little-endian;
+    /// `offsets[0] == 0`. Returns the bytes written.
+    fn write_to<'s, W: std::io::Write>(f: &mut W, n: usize, seq: &dyn Fn(usize) -> &'s [u8]) -> std::io::Result<u64> {
         f.write_all(&REFSEQ_MAGIC)?;
-        f.write_all(&(records.len() as u64).to_le_bytes())?;
+        f.write_all(&(n as u64).to_le_bytes())?;
         let mut off: u64 = 0;
         f.write_all(&off.to_le_bytes())?;
-        for r in records {
-            off += r.seq().len() as u64;
+        for i in 0..n {
+            off += seq(i).len() as u64;
             f.write_all(&off.to_le_bytes())?;
         }
-        for r in records {
-            f.write_all(r.seq())?;
+        for i in 0..n {
+            f.write_all(seq(i))?;
         }
-        Ok(())
+        Ok(16 + 8 * (n as u64 + 1) + off)
+    }
+
+    /// The reference section as its own file (the layout of [`write_to`](Self::write_to)).
+    fn write(filename: &str, records: &[OwnedFastaRecord]) -> std::io::Result<()> {
+        let mut f = BufWriter::new(File::create(filename)?);
+        Self::write_to(&mut f, records.len(), &|i| records[i].seq())?;
+        std::io::Write::flush(&mut f)
+    }
+
+    /// Pointers into `bytes`, which hold a reference section; `None` if they do not.
+    fn parse(bytes: &[u8]) -> Option<(*const u64, *const u8, usize)> {
+        if bytes.len() < 16 || bytes[0..8] != REFSEQ_MAGIC {
+            return None;
+        }
+        let n = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+        let offsets_start = 16usize;
+        let data_start = offsets_start + (n + 1) * 8;
+        if bytes.len() < data_start {
+            return None;
+        }
+        let base = bytes.as_ptr();
+        // offsets_start (16) is 8-byte aligned and the section starts on a page, so the u64 reads
+        // are aligned.
+        Some((unsafe { base.add(offsets_start) } as *const u64, unsafe { base.add(data_start) }, n))
     }
 
     fn mmap_from_file(filename: &str) -> Option<Self> {
         let file = File::open(filename).ok()?;
         let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-        if mmap.len() < 16 || mmap[0..8] != REFSEQ_MAGIC {
-            return None;
-        }
-        let n = u64::from_le_bytes(mmap[8..16].try_into().ok()?) as usize;
-        let offsets_start = 16usize;
-        let data_start = offsets_start + (n + 1) * 8;
-        if mmap.len() < data_start {
-            return None;
-        }
-        let base = mmap.as_ptr();
-        // offsets_start (16) is 8-byte aligned and the mmap base is page-aligned, so the u64 reads
-        // are aligned.
-        let offsets = unsafe { base.add(offsets_start) } as *const u64;
-        let data = unsafe { base.add(data_start) };
-        Some(Self { backing: std::sync::Arc::new(mmap), offsets, data, n })
+        let (offsets, data, n) = Self::parse(&mmap)?;
+        Some(Self { backing: RefBacking::File(std::sync::Arc::new(mmap)), offsets, data, n })
+    }
+
+    fn from_bundle(bundle: &Bundle) -> Option<Self> {
+        let (offset, len) = bundle.section(bundle::REFSEQ)?;
+        let (offsets, data, n) = Self::parse(&bundle.bytes.bytes()[offset..offset + len])?;
+        Some(Self { backing: RefBacking::Bundle(bundle.bytes.clone(), offset, len), offsets, data, n })
     }
 }
 
@@ -290,7 +331,7 @@ pub struct DB<
     const HEADER_THRESHOLD: usize,
 > {
     flexmap: FlexmapStore<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>,
-    rid_to_rname: Vec<String>,
+    rid_to_rname: Names,
     rname_to_rid: HashMap<String, usize>,
     references: RefStore,
 }
@@ -314,9 +355,10 @@ impl<
         let names = paths.names_valid();
         match index_format() {
             IndexFormat::Blob => blob,
-            // A packed index of this format, or a blob to convert to one at load.
-            IndexFormat::Compact => names && (blob || Self::packed_compatible(paths, IndexFormat::Compact)),
-            IndexFormat::Hashed => names && (blob || Self::packed_compatible(paths, IndexFormat::Hashed)),
+            // The bundle of this format; or a packed index of it, or a blob to convert to one, with
+            // the separate name files.
+            format => Self::bundle_compatible(paths, format)
+                || (names && (blob || Self::packed_compatible(paths, format))),
         }
     }
 
@@ -387,7 +429,7 @@ impl<
         eprintln!("  -> {read_gb:.1} GB read from disk (reference only; the {} index is mapped but untouched)",
                   paths.index_blob_file());
 
-        Self { flexmap, rid_to_rname, rname_to_rid: HashMap::new(), references }
+        Self { flexmap, rid_to_rname: Names::Owned(rid_to_rname), rname_to_rid: HashMap::new(), references }
     }
 }
 
@@ -405,11 +447,7 @@ impl<
     }
 
     fn get_rname(&self, id: usize) -> Option<&str> {
-        if (id as usize) < self.rid_to_rname.len() {
-            return Some(&self.rid_to_rname[id as usize])
-        } else {
-            None
-        }
+        self.rid_to_rname.get(id)
     }
 
     fn get_vrange(&self, canonical_kmer: u64) -> Option<AnyRange<'_>> {
@@ -459,7 +497,7 @@ impl<
         }
         Self {
             flexmap,
-            rid_to_rname,
+            rid_to_rname: Names::Owned(rid_to_rname),
             rname_to_rid,
             references: RefStore::Owned(references),
         }
@@ -467,6 +505,9 @@ impl<
 
     fn load(paths: &super::common::DBPaths, version: u32) -> Self {
         let _ = version;
+        if index_format() != IndexFormat::Blob && Self::bundle_compatible(paths, index_format()) {
+            return Self::load_bundle(paths, index_format());
+        }
         let io_before = crate::database::common::disk_read_bytes();
 
         let rid2rname_file = &mut buffered(&paths.id2reference_path, "id2ref");
@@ -584,13 +625,40 @@ impl<
 
         Self {
             flexmap,
-            rid_to_rname,
+            rid_to_rname: Names::Owned(rid_to_rname),
             rname_to_rid,
             references,
         }
     }
     
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
+        if matches!(self.flexmap, FlexmapStore::Compact(_) | FlexmapStore::Hashed(..)) {
+            return self.save_bundle(paths);
+        }
+        self.save_separate(paths, version)
+    }
+
+    fn get_reference(&self, id: usize) -> Option<&[u8]> {
+        if id < self.references.len() {
+            Some(self.references.get(id))
+        } else {
+            None
+        }
+    }
+}
+
+impl<
+    const K: usize,
+    const C: usize,
+    const F: usize,
+    const S: usize,
+    const L: usize,
+    const CELLS_PER_BODY: u64,
+    const HEADER_THRESHOLD: usize,
+> DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> {
+    /// The index, reference and names as separate files, as before bundles (and for the blob
+    /// format, and for shard slicing, which reads the name files and the reference blob).
+    pub fn save_separate(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
         let _ = version;
         match &self.flexmap {
             // A freshly built map: write the single-file blob (mmap-loaded next run) and, for the
@@ -610,48 +678,108 @@ impl<
             FlexmapStore::Absent => {}
         }
 
-        // Write the memory-mappable reference-sequence blob so the next load skips re-parsing the
-        // FASTA. Only possible when the sequences are still owned in RAM (a fresh build); a loaded
-        // index is already backed by the blob.
-        if let RefStore::Owned(records) = &self.references {
-            RefSeqBlob::write(&paths.refseq_file(), records)?;
+        // The memory-mappable reference-sequence blob, so the next load skips re-parsing the FASTA.
+        // A blob loaded from that file is already on disk; owned records and a bundle's section
+        // are written out.
+        if !matches!(&self.references, RefStore::Mmap(RefSeqBlob { backing: RefBacking::File(_), .. })) {
+            let mut f = BufWriter::new(File::create(paths.refseq_file())?);
+            RefSeqBlob::write_to(&mut f, self.references.len(), &|i| self.references.get(i))?;
+            std::io::Write::flush(&mut f)?;
         }
 
-        let mut file = match File::create(&paths.id2reference_path) {
-            Err(why) => panic!(
-                "couldn't open {}: {}",
-                paths.id2reference_path.display(),
-                why
-            ),
-            Ok(file) => BufWriter::new(file),
+        let names: Vec<String> = match &self.rid_to_rname {
+            Names::Owned(v) => v.clone(),
+            Names::Table(t) => (0..t.len()).map(|i| t.get(i).unwrap().to_string()).collect(),
         };
-        let _ = save(&mut file, version, &self.rid_to_rname);
-        let _ = std::io::Write::flush(&mut file);
-    
-    
-        let mut file = match File::create(&paths.reference2id_path) {
-            Err(why) => panic!(
-                "couldn't open {}: {}",
-                paths.id2reference_path.display(),
-                why
-            ),
-            Ok(file) => BufWriter::new(file),
-        };
-        let _ = save(&mut file, version, &self.rname_to_rid);
+        let mut file = BufWriter::new(File::create(&paths.id2reference_path)
+            .unwrap_or_else(|why| panic!("couldn't open {}: {}", paths.id2reference_path.display(), why)));
+        let _ = save(&mut file, version, &names);
         let _ = std::io::Write::flush(&mut file);
 
-        // let mut ser = PureCopySerializer::<16, 8, 16, 1024, _>::new();
-        // let storage = ser.serialize(&self.flexmap);
+        // A bundle load keeps no name -> id map; it is the inverse of the names.
+        let rname_to_rid: HashMap<String, usize> = if self.rname_to_rid.is_empty() {
+            names.iter().enumerate().skip(1).map(|(i, n)| (n.clone(), i)).collect()
+        } else {
+            self.rname_to_rid.clone()
+        };
+        let mut file = BufWriter::new(File::create(&paths.reference2id_path)
+            .unwrap_or_else(|why| panic!("couldn't open {}: {}", paths.reference2id_path.display(), why)));
+        let _ = save(&mut file, version, &rname_to_rid);
+        let _ = std::io::Write::flush(&mut file);
 
         Ok(())
     }
-    
-    fn get_reference(&self, id: usize) -> Option<&[u8]> {
-        if id < self.references.len() {
-            Some(self.references.get(id))
-        } else {
-            None
+
+    /// Writes the packed index, the reference and the names as one bundle
+    /// (`paths.bundle_file(format)`).
+    fn save_bundle(&self, paths: &DBPaths) -> Result<(), std::io::Error> {
+        let file = paths.bundle_file(index_format());
+        bundle::write(
+            &file,
+            |w| match &self.flexmap {
+                FlexmapStore::Compact(p) => p.write_to(w),
+                FlexmapStore::Hashed(p, _) => p.write_to(w),
+                _ => unreachable!("a bundle holds a packed index"),
+            },
+            |w| RefSeqBlob::write_to(w, self.references.len(), &|i| self.references.get(i)),
+            &|i| self.rid_to_rname.get(i).unwrap_or(""),
+            self.rid_to_rname.len(),
+        )
+    }
+
+    /// Whether `paths` has a bundle of `format` whose index this build reads.
+    fn bundle_compatible(paths: &DBPaths, format: IndexFormat) -> bool {
+        match bundle::Bundle::peek_index(&paths.bundle_file(format)) {
+            Some(head) => match format {
+                IndexFormat::Hashed => PackedFlexmap::<HashedKeys, C, F, HEADER_THRESHOLD>::is_compatible_header(&head),
+                _ => PackedFlexmap::<CompactKeys, C, F, HEADER_THRESHOLD>::is_compatible_header(&head),
+            },
+            None => false,
         }
+    }
+
+    /// The whole database from its bundle: one parallel read into huge pages (or one mapping with
+    /// `--index-mmap`), of which the index, the reference and the names are views.
+    fn load_bundle(paths: &DBPaths, format: IndexFormat) -> Self {
+        let file = paths.bundle_file(format);
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let io_before = crate::database::common::disk_read_bytes();
+        let mmap = index_mmap();
+        let (d_read, bundle) = time(|| Bundle::open(&file, mmap, threads).unwrap_or_else(|e| panic!("bundle {file}: {e}")));
+        let (d_views, (flexmap, references, names)) = time(|| {
+            let (offset, _) = bundle.section(bundle::INDEX).expect("bundle has an index");
+            let flexmap = match format {
+                IndexFormat::Hashed => FlexmapStore::hashed(PackedFlexmap::from_shared(&bundle.bytes, offset)),
+                _ => FlexmapStore::Compact(Arc::new(PackedFlexmap::from_shared(&bundle.bytes, offset))),
+            };
+            let references = RefSeqBlob::from_bundle(&bundle).expect("bundle has the reference");
+            let names = NameTable::from_bundle(&bundle).expect("bundle has the names");
+            (flexmap, references, names)
+        });
+        // The name -> id map only serves the gold-standard evaluation.
+        let rname_to_rid: HashMap<String, usize> = if crate::GOLDSTD_EVAL {
+            (1..names.len()).map(|i| (names.get(i).unwrap().to_string(), i)).collect()
+        } else {
+            HashMap::new()
+        };
+        let gb = bundle.bytes.len() as f64 / 1e9;
+        let read_gb = crate::database::common::disk_read_bytes().saturating_sub(io_before) as f64 / 1e9;
+        eprintln!(
+            "Database load {:.2}s total: bundle {file} ({gb:.2} GB)\n  \
+             {:<10} {:>8.3}s  ({})\n  \
+             {:<10} {:>8.3}s  (index {:.2} GB, {} reference sequences, {} names: views, nothing copied)\n  \
+             -> {read_gb:.2} GB read from disk during load",
+            d_read.as_secs_f64() + d_views.as_secs_f64(),
+            if mmap { "mapped" } else { "read" },
+            d_read.as_secs_f64(),
+            if mmap { format!("mmap, populated on {threads} threads") } else { format!("{threads} threads, huge pages") },
+            "views",
+            d_views.as_secs_f64(),
+            flexmap.memory_bytes() as f64 / 1e9,
+            references.len(),
+            names.len(),
+        );
+        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references: RefStore::Mmap(references) }
     }
 }
 
