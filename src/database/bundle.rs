@@ -98,13 +98,15 @@ fn write_names<'s>(out: &mut BufWriter<File>, names: &dyn Fn(usize) -> &'s str, 
 /// A bundle file, read in or mapped.
 pub struct Bundle {
     pub bytes: SharedBytes,
+    /// Whether the bytes are a mapping (`--index-mmap` on a local filesystem) or were read in.
+    pub mapped: bool,
     sections: Vec<(u32, usize, usize)>,
 }
 
 impl Bundle {
     /// `mmap`: map the file and populate it on `threads` threads (the pages are the page cache's,
-    /// shared by every run on the machine). Otherwise read it all on `threads` threads into huge
-    /// pages of this process.
+    /// shared by every run on the machine). Otherwise -- and always on a network filesystem, see
+    /// [`on_network_fs`] -- read it all on `threads` threads into huge pages of this process.
     pub fn open(path: &str, mmap: bool, threads: usize) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
@@ -112,6 +114,7 @@ impl Bundle {
         // tables (~25 ms for 1.4 GB); uncached it reads the file as fast as the parallel read does.
         // Left to fault in lazily, k-mer lookups would read it page by page in random order (3-4x
         // slower runs from a cold cache).
+        let mmap = mmap && !on_network_fs(&file);
         let bytes = if mmap { SharedBytes::mmap(&file)? } else { SharedBytes::read(&file, 0, len, threads)? };
         if mmap {
             populate(&bytes, threads);
@@ -121,7 +124,7 @@ impl Bundle {
         if sections.iter().any(|&(_, offset, len)| offset + len > bytes.len()) {
             return Err(std::io::Error::other(format!("{path}: truncated bundle")));
         }
-        Ok(Self { bytes, sections })
+        Ok(Self { bytes, mapped: mmap, sections })
     }
 
     fn parse(header: &[u8]) -> Option<Vec<(u32, usize, usize)>> {
@@ -159,6 +162,24 @@ impl Bundle {
     pub fn section(&self, kind: u32) -> Option<(usize, usize)> {
         self.sections.iter().find(|s| s.0 == kind).map(|&(_, offset, len)| (offset, len))
     }
+}
+
+/// Whether `file` lives on a network filesystem, where page faults of a mapping go through the
+/// filesystem client one page at a time: on Lustre a cached 6.56 GB bundle took 14.97 s mapped and
+/// populated on 32 threads, 0.24 s read in parallel. There the bundle is always read.
+pub fn on_network_fs(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    const LUSTRE: i64 = 0x0BD0_0BD0;
+    const NFS: i64 = 0x6969;
+    const GPFS: i64 = 0x4750_4653;
+    const CIFS: i64 = 0xFF53_4D42;
+    const SMB2: i64 = 0xFE53_4D42;
+    const BEEGFS: i64 = 0x1983_0326;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    matches!(st.f_type as i64, LUSTRE | NFS | GPFS | CIFS | SMB2 | BEEGFS)
 }
 
 /// Faults every page of a mapped bundle in now, on `threads` threads (`MADV_POPULATE_READ`, one
@@ -263,6 +284,14 @@ impl Names {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_temp_dir_is_not_a_network_filesystem() {
+        let path = std::env::temp_dir().join(format!("flexalign_fs_{}.bin", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        assert!(!on_network_fs(&File::open(&path).unwrap()));
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn names_and_sections_round_trip() {

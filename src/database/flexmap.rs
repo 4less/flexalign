@@ -744,8 +744,8 @@ impl<
         let file = paths.bundle_file(format);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let io_before = crate::database::common::disk_read_bytes();
-        let mmap = index_mmap();
-        let (d_read, bundle) = time(|| Bundle::open(&file, mmap, threads).unwrap_or_else(|e| panic!("bundle {file}: {e}")));
+        let (d_read, bundle) = time(|| Bundle::open(&file, index_mmap(), threads).unwrap_or_else(|e| panic!("bundle {file}: {e}")));
+        let mmap = bundle.mapped;
         let (d_views, (flexmap, references, names)) = time(|| {
             let (offset, _) = bundle.section(bundle::INDEX).expect("bundle has an index");
             let flexmap = match format {
@@ -772,7 +772,13 @@ impl<
             d_read.as_secs_f64() + d_views.as_secs_f64(),
             if mmap { "mapped" } else { "read" },
             d_read.as_secs_f64(),
-            if mmap { format!("mmap, populated on {threads} threads") } else { format!("{threads} threads, huge pages") },
+            if mmap {
+                format!("mmap, populated on {threads} threads")
+            } else if index_mmap() {
+                format!("{threads} threads, huge pages; network filesystem, so read, not mapped")
+            } else {
+                format!("{threads} threads, huge pages")
+            },
             "views",
             d_views.as_secs_f64(),
             flexmap.memory_bytes() as f64 / 1e9,
