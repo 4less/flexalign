@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use flexmap::packed::{CompactKeys, HashedKeys, PackedFlexmap, SlotLocator};
+use flexmap::packed::{CompactKeys, HashedKeys, PackedFlexmap};
 use flexmap::range::AnyRange;
 use serde::{Deserialize, Serialize};
 

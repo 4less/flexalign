@@ -29,6 +29,27 @@ use super::{
 };
 use itertools::Itertools;
 
+use super::process::{alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::StdPairedAnchorExtractor};
+
+/// The alignment half of a paired-end pipeline, built one way for every pipeline that aligns: the
+/// unsharded run (`process_fastq`) and the sharded join (`shard::disk`, `shard::rejoin_align`).
+/// Built separately, the join's had drifted (no anchor gate: other alignments, 4x the reference
+/// lookups); built here, an option reaches all of them or none.
+pub fn paired_align_half<'a, const K: usize, D: FlexalignDatabase>(
+    options: &Options,
+    db: &'a D,
+) -> (StdPairedAnchorExtractor, StdPairedAnchorExtender<'a, D>, LIBWFA2Alignment) {
+    (
+        StdPairedAnchorExtractor::new().with_gate(
+            (!options.args.no_anchor_gate).then_some(K),
+            options.args.anchor_gate_keep,
+            options.args.anchor_gate_flank,
+        ),
+        StdPairedAnchorExtender::new(db),
+        LIBWFA2Alignment::default(),
+    )
+}
+
 /// One mate of the winning anchor pair, resolved to everything the output formats need.
 ///
 /// Both mates are built before either is written: a SAM record carries the *other* mate's placement

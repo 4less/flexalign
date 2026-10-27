@@ -90,6 +90,16 @@ pub fn run_sharded<
     let threads: u32 = options.args.threads.max(1);
 
     let format = index_format();
+    // Not in the sharded pipeline: fast-hit (a pair pinned by its unique k-mers is placed without
+    // seeding). Where the unsharded run's probe would turn it on, those pairs' MAPQ differ.
+    if options.args.fast_hit_on() {
+        eprintln!(
+            "Note: fast-hit is not available in a sharded run; pairs the unsharded run would place by \
+             fast-hit are seeded and aligned (their MAPQ can differ). --no-fast-hit gives the unsharded \
+             run the same alignments."
+        );
+    }
+
     // The bounds, from their file or from the key table; the shards are windows of the bundle.
     let t_bounds = Instant::now();
     let (bounds, computed) = ShardBounds::load_or_compute::<C, F, HEADER_THRESHOLD>(paths, format, n_shards, threads as usize)

@@ -13,7 +13,8 @@
 //! mate         u8       0 | 1
 //! n_ranges     varint
 //! range[n_ranges]:
-//!     qpos_delta   varint   delta from the previous range in this group (qpos ascends, unique)
+//!     qpos_delta   varint   qpos minus the previous range's qpos in this group, wrapping (u32):
+//!                           ranges come rarest-first, not by qpos, so a delta may wrap
 //!     n_positions  varint   == vrange.positions.len(), the global sort key for the rejoin
 //!     flags_dist   u8       bit0: headered; bit1: recovery; bit2: reserved; bits3..7: min_dist (0..=16)
 //!     n_cells      varint
@@ -169,7 +170,8 @@ impl GroupWriter {
             if r.min_dist > DIST_MAX {
                 return Err(RecordError::DistOverflow(r.min_dist));
             }
-            put_varint(&mut self.buf, r.qpos - prev_qpos);
+            // Wrapping both ways: a smaller qpos encodes as a large delta and decodes back exactly.
+            put_varint(&mut self.buf, r.qpos.wrapping_sub(prev_qpos));
             prev_qpos = r.qpos;
 
             put_varint(&mut self.buf, r.n_positions);
@@ -257,7 +259,7 @@ impl<'a> GroupReader<'a> {
 
         let mut qpos = 0u32;
         for _ in 0..n_ranges {
-            qpos += get_varint(self.buf, &mut self.pos)?;
+            qpos = qpos.wrapping_add(get_varint(self.buf, &mut self.pos)?);
             let n_positions = get_varint(self.buf, &mut self.pos)?;
 
             let flags = *self.buf.get(self.pos).ok_or(RecordError::Truncated(self.pos))?;
@@ -399,6 +401,13 @@ mod tests {
         // n_cells == 0 is how a discarded range would ride along if the recovery path (§4a)
         // is ever reinstated.
         let g = GroupRecord { idx: 4, mate: 0, ranges: vec![range(10, 200, true, 3, &[])] };
+        assert_eq!(roundtrip(&[g.clone()]), vec![g]);
+    }
+
+    #[test]
+    fn roundtrips_ranges_whose_qpos_falls() {
+        // Ranges come rarest-first, so qpos may fall from one range to the next.
+        let g = GroupRecord { idx: 0, mate: 0, ranges: vec![range(90, 1, true, 0, &[1]), range(10, 2, true, 0, &[2]), range(50, 3, false, 0, &[3])] };
         assert_eq!(roundtrip(&[g.clone()]), vec![g]);
     }
 

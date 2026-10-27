@@ -22,9 +22,6 @@ use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 
 use crate::align::common::{KmerExtractor, RangeExtractor};
 use crate::align::modular_workflow::ModularPE;
-use crate::align::process::alignment::LIBWFA2Alignment;
-use crate::align::process::anchor_extender::StdPairedAnchorExtender;
-use crate::align::process::anchor_extractor::StdPairedAnchorExtractor;
 use crate::align::process::kmer_extractor::StdKmerExtractor;
 use crate::align::process::output::make_output;
 use crate::align::process::range_extractor::StdRangeExtractor;
@@ -233,6 +230,7 @@ pub fn run_disk_rejoin_align<
 
     let output = make_output(options, out_buffer, db);
 
+    let (anchor_extractor, anchor_extender, align) = crate::align::modular_workflow::paired_align_half::<K, _>(options, db);
     let mut modular_pe = ModularPE {
         options,
         db,
@@ -254,16 +252,10 @@ pub fn run_disk_rejoin_align<
             options.args.ranges,
             options.args.mask_flank_mult, options.args.flank_slack,
         ),
-        // As the unsharded pipeline (process_fastq): the anchor gate is on unless --no-anchor-gate.
-        // Without it the join kept every anchor pair the gate drops, extended them all, and gave
-        // other alignments than the unsharded run.
-        anchor_extractor: StdPairedAnchorExtractor::new().with_gate(
-            (!options.args.no_anchor_gate).then_some(K),
-            options.args.anchor_gate_keep,
-            options.args.anchor_gate_flank,
-        ),
-        anchor_extender: StdPairedAnchorExtender::new(db),
-        align: LIBWFA2Alignment::default(),
+        // Built as the unsharded pipeline builds it (`paired_align_half`).
+        anchor_extractor,
+        anchor_extender,
+        align,
         output,
         rec_fwd_revc: OwnedFastqRecord::new(),
         rec_rev_revc: OwnedFastqRecord::new(),

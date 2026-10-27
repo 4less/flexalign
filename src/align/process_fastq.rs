@@ -9,7 +9,7 @@ use crate::{
     GOLDSTD_EVAL, align::{
         modular_workflow::{self, FastHitScratch, Modular, ModularPE}, 
         process::{
-            alignment::LIBWFA2Alignment, anchor_extender::StdPairedAnchorExtender, anchor_extractor::{StdAnchorExtractor, StdPairedAnchorExtractor}, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
+            anchor_extractor::StdAnchorExtractor, output::make_output, range_extractor::StdRangeExtractor, seed_extractor::StdSeedExtractor, syncmer_extractor::SyncmerKmerExtractor
         }, 
         stats::Stats, 
         workflow
@@ -291,6 +291,7 @@ pub fn process_fastq_wrapper_modular<
                 };  
 
 
+                let (anchor_extractor, anchor_extender, align) = modular_workflow::paired_align_half::<K, _>(options, db);
                 let mut modular_pe = ModularPE {
                     options,
                     db,
@@ -312,9 +313,9 @@ pub fn process_fastq_wrapper_modular<
                         options.args.ranges,
                         options.args.mask_flank_mult, options.args.flank_slack,
                     ),
-                    anchor_extractor: StdPairedAnchorExtractor::new().with_gate((!options.args.no_anchor_gate).then_some(K), options.args.anchor_gate_keep, options.args.anchor_gate_flank),
-                    anchor_extender: StdPairedAnchorExtender::new(db),
-                    align: LIBWFA2Alignment::default(),
+                    anchor_extractor,
+                    anchor_extender,
+                    align,
                     output: output,
                     rec_fwd_revc: OwnedFastqRecord::new(),
                     rec_rev_revc: OwnedFastqRecord::new(),
