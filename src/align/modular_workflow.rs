@@ -98,6 +98,24 @@ struct MateOut<'m> {
 /// it above a cleanly aligned one. Far from `i32::MIN` so summing a pair cannot overflow.
 const SUNK_SCORE: i32 = -1_000_000;
 
+/// An anchor whose alignment the output can use: present, and not dropped by the aligner.
+fn usable(a: &Option<Anchor>) -> Option<&Anchor> {
+    a.as_ref().filter(|a| a.score > SUNK_SCORE)
+}
+
+/// The best aligned anchor of one mate across the alignment window, for a mate the winning pair
+/// has no usable alignment for. Scores are alignment costs (<= 0, higher is better); ties keep
+/// the better-ranked pair.
+fn best_lone_mate<'p>(window: &'p [AnchorPair], mate: impl Fn(&'p AnchorPair) -> &'p Option<Anchor>) -> Option<&'p Anchor> {
+    window
+        .iter()
+        .filter_map(|p| usable(mate(p)).filter(|a| a.cigar.is_some()))
+        .fold(None, |best: Option<&Anchor>, a| match best {
+            Some(b) if b.score >= a.score => Some(b),
+            _ => Some(a),
+        })
+}
+
 /// The abort budget for the candidate at `rank`, given the best complete pair aligned so far.
 ///
 /// Absolute part: `ani_budget`, from `--min-ani`. Relative part: a candidate that cannot get under
@@ -1906,6 +1924,12 @@ impl<
             // A per-mate bound taken from that mate's own best would NOT be sound -- it would
             // discard a weak mate belonging to a winning pair.
             let mut best_pair_cost: Option<i32> = None;
+            // Which mates the pair behind `best_pair_cost` has. A mate is only held to that cost when
+            // the best pair already places it: when the best pair is one-sided, the other mate's
+            // alignment in a later candidate is that mate's only chance to be written (see the lone
+            // mate fallback below), so it keeps its full --min-ani budget.
+            let mut best_pair_has = [false; 2];
+            let unpaired_penalty = self.options.args.unpaired_penalty;
             let mut trace_total = AlignTrace::default();
             let mut stage_hist = [0usize; 6];
             let mut stage_hist_true = [0usize; 6];
@@ -1940,7 +1964,11 @@ impl<
                                 let alignable = alignable_len(a, query.len(), reference.len()) as i32;
                                 min_score_1 = Some(tighten_budget(
                                     ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs(),
-                                    best_pair_cost,
+                                    // This pair can only win by costing less than the best pair; its
+                                    // other mate costs at least 0, or the penalty when it is absent.
+                                    best_pair_cost
+                                        .filter(|_| best_pair_has[0])
+                                        .map(|c| (c - if a2.is_none() { unpaired_penalty } else { 0 }).max(0)),
                                     _i,
                                 ));
                                 self.align.set_max_alignment_score(min_score_1.unwrap());
@@ -2030,7 +2058,12 @@ impl<
                                 let alignable = alignable_len(a, query.len(), reference.len()) as i32;
                                 min_score_2 = Some(tighten_budget(
                                     ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs(),
-                                    best_pair_cost,
+                                    // Mate 1 of this pair is already priced (ranked as the penalty
+                                    // when absent or dropped), so what is left of the best pair's
+                                    // cost is all mate 2 may spend.
+                                    best_pair_cost
+                                        .filter(|_| best_pair_has[1])
+                                        .map(|c| (c - usable(a1).map_or(unpaired_penalty, |x| -x.score)).max(0)),
                                     _i,
                                 ));
 
@@ -2126,28 +2159,28 @@ impl<
                     // Both mates of this candidate are done. If the pair completed, its cost becomes
                     // the bound every LATER candidate has to beat (see `best_pair_cost` above).
                     // Sunk anchors (-1_000_000) are excluded: a dropped mate has no real cost.
-                    let s1 = a1.as_ref().map_or(0, |a| a.score);
-                    let s2 = a2.as_ref().map_or(0, |a| a.score);
+                    let s1 = a1.as_ref().map_or(-unpaired_penalty, |a| a.score);
+                    let s2 = a2.as_ref().map_or(-unpaired_penalty, |a| a.score);
                     if s1 > SUNK_SCORE && s2 > SUNK_SCORE {
                         let pair_cost = -(s1 + s2);
-                        if pair_cost >= 0 {
-                            best_pair_cost =
-                                Some(best_pair_cost.map_or(pair_cost, |c| min(c, pair_cost)));
+                        if pair_cost >= 0 && best_pair_cost.map_or(true, |c| pair_cost < c) {
+                            best_pair_cost = Some(pair_cost);
+                            best_pair_has = [a1.is_some(), a2.is_some()];
                         }
                     }
                 });
 
+            // A mate the aligner dropped is ranked like a mate with no anchor: both cost
+            // --unpaired-penalty. Before, a missing mate cost 0 and a dropped one 1_000_000, so a
+            // pair holding nothing but one dropped anchor outranked a pair with a good alignment and
+            // a dropped partner, and the good alignment was never written. A pair with no usable
+            // mate at all goes last.
             crate::align::common::sort_pairs_by_key(&mut alignment_anchors, &mut self.fast.sort_scratch, |AnchorPair(a1, a2)| {
-                let s1 = match a1 {
-                    Some(a) => a.score,
-                    None => 0,
-                };
-                let s2 = match a2 {
-                    Some(a) => a.score,
-                    None => 0,
-                };
-
-                - ((s1 + s2) as i64)
+                let cost = |u: Option<&Anchor>| u.map_or(unpaired_penalty, |a| -a.score) as i64;
+                match (usable(a1), usable(a2)) {
+                    (None, None) => i64::MAX,
+                    (u1, u2) => cost(u1) + cost(u2),
+                }
             });
 
             stats.trace.merge_from(&trace_total);
@@ -2376,18 +2409,20 @@ impl<
         // other mate's placement, and because --min-ani gates the two mates independently.
         // ##########################################################################################
 
-        let fwd_out = resolve_mate(
-            best_extended_anchor_pair.0.as_ref(),
-            self.db,
-            rec_fwd,
-            &self.rec_fwd_revc,
-        );
-        let rev_out = resolve_mate(
-            best_extended_anchor_pair.1.as_ref(),
-            self.db,
-            rec_rev,
-            &self.rec_rev_revc,
-        );
+        // LONE MATE FALLBACK. Only the winning pair is written, so a mate it has no usable alignment
+        // for -- one-sided, or dropped by the aligner -- used to go unmapped even when that mate
+        // aligned cleanly in another candidate. Mates whose own candidates are on different markers
+        // (or whose partner has none) never share a pair, and against minibwa this was a third of
+        // the reads flexalign missed. Such a mate now takes its own best alignment in the window; it
+        // is written as a lone mate, so --lone-mate-mapq-penalty applies to it.
+        let aligned_window = &extension_anchors[..min(self.options.args.align_top_y, extension_anchors.len())];
+        let fallback = !self.options.args.no_lone_mate_fallback;
+        let fwd_anchor = usable(&best_extended_anchor_pair.0)
+            .or_else(|| best_lone_mate(aligned_window, |p| &p.0).filter(|_| fallback));
+        let rev_anchor = usable(&best_extended_anchor_pair.1)
+            .or_else(|| best_lone_mate(aligned_window, |p| &p.1).filter(|_| fallback));
+        let fwd_out = resolve_mate(fwd_anchor, self.db, rec_fwd, &self.rec_fwd_revc);
+        let rev_out = resolve_mate(rev_anchor, self.db, rec_rev, &self.rec_rev_revc);
 
         // A mate below the identity OR coverage threshold is treated exactly like a mate with no
         // anchor: nothing is emitted for it, and it does not appear as the other mate's pairing

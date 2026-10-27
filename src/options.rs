@@ -112,6 +112,17 @@ pub struct Args {
     #[arg(long = "lone-mate-mapq-penalty", default_value_t = 25)]
     pub lone_mate_mapq_penalty: u8,
 
+    /// Alignment cost charged, when the aligned candidates are ranked, for a mate a pair does not
+    /// place -- no anchor, or dropped by the aligner. bwa-mem's unpaired penalty plays this role (17
+    /// score points, about 34 in this cost space). 0 ranks a one-sided pair by its one mate alone.
+    #[arg(long = "unpaired-penalty", default_value_t = 34)]
+    pub unpaired_penalty: i32,
+
+    /// Do not write a mate the winning pair has no usable alignment for from its own best aligned
+    /// candidate (the lone mate fallback); leave it unmapped.
+    #[arg(long = "no-lone-mate-fallback", action)]
+    pub no_lone_mate_fallback: bool,
+
     /// Minimum number of read bases an alignment must actually place for the record to be emitted.
     ///
     /// This is a BASE COUNT, not a fraction. A fraction is the wrong shape on a marker DB: its
