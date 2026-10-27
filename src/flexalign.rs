@@ -3,7 +3,7 @@ use std::process::exit;
 
 use crate::align::process_fastq::process_fastq_wrapper_modular;
 use crate::database::flexmap::DB;
-use crate::database::common::{DBPaths, FlexalignDatabase};
+use crate::database::common::{DBPaths, FlexalignDatabase, IndexFormat};
 use crate::options::{Args, Options};
 use crate::GLOBAL_VERSION;
 
@@ -143,6 +143,28 @@ pub fn run(args: Args) {
                 exit(4);
             }
             eprintln!("Using the {n_shards}-shard index for {:?}", options.reference);
+            // A slicing that is not cut yet is cut by run_sharded, and the slicer and the sharded
+            // join read the separate index files (packed index or blob, names, reference blob). An
+            // index built as a bundle has none of them: write them from the loaded index first, as
+            // --shard-slice does.
+            let format = options.args.index_format;
+            let sliced = crate::shard::slice::SliceManifest::load(&crate::shard::slice::SliceManifest::path_for(&db_paths, n_shards))
+                .map(|m| m.shards.len() == n_shards && m.format == format)
+                .unwrap_or(false);
+            let exists = |p: &str| std::path::Path::new(p).exists();
+            let index_file = match format {
+                IndexFormat::Blob => db_paths.index_keys_file(),
+                _ => db_paths.index_packed_file(format),
+            };
+            let separate = exists(&db_paths.refseq_file())
+                && db_paths.id2reference_path.exists()
+                && db_paths.reference2id_path.exists()
+                && (sliced || exists(&index_file));
+            if format != IndexFormat::Hashed && !separate {
+                eprintln!("Writing the separate index files the {n_shards}-shard slicing reads");
+                let db = DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&db_paths, GLOBAL_VERSION);
+                db.save_separate(&db_paths, GLOBAL_VERSION).expect("writing the separate index files for slicing");
+            }
             crate::shard::run::run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(
                 &db_paths, &options, n_shards, pairs,
             );
