@@ -294,10 +294,16 @@ impl Cigar {
                 run_len = 1;
             }
         }
+        // The unplaced rest of the read is soft-clipped. A CIGAR that already ends in a soft-clip
+        // (a read hanging off the end of a reference) takes it into that clip: `60M10S` on a
+        // 150-base read is `60M90S`, never `60M10S80S`, which is not valid SAM.
+        let pad = query_length - consumed;
+        if pad > 0 && run_op == b'S' {
+            run_len += pad;
+        }
         flush(run_op, run_len, out);
-
-        if consumed < query_length {
-            out.extend_from_slice(itoa::Buffer::new().format(query_length - consumed).as_bytes());
+        if pad > 0 && run_op != b'S' {
+            out.extend_from_slice(itoa::Buffer::new().format(pad).as_bytes());
             out.push(b'S');
         }
 
@@ -346,6 +352,12 @@ mod tests {
         // SAM requires the CIGAR to account for every base of SEQ.
         assert_eq!(cigar("MMMM").to_sam(10).unwrap(), "4M6S");
         assert_eq!(cigar("SSMMMM").to_sam(6).unwrap(), "2S4M");
+    }
+
+    #[test]
+    fn to_sam_merges_the_padding_into_a_trailing_soft_clip() {
+        assert_eq!(cigar(&format!("{}{}", "M".repeat(60), "S".repeat(10))).to_sam(150).as_deref(), Some("60M90S"));
+        assert_eq!(cigar(&format!("{}{}", "S".repeat(5), "M".repeat(60))).to_sam(70).as_deref(), Some("5S60M5S"));
     }
 
     #[test]
