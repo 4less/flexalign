@@ -274,6 +274,10 @@ pub trait FlexalignDatabase {
     fn get_rid(&self, reference: &str) -> Option<&usize>;
     fn get_rname(&self, id: usize) -> Option<&str>;
     fn get_reference(&self, id: usize) -> Option<&[u8]>;
+    /// The length of reference `id`, without its sequence (a packed reference decodes nothing).
+    fn get_reference_len(&self, id: usize) -> Option<usize> {
+        self.get_reference(id).map(|r| r.len())
+    }
 
     /// Drop resident pages of the reference-sequence mapping, if it is memory-mapped.
     ///
@@ -310,6 +314,9 @@ impl<D: FlexalignDatabase> FlexalignDatabase for &D {
     }
     fn get_reference(&self, id: usize) -> Option<&[u8]> {
         (**self).get_reference(id)
+    }
+    fn get_reference_len(&self, id: usize) -> Option<usize> {
+        (**self).get_reference_len(id)
     }
     fn get_vrange(&self, canonical_kmer: u64) -> Option<AnyRange<'_>> {
         (**self).get_vrange(canonical_kmer)

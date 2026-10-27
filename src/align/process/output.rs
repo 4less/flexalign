@@ -153,7 +153,7 @@ pub fn make_output<D: FlexalignDatabase>(
     let mut references: Vec<(&str, usize)> = Vec::new();
     let mut id = 0usize;
     while let Some(name) = db.get_rname(id) {
-        let length = db.get_reference(id).map_or(0, |r| r.len());
+        let length = db.get_reference_len(id).unwrap_or(0);
         if length > 0 {
             references.push((name, length));
         }

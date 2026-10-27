@@ -126,6 +126,9 @@ impl<D: FlexalignDatabase> FlexalignDatabase for ShardedDB<D> {
     fn get_reference(&self, id: usize) -> Option<&[u8]> {
         self.inner.get_reference(id)
     }
+    fn get_reference_len(&self, id: usize) -> Option<usize> {
+        self.inner.get_reference_len(id)
+    }
 
     fn build(_options: &Options) -> Self {
         unimplemented!("ShardedDB is a view over a built index; build the inner database and wrap it")

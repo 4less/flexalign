@@ -310,6 +310,15 @@ impl RefStore {
         }
     }
 
+    /// The length of sequence `id`; a packed one is not decoded.
+    #[inline]
+    fn seq_len(&self, id: usize) -> usize {
+        match self {
+            RefStore::Packed(p) => p.seq_len(id),
+            _ => self.get(id).len(),
+        }
+    }
+
     /// The bundle's reference: the 2-bit section when it has one, else the bytes.
     fn from_bundle(bundle: &Bundle) -> Option<Self> {
         match bundle.section(bundle::REFSEQ2) {
@@ -680,6 +689,10 @@ impl<
         } else {
             None
         }
+    }
+
+    fn get_reference_len(&self, id: usize) -> Option<usize> {
+        (id < self.references.len()).then(|| self.references.seq_len(id))
     }
 }
 

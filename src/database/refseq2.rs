@@ -235,7 +235,9 @@ impl RefSeq2 {
     pub fn get(&self, id: usize) -> &[u8] {
         SCRATCH.with(|s| {
             let mut s = s.borrow_mut();
-            if let Some(&(_, ptr, len)) = s.seen.iter().rev().find(|e| e.0 == id) {
+            // A read asks for a few dozen sequences; past SEEN_SEARCH the oldest are decoded again
+            // rather than searched for, so a caller that never resets stays linear.
+            if let Some(&(_, ptr, len)) = s.seen.iter().rev().take(SEEN_SEARCH).find(|e| e.0 == id) {
                 return unsafe { std::slice::from_raw_parts(ptr, len) };
             }
             let len = self.seq_len(id);
@@ -257,6 +259,7 @@ struct Scratch {
 }
 
 const CHUNK: usize = 1 << 20;
+const SEEN_SEARCH: usize = 256;
 
 impl Scratch {
     fn alloc(&mut self, len: usize) -> *mut u8 {
