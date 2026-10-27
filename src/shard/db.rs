@@ -32,8 +32,9 @@ pub const KEY_ALIGN: u64 = 16;
 
 impl ShardRange {
     pub fn new(lo: u64, hi: u64) -> Self {
+        // Any key may bound a range: an online shard is a window of the index as it lies on disk
+        // (`slice`), cut where its values split evenly, not at a block of the old blob layout.
         debug_assert!(lo <= hi, "shard range {}..{} is inverted", lo, hi);
-        debug_assert!(lo % KEY_ALIGN == 0, "shard lo {} is not block-aligned", lo);
         Self { lo, hi }
     }
 

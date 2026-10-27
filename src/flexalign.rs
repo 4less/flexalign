@@ -115,60 +115,40 @@ pub fn run(args: Args) {
     const CELLS_PER_BODY: u64 = 16;
     const HEADER_THRESHOLD: usize = 2;
 
-    // A sliced index is discoverable from the reference path alone, so the sharded pipeline is
-    // selected here rather than by reaching for a separate executable. --shards N picks a specific
-    // slicing (or slices one); --no-shards ignores them.
-    if options.args.shard_slice.is_none() && !options.args.no_shards {
-        let available = crate::shard::slice::SliceManifest::available(&db_paths);
-        let chosen = options.args.shards.or_else(|| {
-            match available.len() {
+    // Shards are windows of a packed index's bundle (`shard::slice`): their bounds are
+    // discoverable from the reference path alone, so the sharded pipeline is selected here rather
+    // than by reaching for a separate executable. --shards N picks a shard count (its bounds are
+    // computed on first use); --no-shards ignores them. An index not built yet is built first, below.
+    let format = options.args.index_format;
+    let bundle_ready = format != IndexFormat::Blob
+        && std::path::Path::new(&db_paths.bundle_file(format)).exists()
+        && DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::index_compatible(&db_paths)
+        && !options.args.force_build;
+    if bundle_ready {
+        if let Some(n_shards) = options.args.shard_slice {
+            shard_bounds::<C, F, HEADER_THRESHOLD>(&db_paths, format, n_shards, options.args.threads as usize);
+            return;
+        }
+        if !options.args.no_shards {
+            let available = crate::shard::slice::ShardBounds::available(&db_paths, format);
+            let chosen = options.args.shards.or_else(|| match available.len() {
                 0 => None,
                 1 => Some(available[0]),
                 _ => {
-                    // Several slicings exist and none was named. Picking one silently would make the
-                    // run's memory profile depend on what happens to be on disk, so say what is
-                    // there and let the caller choose.
+                    // Several shard counts have bounds and none was named. Picking one silently
+                    // would make the run's memory profile depend on what happens to be on disk, so
+                    // say what is there and let the caller choose.
                     eprintln!(
-                        "Several sliced indexes exist ({}). Pick one with --shards N, or --no-shards.",
+                        "Shard bounds exist for several counts ({}). Pick one with --shards N, or --no-shards.",
                         available.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
                     );
                     exit(3);
                 }
+            });
+            if let Some(n_shards) = chosen {
+                run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, &options, n_shards);
+                return;
             }
-        });
-        if let Some(n_shards) = chosen {
-            let pairs = sharded_pairs(&options);
-            if pairs.is_empty() {
-                eprintln!("Sharded alignment is paired-end only: give -1 and -2.");
-                exit(4);
-            }
-            eprintln!("Using the {n_shards}-shard index for {:?}", options.reference);
-            // A slicing that is not cut yet is cut by run_sharded, and the slicer and the sharded
-            // join read the separate index files (packed index or blob, names, reference blob). An
-            // index built as a bundle has none of them: write them from the loaded index first, as
-            // --shard-slice does.
-            let format = options.args.index_format;
-            let sliced = crate::shard::slice::SliceManifest::load(&crate::shard::slice::SliceManifest::path_for(&db_paths, n_shards))
-                .map(|m| m.shards.len() == n_shards && m.format == format)
-                .unwrap_or(false);
-            let exists = |p: &str| std::path::Path::new(p).exists();
-            let index_file = match format {
-                IndexFormat::Blob => db_paths.index_keys_file(),
-                _ => db_paths.index_packed_file(format),
-            };
-            let separate = exists(&db_paths.refseq_file())
-                && db_paths.id2reference_path.exists()
-                && db_paths.reference2id_path.exists()
-                && (sliced || exists(&index_file));
-            if !separate {
-                eprintln!("Writing the separate index files the {n_shards}-shard slicing reads");
-                let db = DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&db_paths, GLOBAL_VERSION);
-                db.save_separate(&db_paths, GLOBAL_VERSION).expect("writing the separate index files for slicing");
-            }
-            crate::shard::run::run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(
-                &db_paths, &options, n_shards, pairs,
-            );
-            return;
         }
     }
 
@@ -201,23 +181,19 @@ pub fn run(args: Args) {
         },
     };
 
-    // Shard-slicing mode: cut the built index into N physical shard files + a manifest, then exit.
-    // The index is already built/loaded above, so `.flex.index.keys` exists for the slicer to read.
-    if let Some(n_shards) = options.args.shard_slice {
-        // The slicer and the sharded join read the separate files (index, name files, reference
-        // blob), not a bundle.
-        db.save_separate(&db_paths, GLOBAL_VERSION).expect("writing the separate index files for slicing");
-        drop(db); // the slicer re-reads the keys file; free the in-RAM copy first
-        let (duration, manifest) = time(|| {
-            crate::shard::slice::slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, n_shards, options.args.index_format)
-                .expect("slicing the index")
-        });
-        eprintln!(
-            "Sliced index into {} shard(s) in {:?}: {}",
-            manifest.shards.len(),
-            duration,
-            crate::shard::slice::SliceManifest::path_for(&db_paths, n_shards)
-        );
+    // Sharding asked for on an index that had to be built first: now that its bundle is written,
+    // compute the bounds (--shard-slice) or run on the shards (--shards).
+    let shards = options.args.shards.filter(|_| !options.args.no_shards);
+    if options.args.shard_slice.is_some() || shards.is_some() {
+        drop(db);
+        if format == IndexFormat::Blob {
+            eprintln!("A blob index is not sharded: use --index-format compact or hashed, or --no-shards.");
+            exit(5);
+        }
+        match options.args.shard_slice {
+            Some(n_shards) => shard_bounds::<C, F, HEADER_THRESHOLD>(&db_paths, format, n_shards, options.args.threads as usize),
+            None => run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, &options, shards.unwrap()),
+        }
         return;
     }
 
@@ -249,4 +225,39 @@ pub fn run(args: Args) {
     let started = Instant::now();
     process_fastq_wrapper_modular::<K, C, F, S, L, HEADER_THRESHOLD,DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>>(&options, &db);
     log::info!("Modular: Process reads: {:?}", started.elapsed());
+}
+
+/// --shard-slice N: computes (or confirms) the bounds of N shards of the bundle of `format`.
+fn shard_bounds<const C: usize, const F: usize, const T: usize>(db_paths: &DBPaths, format: IndexFormat, n_shards: usize, threads: usize) {
+    let (duration, (bounds, computed)) = time(|| {
+        crate::shard::slice::ShardBounds::load_or_compute::<C, F, T>(db_paths, format, n_shards, threads.max(1))
+            .unwrap_or_else(|e| panic!("shard bounds of {}: {e}", db_paths.bundle_file(format)))
+    });
+    eprintln!(
+        "{} bounds of {} shard(s) in {:?}: {}",
+        if computed { "Computed" } else { "Reusing" },
+        bounds.ranges().len(),
+        duration,
+        crate::shard::slice::ShardBounds::path_for(db_paths, format, n_shards)
+    );
+}
+
+/// --shards N (or the one shard count with bounds): aligns paired-end reads on N windows of the
+/// bundle, one after another.
+fn run_sharded<
+    const K: usize,
+    const C: usize,
+    const F: usize,
+    const S: usize,
+    const L: usize,
+    const CELLS_PER_BODY: u64,
+    const HEADER_THRESHOLD: usize,
+>(db_paths: &DBPaths, options: &Options, n_shards: usize) {
+    let pairs = sharded_pairs(options);
+    if pairs.is_empty() {
+        eprintln!("Sharded alignment is paired-end only: give -1 and -2.");
+        exit(4);
+    }
+    eprintln!("Using {n_shards} shards of {:?}", options.reference);
+    crate::shard::run::run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(db_paths, options, n_shards, pairs);
 }

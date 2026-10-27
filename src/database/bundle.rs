@@ -158,6 +158,40 @@ impl Bundle {
         Some(head)
     }
 
+    /// The sections from the one of `from` to the end of the file, read alone on `threads` threads
+    /// (a sharded run's join needs the reference and the names, not the index before them).
+    /// Section offsets are then relative to what was read.
+    pub fn open_from(path: &str, from: u32, threads: usize) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        let mut header = vec![0u8; HEADER];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut header, 0)?;
+        let sections = Self::parse(&header).ok_or_else(|| std::io::Error::other(format!("{path}: not a flexalign bundle")))?;
+        let (_, base, _) = *sections
+            .iter()
+            .find(|s| s.0 == from)
+            .ok_or_else(|| std::io::Error::other(format!("{path}: no section {from}")))?;
+        if sections.iter().any(|&(_, offset, n)| offset + n > len) {
+            return Err(std::io::Error::other(format!("{path}: truncated bundle")));
+        }
+        let bytes = SharedBytes::read(&file, base as u64, len - base, threads)?;
+        let sections = sections.into_iter().filter(|s| s.1 >= base).map(|(k, offset, n)| (k, offset - base, n)).collect();
+        Ok(Self { bytes, mapped: false, sections })
+    }
+
+    /// (offset, length) in the file of the section of `kind`, from the header alone.
+    pub fn section_in_file(path: &str, kind: u32) -> std::io::Result<(u64, u64)> {
+        let file = File::open(path)?;
+        let mut header = vec![0u8; HEADER];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut header, 0)?;
+        let sections = Self::parse(&header).ok_or_else(|| std::io::Error::other(format!("{path}: not a flexalign bundle")))?;
+        sections
+            .iter()
+            .find(|s| s.0 == kind)
+            .map(|&(_, offset, n)| (offset as u64, n as u64))
+            .ok_or_else(|| std::io::Error::other(format!("{path}: no section {kind}")))
+    }
+
     /// (offset, length) of the section of `kind`.
     pub fn section(&self, kind: u32) -> Option<(usize, usize)> {
         self.sections.iter().find(|s| s.0 == kind).map(|&(_, offset, len)| (offset, len))

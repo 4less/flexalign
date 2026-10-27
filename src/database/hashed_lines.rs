@@ -43,7 +43,9 @@ impl HashedLines {
 
     #[inline(always)]
     fn line(&self, index: u64) -> *const u64 {
-        unsafe { (self.lines.ptr() as *const u64).add((index * ENTRIES) as usize) }
+        // wrapping: the lines may be a window of the table (flexmap's Section::window), whose
+        // pointer is where the whole table would start.
+        (self.lines.ptr() as *const u64).wrapping_add((index * ENTRIES) as usize)
     }
 
     #[inline(always)]

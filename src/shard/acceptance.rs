@@ -164,7 +164,7 @@ fn diff(unsharded: &SeedMap, sharded: &SeedMap, emit: EmitStats) -> AcceptanceRe
 
 /// Runs one shard pass per provided shard DB and rejoins the evidence into a per-read seed map,
 /// returning it alongside the summed emit counters. `shards` may be `ShardedDB` views or physical
-/// `PhysicalShardDB`s -- anything implementing the database trait.
+/// `WindowShardDB`s -- anything implementing the database trait.
 fn sharded_seed_map<
     const K: usize,
     const C: usize,
@@ -241,8 +241,8 @@ pub fn compare_seeds<
     )
 }
 
-/// Like [`compare_seeds`], but the caller supplies the shard databases -- e.g. physical
-/// `PhysicalShardDB`s loaded from a slice. `oracle_db` is the full index the unsharded run uses.
+/// Like [`compare_seeds`], but the caller supplies the shard databases -- e.g. `WindowShardDB`s
+/// read from a bundle. `oracle_db` is the full index the unsharded run uses.
 pub fn compare_seeds_with_shards<
     const K: usize,
     const C: usize,

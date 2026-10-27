@@ -1,12 +1,12 @@
 //! The sharded alignment run, as a library entry point.
 //!
-//! It lives here, in the library, so the MAIN binary can select it automatically: a sliced index is
-//! discoverable from the reference path (`<index>.s<n>.shards.json`, see
-//! [`SliceManifest::available`]), so a caller should not have to know which executable to reach for.
+//! It lives here, in the library, so the MAIN binary can select it automatically: shard bounds are
+//! discoverable from the reference path (`<bundle>.s<n>.bounds.json`, see
+//! [`ShardBounds::available`]), so a caller should not have to know which executable to reach for.
 //! There is deliberately no separate sharded binary -- one entry point, one set of options.
 //!
 //! Shape of the run, and why: the SHARD loop is the outer one and samples are inner, so each shard
-//! is memory-mapped once for the whole batch instead of once per sample, and is dropped before the
+//! is read once for the whole batch instead of once per sample, and is dropped before the
 //! next loads. Evidence is streamed to per-(shard, sample) files rather than accumulated.
 //!
 //! The memory contract, which the whole design exists to provide:
@@ -30,7 +30,7 @@ use crate::io::output_buffer::{OutputBuffer, OutputTarget};
 use crate::options::Options;
 use crate::shard::disk::{count_batches, run_disk_rejoin_align, run_shard_pass_to_disk};
 use crate::database::common::index_format;
-use crate::shard::slice::{slice_index, PhysicalShardDB, SliceManifest};
+use crate::shard::slice::{ShardBounds, WindowShardDB};
 
 const BUFFER_SIZE: usize = 1 << 24;
 const MAX_HEADERED: usize = 15;
@@ -82,32 +82,24 @@ pub fn run_sharded<
     pairs: Vec<(String, String, String)>,
 ) {
     type ShardOf<const C: usize, const F: usize, const CB: u64, const HT: usize> =
-        PhysicalShardDB<C, F, CB, HT>;
+        WindowShardDB<C, F, CB, HT>;
 
     // -t, not a constant. This was hardcoded to 4, so sharded runs ignored --threads entirely and
     // were benchmarked at 4 workers against everything else's 16 -- most of an apparent slowdown.
     let threads: u32 = options.args.threads.max(1);
 
     let format = index_format();
-    let manifest = match SliceManifest::load(&SliceManifest::path_for(paths, n_shards)) {
-        Ok(m) if m.shards.len() == n_shards && m.format == format => {
-            eprintln!("Reusing existing slice ({n_shards} shards, {format:?})");
-            m
-        }
-        Ok(m) if m.format != format => {
-            eprintln!(
-                "The existing {n_shards}-shard slice is {:?}, not {format:?}; slicing again. Its shard \
-                 files are left in place: {}",
-                m.format,
-                m.shards.iter().map(|s| s.file.as_str()).collect::<Vec<_>>().join(", ")
-            );
-            slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(paths, n_shards, format).expect("slice")
-        }
-        _ => {
-            eprintln!("Slicing index into {n_shards} physical shards ({format:?}) ...");
-            slice_index::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(paths, n_shards, format).expect("slice")
-        }
-    };
+    // The bounds, from their file or from the key table; the shards are windows of the bundle.
+    let t_bounds = Instant::now();
+    let (bounds, computed) = ShardBounds::load_or_compute::<C, F, HEADER_THRESHOLD>(paths, format, n_shards, threads as usize)
+        .unwrap_or_else(|e| panic!("shard bounds of {}: {e}", paths.bundle_file(format)));
+    let ranges = bounds.ranges();
+    eprintln!(
+        "{} {n_shards} shard bounds ({format:?}) in {:.2}s: {}",
+        if computed { "Computed" } else { "Reusing" },
+        t_bounds.elapsed().as_secs_f64(),
+        ShardBounds::path_for(paths, format, n_shards)
+    );
 
     // Only the FILE NAMES are kept; each pass re-opens and streams them (see `open_reads`). The
     // batch amortises the shard loads, not the reads -- holding the reads is what blew peak RSS past
@@ -127,14 +119,20 @@ pub fn run_sharded<
 
     // Evidence is per (shard, sample), keyed on the sample's own output path so concurrent runs and
     // re-runs cannot collide.
-    let evidence: Vec<Vec<String>> = (0..manifest.shards.len())
+    let evidence: Vec<Vec<String>> = (0..ranges.len())
         .map(|i| samples.iter().map(|s| format!("{}.evidence.s{i}.bin", s.out)).collect())
         .collect();
 
     let t_pass = Instant::now();
-    for i in 0..manifest.shards.len() {
+    for (i, &range) in ranges.iter().enumerate() {
+        let t_load = Instant::now();
         let shard: ShardOf<C, F, CELLS_PER_BODY, HEADER_THRESHOLD> =
-            ShardOf::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&manifest, i, threads as usize);
+            ShardOf::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(paths, format, range, threads as usize)
+                .unwrap_or_else(|e| panic!("shard {i} ({}..{}): {e}", range.lo, range.hi));
+        eprintln!(
+            "  shard {i}: keys {}..{}, {:.2} GB read in {:.2}s",
+            range.lo, range.hi, shard.memory_bytes() as f64 / 1e9, t_load.elapsed().as_secs_f64()
+        );
         for (j, s) in samples.iter().enumerate() {
             let emit = run_shard_pass_to_disk::<
                 K, C, F, S, L,
@@ -150,7 +148,7 @@ pub fn run_sharded<
                 s.r1, emit.headered, emit.headerless
             );
         }
-        // `shard` drops here (unmapped or freed), before the next shard loads.
+        // `shard` drops here (freed), before the next shard loads.
     }
     let pass_secs = t_pass.elapsed().as_secs_f64();
 
@@ -169,7 +167,7 @@ pub fn run_sharded<
             File::create(&s.out).unwrap_or_else(|e| panic!("create {}: {}", s.out, e)),
         )));
         let out_buffer = OutputBuffer::new(Arc::clone(&sink), BUFFER_SIZE);
-        let ev: Vec<String> = (0..manifest.shards.len()).map(|i| evidence[i][j].clone()).collect();
+        let ev: Vec<String> = (0..ranges.len()).map(|i| evidence[i][j].clone()).collect();
         let stats = run_disk_rejoin_align::<
             K, C, F, S, L,
             DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>,
@@ -190,7 +188,7 @@ pub fn run_sharded<
     eprintln!(
         "\nsharded done: {} sample(s), {} shard(s); passes {:.2}s + rejoin/align {:.2}s ; alignments={}",
         samples.len(),
-        manifest.shards.len(),
+        ranges.len(),
         pass_secs,
         align_secs,
         total_alignments

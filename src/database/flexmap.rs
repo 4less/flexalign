@@ -383,6 +383,28 @@ impl<
     /// warmed and never queried, so **zero index bytes are read** -- only the reference is. Calling
     /// `get_vrange` on the result would fault the index in on demand; the join never does.
     pub fn load_reference_only(paths: &DBPaths) -> Self {
+        // A packed index's bundle holds the reference and the names after the index: read those
+        // sections alone.
+        let bundle_file = paths.bundle_file(index_format());
+        if std::path::Path::new(&bundle_file).exists() {
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let (d, bundle) = time(|| {
+                Bundle::open_from(&bundle_file, bundle::REFSEQ, threads).unwrap_or_else(|e| panic!("bundle {bundle_file}: {e}"))
+            });
+            let references = RefSeqBlob::from_bundle(&bundle).expect("bundle has the reference");
+            let names = NameTable::from_bundle(&bundle).expect("bundle has the names");
+            eprintln!(
+                "Reference-only load (join phase): {:.2} GB of {bundle_file} (reference and names) in {:.2}s -- index NOT read",
+                bundle.bytes.len() as f64 / 1e9,
+                d.as_secs_f64()
+            );
+            let rname_to_rid: HashMap<String, usize> = if crate::GOLDSTD_EVAL {
+                (1..names.len()).map(|i| (names.get(i).unwrap().to_string(), i)).collect()
+            } else {
+                HashMap::new()
+            };
+            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references: RefStore::Mmap(references) };
+        }
         let io_before = super::common::disk_read_bytes();
 
         // mmap only: opens the file into address space, reads no data pages. A packed index has no
