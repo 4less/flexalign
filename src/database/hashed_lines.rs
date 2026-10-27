@@ -21,7 +21,9 @@ const KEY_AHEAD: usize = 8;
 pub struct HashedLines {
     lines: Section,
     homes: u64,
-    key_bits: u32,
+    /// A key's home line is the high word of key * mult (flexmap's `HashedKeys`); the key space need
+    /// not be a power of two (a shard's is its key range).
+    mult: u64,
     tag_bits: u32,
     start_bits: u32,
 }
@@ -29,9 +31,14 @@ pub struct HashedLines {
 impl HashedLines {
     pub fn new(keys: &HashedKeys) -> Self {
         let [n_keys, _used, homes, start_bits] = keys.params();
-        let tag_bits = (64 - ((n_keys + homes - 1) / homes).leading_zeros()).max(1);
+        // As HashedKeys derives them: mult = floor(homes * 2^64 / keys), and enough tag bits for the
+        // ceil(2^64 / mult) keys a home can hold.
+        let n_keys = n_keys.max(homes + 1);
+        let mult = (((homes as u128) << 64) / n_keys as u128) as u64;
+        let per_home = (((1u128 << 64) + mult as u128 - 1) / mult as u128) as u64;
+        let tag_bits = (64 - per_home.leading_zeros()).max(1);
         let lines = keys.sections().swap_remove(0);
-        Self { lines, homes, key_bits: n_keys.trailing_zeros(), tag_bits, start_bits: start_bits as u32 }
+        Self { lines, homes, mult, tag_bits, start_bits: start_bits as u32 }
     }
 
     #[inline(always)]
@@ -41,7 +48,7 @@ impl HashedLines {
 
     #[inline(always)]
     fn home(&self, key: u64) -> u64 {
-        (key * self.homes) >> self.key_bits
+        ((key as u128 * self.mult as u128) >> 64) as u64
     }
 
     #[inline(always)]
@@ -135,9 +142,9 @@ mod tests {
 
     #[test]
     fn locates_as_flexmap() {
-        // 2^14 possible keys, every fifth one used, and all of a dense block, whose homes overflow
-        // into the following lines.
-        let keys = 1u64 << 14;
+        // 2^14 possible keys (and a shard's key space, not a power of two), every fifth one used,
+        // and all of a dense block, whose homes overflow into the following lines.
+        for keys in [1u64 << 14, 12_345] {
         let used: Vec<u64> = (0..keys).filter(|k| k % 5 == 0 || (4000..4200).contains(k)).collect();
         let each_key = |f: &mut dyn FnMut(u64, u64, u64)| {
             let mut start = 0;
@@ -153,6 +160,7 @@ mod tests {
         assert!((0..lines.homes).any(|l| unsafe { *lines.line(l) } & OVERFLOW != 0), "no line overflows");
         for k in 0..keys {
             assert_eq!(lines.locate(k), table.locate(k), "key {k}");
+        }
         }
     }
 }
