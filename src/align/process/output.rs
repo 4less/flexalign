@@ -147,22 +147,10 @@ pub fn make_output<D: FlexalignDatabase>(
         return Or { a: Some(StdPAFOutput::new(buffer)), b: None };
     }
 
-    // The database exposes references by id without a count; ids are dense from 0, so walk until
-    // one is missing. Zero-length entries are skipped: id 0 is flexmap's "dummy" sentinel (see
-    // `flexmap::build`, which pushes it so real ids start at 1), and SAM requires LN >= 1 anyway.
-    let mut references: Vec<(&str, usize)> = Vec::new();
-    let mut id = 0usize;
-    while let Some(name) = db.get_rname(id) {
-        let length = db.get_reference_len(id).unwrap_or(0);
-        if length > 0 {
-            references.push((name, length));
-        }
-        id += 1;
-    }
-
+    // The header comes from the index's `.samheader` cache, formatted from the names and lengths
+    // when it is missing or stale (`sam_header`).
     let mut sam = StdSAMOutput::new(buffer);
-    sam.write_header(&references);
-    sam.buffer.flush();
+    super::sam_header::write(options, db, &mut sam.buffer);
 
     Or { a: None, b: Some(sam) }
 }

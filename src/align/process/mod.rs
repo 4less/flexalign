@@ -8,5 +8,6 @@ pub mod anchor_sorter;
 pub mod seeds_to_anchors;
 pub mod anchor_extender;
 pub mod output;
+pub mod sam_header;
 pub mod evaluate;
 pub mod alignment;

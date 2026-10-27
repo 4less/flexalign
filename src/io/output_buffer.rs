@@ -49,6 +49,19 @@ impl OutputBuffer {
         self.buffer.clear();
     }
 
+    /// Flushes what is buffered, then copies the rest of `src` straight to the shared writer. File to
+    /// file, `std::io::copy` lets the kernel copy (`copy_file_range`), without the bytes passing
+    /// through this process.
+    pub fn copy_from(&mut self, src: &mut File) -> io::Result<u64> {
+        let mut wr = self.writer.lock().expect("Cannot lock writer");
+        wr.write_all(&self.buffer)?;
+        self.buffer.clear();
+        match &mut *wr {
+            OutputTarget::File(file) => io::copy(src, file),
+            OutputTarget::Stdout(stdout) => io::copy(src, &mut stdout.lock()),
+        }
+    }
+
     pub fn write(&mut self, str: String) {
         let _ = write!(self.buffer, "{}", str);
         self.flush_if_full();
