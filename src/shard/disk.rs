@@ -253,7 +253,14 @@ pub fn run_disk_rejoin_align<
             options.args.ranges,
             options.args.mask_flank_mult, options.args.flank_slack,
         ),
-        anchor_extractor: StdPairedAnchorExtractor::new(),
+        // As the unsharded pipeline (process_fastq): the anchor gate is on unless --no-anchor-gate.
+        // Without it the join kept every anchor pair the gate drops, extended them all, and gave
+        // other alignments than the unsharded run.
+        anchor_extractor: StdPairedAnchorExtractor::new().with_gate(
+            (!options.args.no_anchor_gate).then_some(K),
+            options.args.anchor_gate_keep,
+            options.args.anchor_gate_flank,
+        ),
         anchor_extender: StdPairedAnchorExtender::new(db),
         align: LIBWFA2Alignment::default(),
         output,
