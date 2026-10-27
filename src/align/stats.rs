@@ -128,6 +128,9 @@ pub struct Stats {
     /// 1 when the probe over the input's first pairs switched the fast-hit path off for the run.
     pub fast_hit_workers_off: usize,
     pub rescue_succeeded: usize,
+    /// Overhang rescue: lone placed mates whose partner was searched next to them, and found.
+    pub overhang_rescue_attempted: usize,
+    pub overhang_rescue_found: usize,
     /// Why a rescue did not happen or was refused. `skipped_weak` is the anchored side failing the
     /// quality gate (its position is not worth trusting); `rejected_ambiguous` is the scan finding a
     /// partner that matched about equally well elsewhere in the window, i.e. a repeat.
@@ -302,6 +305,8 @@ impl Stats {
             ("fast_hit_unpaired",           self.fast_hit_unpaired as f64, "count"),
             ("fast_hit_workers_off",        self.fast_hit_workers_off as f64, "count"),
             ("rescue_succeeded",            self.rescue_succeeded as f64, "count"),
+            ("overhang_rescue_attempted",   self.overhang_rescue_attempted as f64, "count"),
+            ("overhang_rescue_found",       self.overhang_rescue_found as f64, "count"),
             ("rescue_skipped_weak",         self.rescue_skipped_weak as f64, "count"),
             ("rescue_rejected_ambiguous",   self.rescue_rejected_ambiguous as f64, "count"),
             ("rescue_indel_suspected",      self.rescue_indel_suspected as f64, "count"),
@@ -451,6 +456,8 @@ impl Merge for Stats {
         self.fast_hit_unpaired += other.fast_hit_unpaired;
         self.fast_hit_workers_off += other.fast_hit_workers_off;
         self.rescue_succeeded += other.rescue_succeeded;
+        self.overhang_rescue_attempted += other.overhang_rescue_attempted;
+        self.overhang_rescue_found += other.overhang_rescue_found;
         self.rescue_skipped_weak += other.rescue_skipped_weak;
         self.rescue_rejected_ambiguous += other.rescue_rejected_ambiguous;
         self.rescue_indel_suspected += other.rescue_indel_suspected;
@@ -718,6 +725,8 @@ impl Default for Stats {
             fast_hit_unpaired: 0,
             fast_hit_workers_off: 0,
             rescue_succeeded: 0,
+            overhang_rescue_attempted: 0,
+            overhang_rescue_found: 0,
             rescue_skipped_weak: 0,
             rescue_rejected_ambiguous: 0,
             rescue_indel_suspected: 0,

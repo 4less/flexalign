@@ -123,6 +123,11 @@ pub struct Args {
     #[arg(long = "no-lone-mate-fallback", action)]
     pub no_lone_mate_fallback: bool,
 
+    /// Do not look for a mate the index never placed next to its placed partner (the overhang
+    /// rescue: the partner's marker, within the insert size, the mate allowed to run off its end).
+    #[arg(long = "no-overhang-rescue", action)]
+    pub no_overhang_rescue: bool,
+
     /// Minimum number of read bases an alignment must actually place for the record to be emitted.
     ///
     /// This is a BASE COUNT, not a fraction. A fraction is the wrong shape on a marker DB: its

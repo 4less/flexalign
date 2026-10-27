@@ -315,6 +315,154 @@ fn rescue_partner<D: FlexalignDatabase>(
     Some(a)
 }
 
+/// Mismatching bytes of `q` against `r` (same length), stopping once they exceed `cap`: eight bytes
+/// at a time, the count of non-zero bytes of their XOR. A wrong offset fails within its first word
+/// or two, which is what makes trying every start in a fragment's window affordable.
+fn mismatches_capped(q: &[u8], r: &[u8], cap: u32) -> u32 {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    let mut mm = 0u32;
+    let mut qc = q.chunks_exact(8);
+    let mut rc = r.chunks_exact(8);
+    for (a, b) in (&mut qc).zip(&mut rc) {
+        let x = u64::from_ne_bytes(a.try_into().unwrap()) ^ u64::from_ne_bytes(b.try_into().unwrap());
+        // A byte is non-zero when any of its bits is: fold them onto its low bit.
+        let x = x | (x >> 4);
+        let x = x | (x >> 2);
+        let x = x | (x >> 1);
+        mm += (x & LOW).count_ones();
+        if mm > cap {
+            return mm;
+        }
+    }
+    mm + qc.remainder().iter().zip(rc.remainder()).filter(|(a, b)| a != b).count() as u32
+}
+
+/// The longest fragment a pair is assumed to span, for scans that look for one mate from the other.
+const MAX_INSERT: i64 = 1000;
+
+/// OVERHANG RESCUE: finds a mate the index never placed, next to its placed partner, letting it
+/// run off the end of the partner's reference.
+///
+/// On a marker database a fragment often straddles the end of a gene: one mate lies inside it, the
+/// other only partly, and the part inside is too short to carry the k-mers seeding needs. The pair
+/// geometry still says where it must be -- downstream of a forward partner, upstream of a reverse
+/// one, within `MAX_INSERT` -- so every read start in that window is tried, including starts where
+/// the read hangs over either end, and each is scored over the bases inside the reference only.
+///
+/// `mate` is the read as it must map (the reverse complement next to a forward partner). The best
+/// start needs at least `min_bases` inside the reference, an identity of `min_ani` there, and a
+/// score `margin` above every other start (a mate that fits about equally well at two starts is in
+/// a repeat and locates nothing). What it finds is aligned like any candidate, so the identity and
+/// base floors downstream judge it as they judge every other mate.
+fn rescue_overhang<D: FlexalignDatabase>(
+    db: &D,
+    aligner: &mut (impl Align + Heuristic),
+    placed: &Anchor,
+    mate: &[u8],
+    min_ani: f64,
+    min_bases: usize,
+    margin: i32,
+) -> Option<Anchor> {
+    let reference = db.get_reference(placed.reference as usize)?;
+    let (n, len) = (reference.len() as i64, mate.len() as i64);
+    if len == 0 || placed.reference_cigar_range.is_empty() || min_bases == 0 {
+        return None;
+    }
+    let (ps, pe) = (placed.reference_cigar_range.start as i64, placed.reference_cigar_range.end as i64);
+    let min_bases = min_bases as i64;
+    // Read starts the geometry allows, clipped to those leaving `min_bases` inside the reference.
+    let (lo, hi) = if placed.forward { (ps, ps + MAX_INSERT - len) } else { (pe - MAX_INSERT, pe - len) };
+    let (lo, hi) = (lo.max(min_bases - len), hi.min(n - min_bases));
+    if lo > hi {
+        return None;
+    }
+    // Score of a start: matches - 4 x mismatches over the overlap, bwa's match/mismatch ratio.
+    let mut best: Option<(i64, i64, u32, i64)> = None; // (score, start, mismatches, overlap)
+    let mut second = i64::MIN;
+    for st in lo..=hi {
+        let (rs, re) = (st.max(0), (st + len).min(n));
+        let ov = re - rs;
+        let budget = ((1.0 - min_ani) * ov as f64) as u32;
+        let q = &mate[(rs - st) as usize..(re - st) as usize];
+        let r = &reference[rs as usize..re as usize];
+        let mm = mismatches_capped(q, r, budget);
+        if mm > budget {
+            continue;
+        }
+        let score = ov - 5 * mm as i64;
+        match best {
+            Some((b, ..)) if score <= b => second = second.max(score),
+            _ => {
+                if let Some((b, ..)) = best {
+                    second = second.max(b);
+                }
+                best = Some((score, st, mm, ov));
+            }
+        }
+    }
+    let (score, st, mm, ov) = best?;
+    if second != i64::MIN && score - second < margin as i64 {
+        return None;
+    }
+    // Seeds are exact matches -- the aligner takes what lies between two seeds as the part to align
+    // -- so the overlap goes in as its runs of agreement (those of 8+ bases; the longest run when
+    // none is), not as one seed with mismatches inside it. A reverse anchor takes its seeds in
+    // FORWARD-read coordinates and flips them itself (`set_forward`), so for one the offsets are
+    // handed over mirrored.
+    let (rs, qoff) = (st.max(0), st.max(0) - st);
+    let forward = !placed.forward;
+    let q = &mate[qoff as usize..(qoff + ov) as usize];
+    let r = &reference[rs as usize..(rs + ov) as usize];
+    let mut runs: Vec<(i64, i64)> = Vec::new(); // (offset in the overlap, length)
+    let mut i = 0i64;
+    while i < ov {
+        if q[i as usize] != r[i as usize] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < ov && q[i as usize] == r[i as usize] {
+            i += 1;
+        }
+        runs.push((start, i - start));
+    }
+    let longest = runs.iter().map(|r| r.1).max()?;
+    let seeds: Vec<(u64, i64, i64)> = runs
+        .iter()
+        .filter(|&&(_, l)| l >= 8.min(longest))
+        .map(|&(o, l)| {
+            let qpos = qoff + o;
+            ((rs + o) as u64, if forward { qpos } else { len - qpos - l }, l)
+        })
+        .collect();
+    let (r0, q0, l0) = seeds[0];
+    let mut a = Anchor::from_seed(&Seed {
+        rpos: r0,
+        rval: placed.reference,
+        qpos: q0 as u32,
+        mismatch: 0,
+        length: l0.min(u8::MAX as i64) as u8,
+        flag: 0,
+    });
+    for &(rp, qp, l) in &seeds[1..] {
+        a.seeds.push(AnchorSeed { qpos: qp as u32, rpos: rp, length: l as u32 });
+        a.seed_count += 1;
+    }
+    a.mismatches = mm;
+    a.set_forward(forward, mate.len());
+    // What the extender establishes for an anchor from the index (`anchor_extender`): seeds in
+    // order on both sequences, which the seed-based alignment requires. Runs of one diagonal are
+    // ordered by construction.
+    debug_assert!(a.seeds.windows(2).all(|w| w[0].qend() <= w[1].qbegin() && w[0].rend() <= w[1].rbegin()));
+    a.seed_status.set_valid();
+    let alignable = alignable_len(&a, mate.len(), reference.len()) as i32;
+    let budget = ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs();
+    match a.align(aligner, mate, reference, 10, budget, None, &mut AlignTrace::default()) {
+        super::common::Status::Dropped => None,
+        _ => Some(a),
+    }
+}
+
 fn resolve_mate<'m, D: FlexalignDatabase>(
     anchor: Option<&'m Anchor>,
     db: &'m D,
@@ -2421,8 +2569,49 @@ impl<
             .or_else(|| best_lone_mate(aligned_window, |p| &p.0).filter(|_| fallback));
         let rev_anchor = usable(&best_extended_anchor_pair.1)
             .or_else(|| best_lone_mate(aligned_window, |p| &p.1).filter(|_| fallback));
-        let fwd_out = resolve_mate(fwd_anchor, self.db, rec_fwd, &self.rec_fwd_revc);
-        let rev_out = resolve_mate(rev_anchor, self.db, rec_rev, &self.rec_rev_revc);
+        let rescued: Option<Anchor>;
+        let mut fwd_out = resolve_mate(fwd_anchor, self.db, rec_fwd, &self.rec_fwd_revc);
+        let mut rev_out = resolve_mate(rev_anchor, self.db, rec_rev, &self.rec_rev_revc);
+        // A placed mate whose partner has no candidate at all: look for the partner next to it,
+        // letting it hang off the end of the marker (`rescue_overhang`). Only behind a mate that
+        // passes the output gates on its own -- the rescued one is then held to the pair-aware
+        // floor (--min-query-coverage-mate), which is exactly the evidence this supplies.
+        if !self.options.args.no_overhang_rescue && (fwd_anchor.is_none() != rev_anchor.is_none()) {
+            let min_aligned_bases = self.options.args.min_query_coverage;
+            let require_e2e = !self.options.args.allow_partial;
+            let placed_ok = |m: &MateOut| {
+                m.ani >= min_ani && m.aligned_bases >= min_aligned_bases && (!require_e2e || m.end_to_end)
+            };
+            let (placed, mate_seq) = match (fwd_out.as_ref(), rev_out.as_ref()) {
+                (Some(m), None) if placed_ok(m) => {
+                    (m.anchor, if m.anchor.forward { self.rec_rev_revc.seq() } else { rec_rev.seq() })
+                }
+                (None, Some(m)) if placed_ok(m) => {
+                    (m.anchor, if m.anchor.forward { self.rec_fwd_revc.seq() } else { rec_fwd.seq() })
+                }
+                _ => (fwd_anchor.or(rev_anchor).unwrap(), &[][..]),
+            };
+            if !mate_seq.is_empty() {
+                stats.overhang_rescue_attempted += 1;
+                rescued = rescue_overhang(
+                    self.db,
+                    &mut self.align,
+                    placed,
+                    mate_seq,
+                    min_ani,
+                    self.options.args.min_query_coverage_mate,
+                    self.options.args.mate_rescue_margin as i32,
+                );
+                if let Some(a) = rescued.as_ref() {
+                    stats.overhang_rescue_found += 1;
+                    if fwd_out.is_none() {
+                        fwd_out = resolve_mate(Some(a), self.db, rec_fwd, &self.rec_fwd_revc);
+                    } else {
+                        rev_out = resolve_mate(Some(a), self.db, rec_rev, &self.rec_rev_revc);
+                    }
+                }
+            }
+        }
 
         // A mate below the identity OR coverage threshold is treated exactly like a mate with no
         // anchor: nothing is emitted for it, and it does not appear as the other mate's pairing
@@ -2718,6 +2907,25 @@ impl<
 
 #[cfg(test)]
 mod budget_tests {
+
+    #[test]
+    fn mismatches_capped_counts_like_a_byte_loop() {
+        let q: Vec<u8> = (0..150u32).map(|i| b"ACGT"[(i * 7 % 4) as usize]).collect();
+        for shift in 0..20usize {
+            let mut r = q.clone();
+            for k in (0..r.len()).step_by(shift + 3) {
+                r[k] = b'N';
+            }
+            for len in [0usize, 5, 8, 20, 37, 150] {
+                let naive = q[..len].iter().zip(&r[..len]).filter(|(a, b)| a != b).count() as u32;
+                assert_eq!(mismatches_capped(&q[..len], &r[..len], u32::MAX), naive);
+                // Capped: exact up to the cap, and past it once the cap is exceeded.
+                let capped = mismatches_capped(&q[..len], &r[..len], 3);
+                assert!(if naive <= 3 { capped == naive } else { capped > 3 });
+            }
+        }
+    }
+
     use super::*;
 
     /// The best and the runner-up must never be tightened. MAPQ is the gap between them, so an
