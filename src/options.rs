@@ -335,11 +335,12 @@ pub struct Args {
     #[arg(long = "mapq-from-alignment", action)]
     pub mapq_from_alignment: bool,
 
-    /// Use the N-shard slicing of the index (RAM-bounded: one shard resident at a time).
+    /// Align on N windows of the index, one in memory at a time (RAM-bounded). 1 is the unsharded
+    /// run: the whole index in memory, the reads read once.
     ///
-    /// Normally unnecessary -- a sliced index is discovered from the reference path
-    /// (`<index>.s<n>.shards.json`) and used automatically. Give this when several slicings exist
-    /// and you want a specific one, or to slice a new shard count on the fly.
+    /// Normally unnecessary -- shard bounds are discovered from the reference path
+    /// (`<bundle>.s<n>.bounds.json`) and used automatically. Give this when bounds exist for several
+    /// counts and you want a specific one, or for a new count (its bounds are computed on first use).
     #[arg(long = "shards", value_name = "N")]
     pub shards: Option<usize>,
 

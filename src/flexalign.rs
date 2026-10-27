@@ -145,7 +145,9 @@ pub fn run(args: Args) {
                     exit(3);
                 }
             });
-            if let Some(n_shards) = chosen {
+            // One shard is the whole index: the unsharded run does that in one pass over the reads,
+            // the sharded pipeline in two plus an evidence file.
+            if let Some(n_shards) = chosen.filter(|&n| n > 1) {
                 run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, &options, n_shards);
                 return;
             }
@@ -183,7 +185,7 @@ pub fn run(args: Args) {
 
     // Sharding asked for on an index that had to be built first: now that its bundle is written,
     // compute the bounds (--shard-slice) or run on the shards (--shards).
-    let shards = options.args.shards.filter(|_| !options.args.no_shards);
+    let shards = options.args.shards.filter(|&n| !options.args.no_shards && n > 1);
     if options.args.shard_slice.is_some() || shards.is_some() {
         drop(db);
         if format == IndexFormat::Blob {
