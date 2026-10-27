@@ -89,6 +89,8 @@ impl<
         rec: &RefFastqRecord,
         stats: &mut Stats) -> ()
     {
+        // A read starts: no reference slice of the previous one is used again.
+        crate::database::refseq2::reset_scratch();
         stats.reads_processed += 1;
 
         self.ranges.clear();

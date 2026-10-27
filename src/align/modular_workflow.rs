@@ -812,6 +812,8 @@ impl<
 {
     //RE, SE,
     pub fn run(&mut self, rec: &RefFastqRecord, stats: &mut Stats) -> () {
+        // A read (pair) starts: no reference slice of the previous one is used again.
+        crate::database::refseq2::reset_scratch();
         stats.reads_processed += 1;
 
         let (duration, kmers) = stage_time(|| self.kmer_extractor.generate(rec, stats));
@@ -968,6 +970,8 @@ impl<
     //RE, SE,
     /// The probe: would the fast-hit path place this pair? Writes nothing.
     pub fn probe_fast_hit(&mut self, rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats) -> bool {
+        // A read (pair) starts: no reference slice of the previous one is used again.
+        crate::database::refseq2::reset_scratch();
         if !self.output.has_b() {
             return false;
         }
@@ -997,6 +1001,8 @@ impl<
         rec_rev: &RefFastqRecord,
         stats: &mut Stats,
     ) -> () {
+        // A read (pair) starts: no reference slice of the previous one is used again.
+        crate::database::refseq2::reset_scratch();
         stats.reads_processed += 2;
 
         log::trace!("\n####################################################################\n#### New pair \n####################################################################");
@@ -1275,6 +1281,8 @@ impl<
         seeds_rev: &[Seed],
         stats: &mut Stats,
     ) {
+        // A read (pair) starts: no reference slice of the previous one is used again.
+        crate::database::refseq2::reset_scratch();
         // seeds_fwd.iter().for_each(|s| {
         //     let qend = s.qpos + s.length as u32;
         //     if qend as usize > rec_fwd.seq().len() {

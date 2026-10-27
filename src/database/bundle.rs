@@ -9,6 +9,7 @@
 //! sections              each at a multiple of ALIGN (2 MiB), zero-padded between
 //!   INDEX               flexmap's packed index, as PackedFlexmap::write_to writes it
 //!   REFSEQ              REFSEQ_MAGIC(8) | n u64 | offsets (n + 1) u64 | sequences
+//!   or REFSEQ2          the sequences at 2 bits a base, when all are short (see `refseq2`)
 //!   NAMES               n u64 | offsets (n + 1) u64 | names (UTF-8, no separators)
 //! ```
 //!
@@ -28,6 +29,8 @@ const ALIGN: u64 = 2 << 20;
 pub const INDEX: u32 = 1;
 pub const REFSEQ: u32 = 2;
 pub const NAMES: u32 = 3;
+/// The reference at 2 bits a base (`refseq2`), in place of REFSEQ when every sequence is short.
+pub const REFSEQ2: u32 = 4;
 
 /// Writes a bundle to `path` (through `path.tmp`, renamed when complete, so a reader never sees a
 /// half-written bundle). `index` writes the packed index and returns its length; `refseq` writes
@@ -38,6 +41,7 @@ pub fn write<'s>(
     refseq: impl FnOnce(&mut BufWriter<File>) -> std::io::Result<u64>,
     names: &dyn Fn(usize) -> &'s str,
     n_names: usize,
+    refseq_kind: u32,
 ) -> std::io::Result<()> {
     let tmp = format!("{path}.tmp");
     let mut out = BufWriter::with_capacity(8 << 20, File::create(&tmp)?);
@@ -50,7 +54,7 @@ pub fn write<'s>(
 
     pad_to(&mut out, ALIGN)?;
     let at = out.stream_position()?;
-    table.push((REFSEQ, at, refseq(&mut out)?));
+    table.push((refseq_kind, at, refseq(&mut out)?));
 
     pad_to(&mut out, ALIGN)?;
     let at = out.stream_position()?;
@@ -338,6 +342,7 @@ mod tests {
             |w| { w.write_all(b"REFSEQ")?; Ok(6) },
             &|i| names[i].as_str(),
             names.len(),
+            REFSEQ,
         )
         .unwrap();
         for mmap in [false, true] {

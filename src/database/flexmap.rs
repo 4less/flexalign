@@ -10,6 +10,7 @@ use savefile::{load, save};
 use crate::flexalign::time;
 
 use super::bundle::{self, Bundle, NameTable, Names};
+use super::refseq2::{self, RefSeq2};
 use super::hashed_lines::HashedLines;
 use super::common::{DBPaths, load_references, FlexalignDatabase, IndexFormat, index_format};
 
@@ -296,6 +297,8 @@ impl RefSeqBlob {
 pub enum RefStore {
     Owned(Vec<OwnedFastaRecord>),
     Mmap(RefSeqBlob),
+    /// 2 bits a base, decoded per read into this thread's scratch (`refseq2`).
+    Packed(RefSeq2),
 }
 impl RefStore {
     #[inline]
@@ -303,6 +306,15 @@ impl RefStore {
         match self {
             RefStore::Owned(v) => v[id].seq(),
             RefStore::Mmap(b) => b.get(id),
+            RefStore::Packed(p) => p.get(id),
+        }
+    }
+
+    /// The bundle's reference: the 2-bit section when it has one, else the bytes.
+    fn from_bundle(bundle: &Bundle) -> Option<Self> {
+        match bundle.section(bundle::REFSEQ2) {
+            Some((offset, len)) => RefSeq2::from_shared(&bundle.bytes, offset, len).map(RefStore::Packed),
+            None => RefSeqBlob::from_bundle(bundle).map(RefStore::Mmap),
         }
     }
     fn release(&self) {
@@ -314,6 +326,7 @@ impl RefStore {
         match self {
             RefStore::Owned(v) => v.len(),
             RefStore::Mmap(b) => b.len(),
+            RefStore::Packed(p) => p.len(),
         }
     }
 }
@@ -388,10 +401,11 @@ impl<
         let bundle_file = paths.bundle_file(index_format());
         if std::path::Path::new(&bundle_file).exists() {
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let first = if Bundle::section_in_file(&bundle_file, bundle::REFSEQ2).is_ok() { bundle::REFSEQ2 } else { bundle::REFSEQ };
             let (d, bundle) = time(|| {
-                Bundle::open_from(&bundle_file, bundle::REFSEQ, threads).unwrap_or_else(|e| panic!("bundle {bundle_file}: {e}"))
+                Bundle::open_from(&bundle_file, first, threads).unwrap_or_else(|e| panic!("bundle {bundle_file}: {e}"))
             });
-            let references = RefSeqBlob::from_bundle(&bundle).expect("bundle has the reference");
+            let references = RefStore::from_bundle(&bundle).expect("bundle has the reference");
             let names = NameTable::from_bundle(&bundle).expect("bundle has the names");
             eprintln!(
                 "Reference-only load (join phase): {:.2} GB of {bundle_file} (reference and names) in {:.2}s -- index NOT read",
@@ -403,7 +417,7 @@ impl<
             } else {
                 HashMap::new()
             };
-            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references: RefStore::Mmap(references) };
+            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references };
         }
         let io_before = super::common::disk_read_bytes();
 
@@ -705,7 +719,10 @@ impl<
         // are written out.
         if !matches!(&self.references, RefStore::Mmap(RefSeqBlob { backing: RefBacking::File(_), .. })) {
             let mut f = BufWriter::new(File::create(paths.refseq_file())?);
-            RefSeqBlob::write_to(&mut f, self.references.len(), &|i| self.references.get(i))?;
+            RefSeqBlob::write_to(&mut f, self.references.len(), &|i| {
+                refseq2::reset_scratch();
+                self.references.get(i)
+            })?;
             std::io::Write::flush(&mut f)?;
         }
 
@@ -736,6 +753,14 @@ impl<
     /// (`paths.bundle_file(format)`).
     fn save_bundle(&self, paths: &DBPaths) -> Result<(), std::io::Error> {
         let file = paths.bundle_file(index_format());
+        // A reference of short sequences (a marker database) is stored at 2 bits a base; one with
+        // a long sequence (a whole genome) keeps its bytes. Decoding a packed reference to write
+        // it again goes through this thread's scratch, reset per sequence.
+        let packed = refseq2::packable(self.references.len(), &|i| {
+            refseq2::reset_scratch();
+            self.references.get(i)
+        });
+        refseq2::reset_scratch();
         bundle::write(
             &file,
             |w| match &self.flexmap {
@@ -743,9 +768,22 @@ impl<
                 FlexmapStore::Hashed(p, _) => p.write_to(w),
                 _ => unreachable!("a bundle holds a packed index"),
             },
-            |w| RefSeqBlob::write_to(w, self.references.len(), &|i| self.references.get(i)),
+            |w| {
+                // Each sequence is used and dropped before the next is asked for, so a packed
+                // store's scratch can be reset per sequence.
+                let seq = |i: usize| {
+                    refseq2::reset_scratch();
+                    self.references.get(i)
+                };
+                if packed {
+                    refseq2::write_to(w, self.references.len(), &seq)
+                } else {
+                    RefSeqBlob::write_to(w, self.references.len(), &seq)
+                }
+            },
             &|i| self.rid_to_rname.get(i).unwrap_or(""),
             self.rid_to_rname.len(),
+            if packed { bundle::REFSEQ2 } else { bundle::REFSEQ },
         )
     }
 
@@ -774,7 +812,7 @@ impl<
                 IndexFormat::Hashed => FlexmapStore::hashed(PackedFlexmap::from_shared(&bundle.bytes, offset)),
                 _ => FlexmapStore::Compact(Arc::new(PackedFlexmap::from_shared(&bundle.bytes, offset))),
             };
-            let references = RefSeqBlob::from_bundle(&bundle).expect("bundle has the reference");
+            let references = RefStore::from_bundle(&bundle).expect("bundle has the reference");
             let names = NameTable::from_bundle(&bundle).expect("bundle has the names");
             (flexmap, references, names)
         });
@@ -807,7 +845,7 @@ impl<
             references.len(),
             names.len(),
         );
-        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references: RefStore::Mmap(references) }
+        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references }
     }
 }
 

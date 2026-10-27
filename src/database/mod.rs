@@ -6,3 +6,4 @@ pub mod common;
 // pub mod build;
 pub mod flexmap;
 pub mod hashed_lines;
+pub mod refseq2;
