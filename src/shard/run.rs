@@ -89,13 +89,6 @@ pub fn run_sharded<
     let threads: u32 = options.args.threads.max(1);
 
     let format = index_format();
-    if format == crate::database::common::IndexFormat::Hashed {
-        eprintln!(
-            "A hashed index cannot be sharded (its key table needs a power-of-two key space). \
-             Use --index-format compact (the default) or blob, or --no-shards."
-        );
-        std::process::exit(5);
-    }
     let manifest = match SliceManifest::load(&SliceManifest::path_for(paths, n_shards)) {
         Ok(m) if m.shards.len() == n_shards && m.format == format => {
             eprintln!("Reusing existing slice ({n_shards} shards, {format:?})");

@@ -22,20 +22,23 @@
 //! boundaries need no block alignment; they are still multiples of `KEY_ALIGN` so one boundary rule
 //! serves both formats. A compact shard is read into memory on load and freed when dropped.
 //!
-//! A **hashed** index cannot be sharded: its key table places a key at line `key * homes >> bits`,
-//! which needs a power-of-two key space, and a shard's `hi - lo` is not one.
+//! A **hashed** index (`--index-format hashed`) is sliced by flexmap's
+//! [`PackedFlexmap::slice_hashed`]: keys `[lo, hi)` become keys `0..hi - lo` of a self-contained
+//! hashed index (`.shardN.hashed`), whose key table homes a key by multiply-high and so takes a key
+//! space of any size. It is read into memory on load, as a compact shard is.
 
 use std::sync::Arc;
 
 use flexmap::flexmap::{Flexmap, FlexmapBlob, VRangeGetter};
 use flexmap::keys::FMKeys;
-use flexmap::packed::{CompactKeys, PackedFlexmap, SlotLocator};
+use flexmap::packed::{CompactKeys, HashedKeys, PackedFlexmap, SlotLocator};
 use flexmap::range::AnyRange;
 use flexmap::values::FMValues;
 use serde::{Deserialize, Serialize};
 
 use crate::database::common::{DBPaths, FlexalignDatabase, IndexFormat};
 use crate::database::flexmap::FlexmapStore;
+use crate::database::hashed_lines::HashedLines;
 use crate::options::Options;
 
 use super::db::{ShardRange, KEY_ALIGN};
@@ -203,11 +206,13 @@ fn split_packed_by_cells<K: SlotLocator, const C: usize, const F: usize, const T
     bounds.windows(2).map(|w| ShardRange::new(w[0], w[1])).collect()
 }
 
-/// Cuts a packed index into `n_shards` compact shard files named after `stem`.
+/// Cuts a packed index into `n_shards` shard files named after `stem`: compact ones, or hashed
+/// ones when `hashed` (the format of the index sliced).
 fn slice_packed<K: SlotLocator, const C: usize, const F: usize, const T: usize>(
     full: &PackedFlexmap<K, C, F, T>,
     stem: &str,
     n_shards: usize,
+    hashed: bool,
 ) -> std::io::Result<Vec<ShardEntry>> {
     let key_space = 1u64 << (2 * C);
     let mut shards = Vec::new();
@@ -215,15 +220,24 @@ fn slice_packed<K: SlotLocator, const C: usize, const F: usize, const T: usize>(
         if range.is_empty() {
             continue;
         }
-        let file = format!("{}.shard{}.compact", stem, i);
-        full.slice(range.lo, range.hi).save(&file)?;
+        let file = if hashed {
+            let file = format!("{}.shard{}.hashed", stem, i);
+            full.slice_hashed(range.lo, range.hi)
+                .ok_or_else(|| std::io::Error::other(format!("shard {i}: its hashed key table does not fit 64-bit entries")))?
+                .save(&file)?;
+            file
+        } else {
+            let file = format!("{}.shard{}.compact", stem, i);
+            full.slice(range.lo, range.hi).save(&file)?;
+            file
+        };
         shards.push(ShardEntry { lo: range.lo, hi: range.hi, file });
     }
     Ok(shards)
 }
 
 /// Slices the built index of `paths` into `n_shards` self-contained shard indexes (keys **and**
-/// values) of `format` (compact or blob), writes a [`SliceManifest`], and returns it. Loads the full
+/// values) of `format`, writes a [`SliceManifest`], and returns it. Loads the full
 /// index once (the one-time offline slicing cost); each shard is then loaded on its own.
 pub fn slice_index<
     const C: usize,
@@ -238,20 +252,14 @@ pub fn slice_index<
     let stem = SliceManifest::stem_for(paths, n_shards);
     let shards = match format {
         IndexFormat::Blob => slice_blob::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>(paths, n_shards)?,
-        IndexFormat::Hashed => {
-            return Err(std::io::Error::other(
-                "a hashed index cannot be sharded (its key table needs a power-of-two key space); \
-                 use --index-format compact or blob",
-            ))
-        }
-        IndexFormat::Compact => {
-            // The compact index, converted from the blob first if that is all there is.
-            let (full, note) =
-                FlexmapStore::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(paths, IndexFormat::Compact);
-            eprintln!("Slicing the compact index ({note})");
+        IndexFormat::Compact | IndexFormat::Hashed => {
+            // The packed index, converted from the blob first if that is all there is.
+            let (full, note) = FlexmapStore::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(paths, format);
+            eprintln!("Slicing the {format:?} index ({note})");
             match &full {
-                FlexmapStore::Compact(p) => slice_packed(&**p, &stem, n_shards)?,
-                _ => unreachable!("FlexmapStore::load of the compact format returns a compact index"),
+                FlexmapStore::Compact(p) => slice_packed(&**p, &stem, n_shards, false)?,
+                FlexmapStore::Hashed(p, _) => slice_packed(&**p, &stem, n_shards, true)?,
+                _ => unreachable!("FlexmapStore::load of a packed format returns a packed index"),
             }
         }
     };
@@ -336,11 +344,13 @@ fn slice_blob<
     Ok(shards)
 }
 
-/// A shard's index: a memory-mapped blob or a compact index read into memory.
+/// A shard's index: a memory-mapped blob, or a compact or hashed index read into memory (a hashed
+/// one with flexalign's reader of its key table, as the unsharded index).
 #[derive(Clone)]
 enum ShardStore<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THRESHOLD: usize> {
     Blob(FlexmapBlob<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>),
     Compact(Arc<PackedFlexmap<CompactKeys, C, F, HEADER_THRESHOLD>>),
+    Hashed(Arc<PackedFlexmap<HashedKeys, C, F, HEADER_THRESHOLD>>, HashedLines),
 }
 
 /// One physical shard: a memory-mapped blob or a compact index holding this shard's rebased keys and
@@ -374,7 +384,12 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
             IndexFormat::Compact => ShardStore::Compact(Arc::new(
                 PackedFlexmap::load(&entry.file, threads).unwrap_or_else(|e| panic!("read {}: {e}", entry.file)),
             )),
-            IndexFormat::Hashed => panic!("a slice manifest of a hashed index: hashed indexes cannot be sharded"),
+            IndexFormat::Hashed => {
+                let p: PackedFlexmap<HashedKeys, C, F, HEADER_THRESHOLD> =
+                    PackedFlexmap::load(&entry.file, threads).unwrap_or_else(|e| panic!("read {}: {e}", entry.file));
+                let lines = HashedLines::new(&p.keys);
+                ShardStore::Hashed(Arc::new(p), lines)
+            }
         };
         Self { store, lo: entry.lo, hi: entry.hi }
     }
@@ -398,6 +413,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         match &self.store {
             ShardStore::Blob(b) => b.get_vrange(key).map(AnyRange::from),
             ShardStore::Compact(p) => p.get(key).map(AnyRange::from),
+            ShardStore::Hashed(p, h) => h.locate(key).map(|(start, slots)| AnyRange::from(p.values.range(start, slots))),
         }
     }
 
@@ -435,6 +451,29 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         }
         match &self.store {
             ShardStore::Compact(p) => prefetched(&**p, keys, self.lo, self.hi, f),
+            ShardStore::Hashed(p, h) => {
+                // As `prefetched`, through the hashed reader: the in-range keys, rebased, then the
+                // keys outside the shard as `None`, all in key order.
+                let mut inside = Vec::with_capacity(keys.len());
+                let mut at = Vec::with_capacity(keys.len());
+                for (i, &k) in keys.iter().enumerate() {
+                    if k >= self.lo && k < self.hi {
+                        inside.push(k - self.lo);
+                        at.push(i);
+                    }
+                }
+                let mut next = 0;
+                h.for_each(&**p, &inside, |j, r| {
+                    for i in next..at[j] {
+                        f(i, None);
+                    }
+                    f(at[j], r.map(AnyRange::from));
+                    next = at[j] + 1;
+                });
+                for i in next..keys.len() {
+                    f(i, None);
+                }
+            }
             ShardStore::Blob(_) => {
                 for (i, &k) in keys.iter().enumerate() {
                     f(i, self.get_vrange(k));

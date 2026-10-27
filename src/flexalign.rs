@@ -160,7 +160,7 @@ pub fn run(args: Args) {
                 && db_paths.id2reference_path.exists()
                 && db_paths.reference2id_path.exists()
                 && (sliced || exists(&index_file));
-            if format != IndexFormat::Hashed && !separate {
+            if !separate {
                 eprintln!("Writing the separate index files the {n_shards}-shard slicing reads");
                 let db = DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::load(&db_paths, GLOBAL_VERSION);
                 db.save_separate(&db_paths, GLOBAL_VERSION).expect("writing the separate index files for slicing");
