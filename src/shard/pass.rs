@@ -129,7 +129,7 @@ pub fn run_shard_pass<
             let ranges = range_extractor.generate(kmers, rec, &mut scratch);
 
             let mut records = Vec::new();
-            let est = emit_ranges::<F>(ranges, max_best_flex, max_headered, &mut dist_buf, &mut records);
+            let est = emit_ranges::<F>(ranges, max_best_flex, None, max_headered, &mut dist_buf, &mut records);
 
             state.emit.headered += est.headered;
             state.emit.headerless += est.headerless;

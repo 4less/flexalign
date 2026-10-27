@@ -35,7 +35,7 @@ use crate::io::output_buffer::OutputBuffer;
 use crate::options::Options;
 
 use super::chunkfile::{ChunkFileReader, ChunkFileWriter};
-use super::emit::{emit_ranges, EmitStats};
+use super::emit::{emit_ranges, EmitStats, Recovery};
 use super::record::{GroupReader, GroupRecord, GroupWriter};
 use super::replay::ReplaySeedExtractor;
 
@@ -99,6 +99,7 @@ pub fn run_shard_pass_to_disk<
     buffer_size: usize,
     threads: u32,
     max_best_flex: usize,
+    recovery: Option<Recovery>,
     max_headered: usize,
 ) -> io::Result<EmitStats> {
     let writer = Arc::new(ChunkFileWriter::create(evidence_path, n_chunks)?);
@@ -156,7 +157,7 @@ pub fn run_shard_pass_to_disk<
             let kmers = kmer_ex.generate(rec, &mut scratch);
             let ranges = range_ex.generate(kmers, rec, &mut scratch);
             let mut records = Vec::new();
-            let est = emit_ranges::<F>(ranges, max_best_flex, max_headered, &mut dist_buf, &mut records);
+            let est = emit_ranges::<F>(ranges, max_best_flex, recovery, max_headered, &mut dist_buf, &mut records);
             add_emit(&mut st.emit, &est);
             if !records.is_empty() {
                 st.gw
@@ -269,8 +270,9 @@ pub fn run_disk_rejoin_align<
         fast: crate::align::modular_workflow::FastHitScratch::default(),
     };
 
-    let mut replay_fwd = ReplaySeedExtractor::<K, C, F>::new(max_ranges);
-    let mut replay_rev = ReplaySeedExtractor::<K, C, F>::new(max_ranges);
+    // The min-ranges recovery, from the recovery evidence the shard passes wrote (`run_sharded`).
+    let mut replay_fwd = ReplaySeedExtractor::<K, C, F>::with_recovery(max_ranges, options.args.min_ranges);
+    let mut replay_rev = ReplaySeedExtractor::<K, C, F>::with_recovery(max_ranges, options.args.min_ranges);
     let mut sort_time = Duration::ZERO;
     // Per-batch decoded evidence (idx_in_batch -> gathered groups across shards); only one batch resident.
     let mut current_batch: Option<u64> = None;

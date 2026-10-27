@@ -50,7 +50,23 @@ pub struct EmitStats {
 /// evidence and cost at most two cells.
 pub const DEFAULT_MAX_HEADERED: usize = 15;
 
+/// The unsharded seed walk's recovery (`StdSeedExtractor::generate`): a mate with fewer than
+/// `min_ranges` headered ranges surviving the flex filter, and at least one range cut by it, is
+/// walked again at `flex` -- `128`, under the `--mask-flank-mult` cap -- and those seeds are added.
+#[derive(Debug, Clone, Copy)]
+pub struct Recovery {
+    pub min_ranges: usize,
+    pub flex: usize,
+}
+
 /// Turns one mate's ranges into the records this shard owes the rejoin.
+///
+/// With `recovery`, a mate with fewer than `min_ranges` surviving headered ranges *in this shard*
+/// also gets a recovery record for every range the flex filter cut: its cells at `recovery.flex`,
+/// or none (a marker) if it fails that as well or falls past the per-shard cap there. Only the
+/// rejoin can tell whether the mate triggers recovery -- its surviving ranges are spread over the
+/// shards -- but a mate below `min_ranges` overall is below it in every shard, so every shard has
+/// written what the rejoin then needs.
 ///
 /// `ranges` must be ordered rarest-first (`StdRangeExtractor` sorts by `positions.len()`
 /// ascending). The cap relies on that order; the rejoin re-establishes it globally after merging.
@@ -60,20 +76,27 @@ pub const DEFAULT_MAX_HEADERED: usize = 15;
 pub fn emit_ranges<const F: usize>(
     ranges: &[Range<F>],
     max_best_flex: usize,
+    recovery: Option<Recovery>,
     max_headered: usize,
     dist_buf: &mut Vec<u8>,
     out: &mut Vec<RangeRecord>,
 ) -> EmitStats {
     let mut stats = EmitStats::default();
     let mut idx = [0u32; MAX_KEPT_TIES];
+    // Which ranges the flex filter cut, for the recovery records below.
+    let mut cut: Vec<bool> = Vec::new();
 
-    for range in ranges {
+    for (r, range) in ranges.iter().enumerate() {
         match range.vrange.has_header() {
             true => {
                 // flank_slack = 0: the sharded record stores one distance per range.
                 let (min_dist, count) = match range.resolve_flex(max_best_flex, 0, dist_buf, &mut idx) {
                     None => {
                         stats.discarded += 1;
+                        if recovery.is_some() {
+                            cut.resize(ranges.len(), false);
+                            cut[r] = true;
+                        }
                         continue;
                     }
                     Some(mc) => mc,
@@ -94,6 +117,7 @@ pub fn emit_ranges<const F: usize>(
                     n_positions: range.vrange.len() as u32,
                     headered: true,
                     min_dist: min_dist as u8,
+                    recovery: false,
                     cells,
                 });
             }
@@ -107,6 +131,46 @@ pub fn emit_ranges<const F: usize>(
                     headered: false,
                     // Meaningless without headers; the replay reads it only when `headered`.
                     min_dist: 0,
+                    recovery: false,
+                    cells,
+                });
+            }
+        }
+    }
+
+    // Survivors past the cap are survivors too: a capped mate has max_headered >= min_ranges.
+    let survived = stats.headered + stats.capped;
+    if let Some(rec) = recovery {
+        if stats.discarded > 0 && survived < rec.min_ranges {
+            let mut big = vec![0u32; rec.flex.max(MAX_KEPT_TIES)];
+            // Headered survivors at the relaxed threshold, in rank order: the per-shard cap holds
+            // for the recovery walk as for the first (a range in its global rarest set is in its
+            // shard's).
+            let mut kept = 0usize;
+            for (r, range) in ranges.iter().enumerate() {
+                if !range.vrange.has_header() {
+                    continue;
+                }
+                let resolved = range.resolve_flex(rec.flex, 0, dist_buf, &mut big);
+                if !cut[r] {
+                    kept += resolved.is_some() as usize;
+                    continue;
+                }
+                let cells: Vec<u64> = match resolved {
+                    Some((_, count)) if kept < max_headered => {
+                        kept += 1;
+                        big[..count].iter().map(|&i| range.vrange.cell(i as usize)).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let min_dist = resolved.map_or(0, |(d, _)| d);
+                stats.cells += cells.len();
+                out.push(RangeRecord {
+                    qpos: range.qpos as u32,
+                    n_positions: range.vrange.len() as u32,
+                    headered: true,
+                    min_dist: min_dist as u8,
+                    recovery: true,
                     cells,
                 });
             }

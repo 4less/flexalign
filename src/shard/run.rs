@@ -30,6 +30,7 @@ use crate::io::output_buffer::{OutputBuffer, OutputTarget};
 use crate::options::Options;
 use crate::shard::disk::{count_batches, run_disk_rejoin_align, run_shard_pass_to_disk};
 use crate::database::common::index_format;
+use crate::shard::emit::Recovery;
 use crate::shard::slice::{ShardBounds, WindowShardDB};
 
 const BUFFER_SIZE: usize = 1 << 24;
@@ -123,6 +124,12 @@ pub fn run_sharded<
         .map(|i| samples.iter().map(|s| format!("{}.evidence.s{i}.bin", s.out)).collect())
         .collect();
 
+    // As the unsharded seed walk: --max-best-flex and the recovery's 128 under the
+    // --mask-flank-mult ceiling, and the recovery only with --min-ranges.
+    let cap = if options.args.mask_flank_mult == 0 { usize::MAX } else { options.args.mask_flank_mult };
+    let max_best_flex = options.args.max_best_flex.min(cap);
+    let recovery = (options.args.min_ranges > 0).then(|| Recovery { min_ranges: options.args.min_ranges, flex: 128.min(cap) });
+
     let t_pass = Instant::now();
     for (i, &range) in ranges.iter().enumerate() {
         let t_load = Instant::now();
@@ -140,7 +147,7 @@ pub fn run_sharded<
                 Box<dyn Read + Send>,
             >(
                 open_reads(&s.r1), open_reads(&s.r2), &shard, s.n_batches, &evidence[i][j],
-                BUFFER_SIZE, threads, options.args.max_best_flex, MAX_HEADERED,
+                BUFFER_SIZE, threads, max_best_flex, recovery, MAX_HEADERED,
             )
             .expect("shard pass");
             eprintln!(

@@ -32,6 +32,10 @@ impl<const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for Rang
         _dist_buf: &mut Vec<u8>,
         seeds: &mut Vec<Seed>,
     ) -> RangeVerdict {
+        // A recovery marker: the range fails the relaxed threshold too (or is past the cap).
+        if self.recovery && self.cells.is_empty() {
+            return RangeVerdict::Discarded;
+        }
         if self.headered {
             for cell in &self.cells {
                 let (value, rpos) = VD::get(*cell);
@@ -62,6 +66,9 @@ pub struct ReplaySeedExtractor<const K: usize, const C: usize, const F: usize> {
     seeds: Vec<Seed>,
     ranges: Vec<RangeRecord>,
     max_ranges: usize,
+    /// `--min-ranges`: a mate with fewer headered ranges is walked again with its recovery
+    /// evidence, as `StdSeedExtractor::generate` does (0: never).
+    min_ranges: usize,
     /// Unused scratch to satisfy `walk_ranges` (the replay carries pre-resolved cells and never
     /// scans flanks); kept as a field so the call allocates nothing.
     flex_scratch: Vec<u8>,
@@ -69,7 +76,13 @@ pub struct ReplaySeedExtractor<const K: usize, const C: usize, const F: usize> {
 
 impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F> {
     pub fn new(max_ranges: usize) -> Self {
-        Self { seeds: Vec::new(), ranges: Vec::new(), max_ranges, flex_scratch: Vec::new() }
+        Self::with_recovery(max_ranges, 0)
+    }
+
+    /// With the min-ranges recovery of `min_ranges` (the shard passes must have written recovery
+    /// evidence: `emit_ranges` with `Recovery`).
+    pub fn with_recovery(max_ranges: usize, min_ranges: usize) -> Self {
+        Self { seeds: Vec::new(), ranges: Vec::new(), max_ranges, min_ranges, flex_scratch: Vec::new() }
     }
 
     /// Collects one mate's ranges out of the groups the N shard cursors yielded for this read.
@@ -94,18 +107,36 @@ impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F
     pub fn generate(&mut self, time_sorting: &mut std::time::Duration) -> &[Seed] {
         self.seeds.clear();
 
-        self.ranges.sort_unstable_by_key(|r| (r.n_positions, r.qpos));
+        // The first walk is over the ranges that passed the flex filter, rarest first; recovery
+        // evidence sorts after them and is left out.
+        self.ranges.sort_unstable_by_key(|r| (r.recovery, r.n_positions, r.qpos));
+        let first = self.ranges.iter().position(|r| r.recovery).unwrap_or(self.ranges.len());
 
         // usize::MAX: the flex filter lives in the shard pass. See `emit_seeds` above. flank_slack
         // is irrelevant here for the same reason (cells are pre-resolved on the wire).
-        let _: (usize, usize, usize) = walk_ranges::<K, C, F, _>(
-            &self.ranges,
+        let (retrieved, _, _) = walk_ranges::<K, C, F, _>(
+            &self.ranges[..first],
             usize::MAX,
             0,
             self.max_ranges,
             &mut self.flex_scratch,
             &mut self.seeds,
         );
+
+        // The recovery, as `StdSeedExtractor::generate`: too few headered ranges and one cut by
+        // the filter (whose recovery record is here: every shard wrote them for a mate this short)
+        // -> walk every range again at the relaxed threshold and add those seeds.
+        if retrieved < self.min_ranges && first < self.ranges.len() {
+            self.ranges.sort_unstable_by_key(|r| (r.n_positions, r.qpos));
+            let _ = walk_ranges::<K, C, F, _>(
+                &self.ranges,
+                usize::MAX,
+                0,
+                self.max_ranges,
+                &mut self.flex_scratch,
+                &mut self.seeds,
+            );
+        }
 
         let (duration, _) = stage_time(|| {
             glidesort::sort_by_key(&mut self.seeds, |seed: &Seed| (seed.rval, seed.rpos));
@@ -129,7 +160,7 @@ mod tests {
     use super::*;
 
     fn rec(qpos: u32, n_positions: u32, headered: bool, min_dist: u8, cells: &[u64]) -> RangeRecord {
-        RangeRecord { qpos, n_positions, headered, min_dist, cells: cells.to_vec() }
+        RangeRecord { qpos, n_positions, headered, min_dist, recovery: false, cells: cells.to_vec() }
     }
 
     fn group(mate: u8, ranges: Vec<RangeRecord>) -> GroupRecord {
