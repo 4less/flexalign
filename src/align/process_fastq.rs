@@ -216,6 +216,9 @@ pub fn process_fastq_wrapper_modular<
         };
 
         eprintln!("Process: {:?} {:?}", fwd, rev_option);
+        // Phases of one input, outside the per-pair stages: the SAM header is written on one
+        // thread before any read is processed, and on a large database it rivals the whole pass.
+        let input_started = std::time::Instant::now();
 
 
         let out_buffer = if options.output_prefix.is_some() {
@@ -229,6 +232,9 @@ pub fn process_fastq_wrapper_modular<
 
         // let output: StdPAFOutput = StdPAFOutput::new(stdout_buffer);
         let output = make_output(options, out_buffer, db);
+        let header_written = input_started.elapsed();
+        // Reset when the parallel pass starts, after the worker setup and the fast-hit probe.
+        let mut pass_started = input_started;
 
 
         let mut modular_fwd = Modular {
@@ -386,6 +392,7 @@ pub fn process_fastq_wrapper_modular<
                 }
 
 
+                pass_started = std::time::Instant::now();
                 if fwd_gzip {
                     // Each mate file is inflated on a thread of its own, ahead of the workers
                     // (io::threaded_reader): under the shared reader lock the inflate starved them.
@@ -441,6 +448,14 @@ pub fn process_fastq_wrapper_modular<
             },
         }
 
+        if crate::flexalign::STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "Input phases: SAM header {:.3?}, setup {:.3?}, read pass {:.3?}",
+                header_written,
+                pass_started.duration_since(input_started).saturating_sub(header_written),
+                pass_started.elapsed(),
+            );
+        }
         let mut stats = stats;
         if let Ok(s) = stats.as_mut() {
             s.fast_hit_workers_off = if options.args.fast_hit_on() && !modular_workflow::fast_hit_enabled() { 1 } else { 0 };

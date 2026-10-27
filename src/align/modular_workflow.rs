@@ -1022,6 +1022,21 @@ impl<
         rec_rev: &RefFastqRecord,
         stats: &mut Stats,
     ) -> () {
+        if STAGE_TRACE {
+            let started = std::time::Instant::now();
+            self.run_pair(rec_fwd, rec_rev, stats);
+            stats.trace_counts.time_pair += started.elapsed();
+        } else {
+            self.run_pair(rec_fwd, rec_rev, stats);
+        }
+    }
+
+    fn run_pair(
+        &mut self,
+        rec_fwd: &RefFastqRecord,
+        rec_rev: &RefFastqRecord,
+        stats: &mut Stats,
+    ) -> () {
         // A read (pair) starts: no reference slice of the previous one is used again.
         crate::database::refseq2::reset_scratch();
         stats.reads_processed += 2;
@@ -1048,6 +1063,7 @@ impl<
 
         // The fast-hit path: a pair pinned by its unique k-mers is written here and never seeded.
         if self.options.args.fast_hit_on() && fast_hit_enabled() && self.output.has_b() {
+            let fast_started = STAGE_TRACE.then(std::time::Instant::now);
             let done = fast_hit_pair::<C, F, RE, SO, D>(
                 &self.options.args,
                 self.db,
@@ -1064,6 +1080,10 @@ impl<
                 stats,
                 true,
             );
+            if let Some(t) = fast_started {
+                stats.trace_counts.fast_hit_tried += 1;
+                stats.trace_counts.time_fast_hit += t.elapsed();
+            }
             if done {
                 stats.fast_hit_pairs += 1;
                 return;
@@ -1302,6 +1322,24 @@ impl<
         seeds_rev: &[Seed],
         stats: &mut Stats,
     ) {
+        if STAGE_TRACE {
+            let started = std::time::Instant::now();
+            stats.trace_counts.pairs_seeded += 1;
+            self.align_from_seeds_traced(rec_fwd, rec_rev, seeds_fwd, seeds_rev, stats);
+            stats.trace_counts.time_align_half += started.elapsed();
+        } else {
+            self.align_from_seeds_traced(rec_fwd, rec_rev, seeds_fwd, seeds_rev, stats);
+        }
+    }
+
+    fn align_from_seeds_traced(
+        &mut self,
+        rec_fwd: &RefFastqRecord,
+        rec_rev: &RefFastqRecord,
+        seeds_fwd: &[Seed],
+        seeds_rev: &[Seed],
+        stats: &mut Stats,
+    ) {
         // A read (pair) starts: no reference slice of the previous one is used again.
         crate::database::refseq2::reset_scratch();
         // seeds_fwd.iter().for_each(|s| {
@@ -1442,6 +1480,16 @@ impl<
         //     }
         // }
 
+        if STAGE_TRACE {
+            let tc = &mut stats.trace_counts;
+            tc.anchor_pairs += anchors.len();
+            tc.pairs_no_anchor += anchors.is_empty() as usize;
+            for AnchorPair(a1, a2) in anchors.iter() {
+                tc.anchor_mates += a1.is_some() as usize + a2.is_some() as usize;
+                tc.anchor_full_pairs += (a1.is_some() && a2.is_some()) as usize;
+            }
+        }
+
         if anchors.is_empty() {
             if GOLDSTD_EVAL {
                 stats.gold_std_evaluation.as_mut().unwrap().add(false, 0);
@@ -1581,7 +1629,9 @@ impl<
             stats.funnel_true_in_screen_mates += holds_truth_mates(&anchors[0..screen_z]);
         }
         let pair_bonus = self.options.args.proper_pair_bonus;
+        let mut time_extend = std::time::Duration::ZERO;
         let (duration, extended_count) = stage_time(|| {
+            let extend_started = STAGE_TRACE.then(std::time::Instant::now);
             let extended_count = self.anchor_extender.extend(
                 &mut anchors[0..extend_top_z],
                 rec_fwd,
@@ -1605,6 +1655,9 @@ impl<
             // 60% of misclassified pairs and 54,366 half-pairs are a single-sided candidate beating
             // a two-sided one. Two mates agreeing on a locus at the right insert distance is stronger
             // evidence than one mate scoring well, so a pair that HAS both sides is ranked ahead.
+            if let Some(t) = extend_started {
+                time_extend = t.elapsed();
+            }
             let bonus = pair_bonus;
             crate::align::common::sort_pairs_by_key(&mut anchors[0..extended_count], &mut self.fast.sort_scratch, |AnchorPair(a1, a2)| {
                 let s = a1.as_ref().map_or(0, |a| a.score) + a2.as_ref().map_or(0, |a| a.score);
@@ -1617,6 +1670,12 @@ impl<
 
         // Assumes sorted anchors !!
         let extension_anchors = &mut anchors[0..extended_count];
+        let rescue_started = STAGE_TRACE.then(std::time::Instant::now);
+        if STAGE_TRACE {
+            stats.trace_counts.extend_window += extend_top_z;
+            stats.trace_counts.extended += extended_count;
+            stats.trace_counts.time_extend += time_extend;
+        }
 
         // Mate rescue, LAZY: run only on the candidate(s) that can still be emitted, after extension
         // has re-scored and re-sorted everything.
@@ -1716,6 +1775,9 @@ impl<
         // --debug: after extension + score-sort, is the best anchor the true one? Together with
         // dbg_true_anchor_present this pinpoints the stage: present but not best => extension/scoring
         // ranks a homolog above the truth; not present => the true anchor is never formed (seeding).
+        if let Some(t) = rescue_started {
+            stats.trace_counts.time_mate_rescue += t.elapsed();
+        }
         if self.options.args.debug || GOLDSTD_EVAL {
             if true_rid != 0 {
                 if let Some(AnchorPair(a1, a2)) = extension_anchors.first() {
@@ -1810,6 +1872,12 @@ impl<
         let anchors_len: usize = extension_anchors.len();
         let mut alignment_anchors =
             &mut extension_anchors[0..min(self.options.args.align_top_y, anchors_len)];
+        if STAGE_TRACE {
+            stats.trace_counts.align_window_pairs += alignment_anchors.len();
+            for AnchorPair(a1, a2) in alignment_anchors.iter() {
+                stats.trace_counts.align_window_mates += a1.is_some() as usize + a2.is_some() as usize;
+            }
+        }
 
         // Did the true anchor survive the screen's re-ranking into the alignment window? A "no" here
         // with a "yes" at `funnel_in_screen` is the screen mis-ranking the truth -- the failure mode
@@ -2385,6 +2453,10 @@ impl<
         }
         let fwd_mate = if fwd_pass { fwd_out.as_ref() } else { None };
         let rev_mate = if rev_pass { rev_out.as_ref() } else { None };
+        if STAGE_TRACE {
+            stats.trace_counts.mates_resolved += fwd_out.is_some() as usize + rev_out.is_some() as usize;
+            stats.trace_counts.mates_written += fwd_mate.is_some() as usize + rev_mate.is_some() as usize;
+        }
 
         // What SHAPE did this pair emit? Counted always, not only under GOLDSTD_EVAL, because a pair
         // that places one mate and drops the other loses a real alignment while every pair-level

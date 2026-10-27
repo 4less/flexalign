@@ -147,7 +147,59 @@ pub struct Stats {
 
     pub threads: usize,
 
+    /// Candidate counts and the per-pair timers around them, for the runtime anatomy of a run.
+    /// Written only under [`STAGE_TRACE`](crate::STAGE_TRACE), so an untraced build never touches
+    /// them. Counts are per pair (`anchor_pairs`, `extend_window`, `align_window_pairs`) or per
+    /// mate (`anchor_mates`, `align_window_mates`, `mates_resolved`, `mates_written`).
+    pub trace_counts: TraceCounts,
+
     pub gold_std_evaluation: Option<MapqEvaluation>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TraceCounts {
+    pub pairs_seeded: usize,
+    pub pairs_no_anchor: usize,
+    pub anchor_pairs: usize,
+    pub anchor_mates: usize,
+    pub anchor_full_pairs: usize,
+    pub extend_window: usize,
+    pub extended: usize,
+    pub align_window_pairs: usize,
+    pub align_window_mates: usize,
+    pub mates_resolved: usize,
+    pub mates_written: usize,
+    pub fast_hit_tried: usize,
+    /// Whole pair, from k-mers to output.
+    pub time_pair: Duration,
+    /// The reference-comparison half (`align_from_seeds`).
+    pub time_align_half: Duration,
+    pub time_fast_hit: Duration,
+    /// The gapless extension alone, inside the extension screen.
+    pub time_extend: Duration,
+    pub time_mate_rescue: Duration,
+}
+
+impl TraceCounts {
+    fn merge_from(&mut self, o: &Self) {
+        self.pairs_seeded += o.pairs_seeded;
+        self.pairs_no_anchor += o.pairs_no_anchor;
+        self.anchor_pairs += o.anchor_pairs;
+        self.anchor_mates += o.anchor_mates;
+        self.anchor_full_pairs += o.anchor_full_pairs;
+        self.extend_window += o.extend_window;
+        self.extended += o.extended;
+        self.align_window_pairs += o.align_window_pairs;
+        self.align_window_mates += o.align_window_mates;
+        self.mates_resolved += o.mates_resolved;
+        self.mates_written += o.mates_written;
+        self.fast_hit_tried += o.fast_hit_tried;
+        self.time_pair += o.time_pair;
+        self.time_align_half += o.time_align_half;
+        self.time_fast_hit += o.time_fast_hit;
+        self.time_extend += o.time_extend;
+        self.time_mate_rescue += o.time_mate_rescue;
+    }
 }
 
 pub trait EDisplay {
@@ -277,6 +329,36 @@ impl Stats {
             writeln!(f, "{input}\talign_stage_true_{label}\t{}\tcount", self.align_stage_reached_true[i])?;
         }
 
+        if crate::STAGE_TRACE {
+            let tc = &self.trace_counts;
+            let counts: [(&str, usize); 12] = [
+                ("trace_pairs_seeded", tc.pairs_seeded),
+                ("trace_pairs_no_anchor", tc.pairs_no_anchor),
+                ("trace_anchor_pairs", tc.anchor_pairs),
+                ("trace_anchor_mates", tc.anchor_mates),
+                ("trace_anchor_full_pairs", tc.anchor_full_pairs),
+                ("trace_extend_window", tc.extend_window),
+                ("trace_extended", tc.extended),
+                ("trace_align_window_pairs", tc.align_window_pairs),
+                ("trace_align_window_mates", tc.align_window_mates),
+                ("trace_mates_resolved", tc.mates_resolved),
+                ("trace_mates_written", tc.mates_written),
+                ("trace_fast_hit_tried", tc.fast_hit_tried),
+            ];
+            for (metric, value) in counts {
+                writeln!(f, "{input}\t{metric}\t{value}\tcount")?;
+            }
+            let times: [(&str, Duration); 5] = [
+                ("trace_pair", tc.time_pair),
+                ("trace_align_half", tc.time_align_half),
+                ("trace_fast_hit", tc.time_fast_hit),
+                ("trace_gapless_extend", tc.time_extend),
+                ("trace_mate_rescue", tc.time_mate_rescue),
+            ];
+            for (metric, value) in times {
+                writeln!(f, "{input}\t{metric}\t{:.9}\ts", secs(value))?;
+            }
+        }
         for (metric, value, unit) in rows {
             if unit == "s" || unit == "rate" {
                 writeln!(f, "{input}\t{metric}\t{value:.9}\t{unit}")?;
@@ -384,6 +466,7 @@ impl Merge for Stats {
         self.alignments_partial += other.alignments_partial;
         self.alignments_dropped += other.alignments_dropped;
         self.threads += 1;
+        self.trace_counts.merge_from(&other.trace_counts);
 
         if self.gold_std_evaluation.is_some() && other.gold_std_evaluation.is_some() {
             self.gold_std_evaluation.as_mut().unwrap().merge_from(&mut other.gold_std_evaluation.as_mut().unwrap());
@@ -644,6 +727,7 @@ impl Default for Stats {
             pair_leak_insert_size: 0,
 
             threads: 0,
+            trace_counts: TraceCounts::default(),
 
             gold_std_evaluation: if GOLDSTD_EVAL { Some(MapqEvaluation::default()) } else { None },
         }
