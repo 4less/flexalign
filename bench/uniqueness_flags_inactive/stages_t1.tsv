@@ -1,0 +1,217 @@
+rep	binary	stage	seconds
+1	base	getting reverse complement	0.116922
+1	base	getting kmers	1.84775
+1	base	getting ranges	1.26854
+1	base	sorting ranges	0
+1	base	getting range headers	0.88966
+1	base	sorting seeds	0.387641
+1	base	getting anchors	1.01162
+1	base	sorting anchors	0
+1	base	the hamming screen	0.973414
+1	base	calculating offsets	0
+1	base	checking anchors	0
+1	base	alignment	0.534731
+1	flags	getting reverse complement	0.112318
+1	flags	getting kmers	1.84287
+1	flags	getting ranges	1.26049
+1	flags	sorting ranges	0
+1	flags	getting range headers	0.887647
+1	flags	sorting seeds	0.383553
+1	flags	getting anchors	1.01689
+1	flags	sorting anchors	0
+1	flags	the hamming screen	0.966307
+1	flags	calculating offsets	0
+1	flags	checking anchors	0
+1	flags	alignment	0.529244
+2	flags	getting reverse complement	0.112896
+2	flags	getting kmers	1.84864
+2	flags	getting ranges	1.33381
+2	flags	sorting ranges	0
+2	flags	getting range headers	0.898216
+2	flags	sorting seeds	0.387145
+2	flags	getting anchors	1.02765
+2	flags	sorting anchors	0
+2	flags	the hamming screen	1.04268
+2	flags	calculating offsets	0
+2	flags	checking anchors	0
+2	flags	alignment	0.543523
+2	base	getting reverse complement	0.118738
+2	base	getting kmers	1.86351
+2	base	getting ranges	1.42869
+2	base	sorting ranges	0
+2	base	getting range headers	0.930724
+2	base	sorting seeds	0.401674
+2	base	getting anchors	1.04576
+2	base	sorting anchors	0
+2	base	the hamming screen	1.13597
+2	base	calculating offsets	0
+2	base	checking anchors	0
+2	base	alignment	0.560068
+3	base	getting reverse complement	0.118502
+3	base	getting kmers	1.86627
+3	base	getting ranges	1.41793
+3	base	sorting ranges	0
+3	base	getting range headers	0.92463
+3	base	sorting seeds	0.400074
+3	base	getting anchors	1.04278
+3	base	sorting anchors	0
+3	base	the hamming screen	1.13761
+3	base	calculating offsets	0
+3	base	checking anchors	0
+3	base	alignment	0.563453
+3	flags	getting reverse complement	0.115257
+3	flags	getting kmers	1.87022
+3	flags	getting ranges	1.43315
+3	flags	sorting ranges	0
+3	flags	getting range headers	0.938151
+3	flags	sorting seeds	0.401693
+3	flags	getting anchors	1.06878
+3	flags	sorting anchors	0
+3	flags	the hamming screen	1.15118
+3	flags	calculating offsets	0
+3	flags	checking anchors	0
+3	flags	alignment	0.570237
+4	flags	getting reverse complement	0.113432
+4	flags	getting kmers	1.85554
+4	flags	getting ranges	1.37665
+4	flags	sorting ranges	0
+4	flags	getting range headers	0.912142
+4	flags	sorting seeds	0.39227
+4	flags	getting anchors	1.04272
+4	flags	sorting anchors	0
+4	flags	the hamming screen	1.09644
+4	flags	calculating offsets	0
+4	flags	checking anchors	0
+4	flags	alignment	0.555606
+4	base	getting reverse complement	0.117937
+4	base	getting kmers	1.85362
+4	base	getting ranges	1.31843
+4	base	sorting ranges	0
+4	base	getting range headers	0.907265
+4	base	sorting seeds	0.394778
+4	base	getting anchors	1.02604
+4	base	sorting anchors	0
+4	base	the hamming screen	1.04003
+4	base	calculating offsets	0
+4	base	checking anchors	0
+4	base	alignment	0.550889
+5	base	getting reverse complement	0.117685
+5	base	getting kmers	1.85786
+5	base	getting ranges	1.35023
+5	base	sorting ranges	0
+5	base	getting range headers	0.91413
+5	base	sorting seeds	0.397035
+5	base	getting anchors	1.0319
+5	base	sorting anchors	0
+5	base	the hamming screen	1.06892
+5	base	calculating offsets	0
+5	base	checking anchors	0
+5	base	alignment	0.553621
+5	flags	getting reverse complement	0.112925
+5	flags	getting kmers	1.84291
+5	flags	getting ranges	1.31184
+5	flags	sorting ranges	0
+5	flags	getting range headers	0.891752
+5	flags	sorting seeds	0.383995
+5	flags	getting anchors	1.01935
+5	flags	sorting anchors	0
+5	flags	the hamming screen	1.02461
+5	flags	calculating offsets	0
+5	flags	checking anchors	0
+5	flags	alignment	0.538991
+6	flags	getting reverse complement	0.112222
+6	flags	getting kmers	1.84075
+6	flags	getting ranges	1.30642
+6	flags	sorting ranges	0
+6	flags	getting range headers	0.887372
+6	flags	sorting seeds	0.382472
+6	flags	getting anchors	1.018
+6	flags	sorting anchors	0
+6	flags	the hamming screen	1.01671
+6	flags	calculating offsets	0
+6	flags	checking anchors	0
+6	flags	alignment	0.531011
+6	base	getting reverse complement	0.115518
+6	base	getting kmers	1.83884
+6	base	getting ranges	1.28798
+6	base	sorting ranges	0
+6	base	getting range headers	0.884205
+6	base	sorting seeds	0.385017
+6	base	getting anchors	1.00053
+6	base	sorting anchors	0
+6	base	the hamming screen	0.996602
+6	base	calculating offsets	0
+6	base	checking anchors	0
+6	base	alignment	0.529052
+7	base	getting reverse complement	0.117173
+7	base	getting kmers	1.85164
+7	base	getting ranges	1.3095
+7	base	sorting ranges	0
+7	base	getting range headers	0.910871
+7	base	sorting seeds	0.393928
+7	base	getting anchors	1.02879
+7	base	sorting anchors	0
+7	base	the hamming screen	1.02095
+7	base	calculating offsets	0
+7	base	checking anchors	0
+7	base	alignment	0.544424
+7	flags	getting reverse complement	0.113882
+7	flags	getting kmers	1.86302
+7	flags	getting ranges	1.37789
+7	flags	sorting ranges	0
+7	flags	getting range headers	0.921019
+7	flags	sorting seeds	0.396546
+7	flags	getting anchors	1.05257
+7	flags	sorting anchors	0
+7	flags	the hamming screen	1.09373
+7	flags	calculating offsets	0
+7	flags	checking anchors	0
+7	flags	alignment	0.555302
+8	flags	getting reverse complement	0.114203
+8	flags	getting kmers	1.86095
+8	flags	getting ranges	1.40707
+8	flags	sorting ranges	0
+8	flags	getting range headers	0.921046
+8	flags	sorting seeds	0.395783
+8	flags	getting anchors	1.05158
+8	flags	sorting anchors	0
+8	flags	the hamming screen	1.12703
+8	flags	calculating offsets	0
+8	flags	checking anchors	0
+8	flags	alignment	0.553914
+8	base	getting reverse complement	0.117395
+8	base	getting kmers	1.86532
+8	base	getting ranges	1.35411
+8	base	sorting ranges	0
+8	base	getting range headers	0.917837
+8	base	sorting seeds	0.39896
+8	base	getting anchors	1.04016
+8	base	sorting anchors	0
+8	base	the hamming screen	1.07748
+8	base	calculating offsets	0
+8	base	checking anchors	0
+8	base	alignment	0.558012
+9	base	getting reverse complement	0.118172
+9	base	getting kmers	1.85311
+9	base	getting ranges	1.38129
+9	base	sorting ranges	0
+9	base	getting range headers	0.910707
+9	base	sorting seeds	0.394491
+9	base	getting anchors	1.03002
+9	base	sorting anchors	0
+9	base	the hamming screen	1.09352
+9	base	calculating offsets	0
+9	base	checking anchors	0
+9	base	alignment	0.5485
+9	flags	getting reverse complement	0.112167
+9	flags	getting kmers	1.84088
+9	flags	getting ranges	1.32717
+9	flags	sorting ranges	0
+9	flags	getting range headers	0.88691
+9	flags	sorting seeds	0.382001
+9	flags	getting anchors	1.01728
+9	flags	sorting anchors	0
+9	flags	the hamming screen	1.04498
+9	flags	calculating offsets	0
+9	flags	checking anchors	0
+9	flags	alignment	0.535184
