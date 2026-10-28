@@ -3003,6 +3003,12 @@ fn prefetch_line(bytes: &[u8]) {
     }
 }
 
+/// Sets the unresolved repeat cores of the pair `align_from_seeds` aligns next on this thread: the
+/// sharded rejoin's count, gathered from the shards' evidence. `run_pair` sets its own.
+pub fn set_unresolved(n: usize) {
+    UNRESOLVED.with(|u| u.set(n));
+}
+
 thread_local! {
     /// Unresolved repeat cores of the pair being aligned (`RangeExtractor::last_unresolved`, both
     /// mates), set by `run_pair` for the MAPQ in `align_from_seeds`.

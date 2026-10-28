@@ -16,7 +16,7 @@
 //!     qpos_delta   varint   qpos minus the previous range's qpos in this group, wrapping (u32):
 //!                           ranges come rarest-first, not by qpos, so a delta may wrap
 //!     n_positions  varint   == vrange.positions.len(), the global sort key for the rejoin
-//!     flags_dist   u8       bit0: headered; bit1: recovery; bit2: reserved; bits3..7: min_dist (0..=16)
+//!     flags_dist   u8       bit0: headered; bit1: recovery; bit2: unresolved marker; bits3..7: min_dist (0..=16)
 //!     n_cells      varint
 //!     cells        n_cells x u64 little-endian raw VCell
 //! ```
@@ -33,6 +33,9 @@ pub const FLAG_HEADERED: u8 = 0b0000_0001;
 /// Evidence for the min-ranges recovery only (see `emit_ranges`): a range the flex filter cut,
 /// with its cells at the relaxed threshold, or none if it fails that too.
 pub const FLAG_RECOVERY: u8 = 0b0000_0010;
+/// Not a range: a marker whose `n_positions` counts the mate's cores the repeat index could not
+/// resolve in this shard (`--repeat-index`), for the MAPQ of the rejoin. It carries no cells.
+pub const FLAG_UNRESOLVED: u8 = 0b0000_0100;
 const DIST_SHIFT: u8 = 3;
 const DIST_MAX: u8 = 0x1F;
 
@@ -55,6 +58,9 @@ pub struct RangeRecord {
     /// Recovery evidence (`FLAG_RECOVERY`): replayed only when the read's mate triggers the
     /// min-ranges recovery, as the unsharded walk's second pass.
     pub recovery: bool,
+    /// An unresolved-cores marker (`FLAG_UNRESOLVED`), not a range: skipped by the replay, which
+    /// only adds up its `n_positions`.
+    pub unresolved: bool,
     pub cells: Vec<u64>,
 }
 
@@ -180,6 +186,9 @@ impl GroupWriter {
             if r.recovery {
                 flags |= FLAG_RECOVERY;
             }
+            if r.unresolved {
+                flags |= FLAG_UNRESOLVED;
+            }
             flags |= r.min_dist << DIST_SHIFT;
             self.buf.push(flags);
 
@@ -284,6 +293,7 @@ impl<'a> GroupReader<'a> {
                 headered: flags & FLAG_HEADERED != 0,
                 min_dist: (flags >> DIST_SHIFT) & DIST_MAX,
                 recovery: flags & FLAG_RECOVERY != 0,
+                unresolved: flags & FLAG_UNRESOLVED != 0,
                 cells,
             });
         }
@@ -313,7 +323,7 @@ mod tests {
     use super::*;
 
     fn range(qpos: u32, n_positions: u32, headered: bool, min_dist: u8, cells: &[u64]) -> RangeRecord {
-        RangeRecord { qpos, n_positions, headered, min_dist, recovery: false, cells: cells.to_vec() }
+        RangeRecord { qpos, n_positions, headered, min_dist, recovery: false, unresolved: false, cells: cells.to_vec() }
     }
 
     fn roundtrip(groups: &[GroupRecord]) -> Vec<GroupRecord> {
@@ -337,6 +347,13 @@ mod tests {
             mate: 0,
             ranges: vec![range(22, 5, true, 0, &[0xDEAD_BEEF_0000_0001, 2])],
         };
+        assert_eq!(roundtrip(&[g.clone()]), vec![g]);
+    }
+
+    #[test]
+    fn roundtrips_an_unresolved_marker() {
+        let marker = RangeRecord { qpos: 0, n_positions: 9, headered: false, min_dist: 0, recovery: false, unresolved: true, cells: Vec::new() };
+        let g = GroupRecord { idx: 3, mate: 1, ranges: vec![range(22, 5, true, 2, &[7]), marker] };
         assert_eq!(roundtrip(&[g.clone()]), vec![g]);
     }
 

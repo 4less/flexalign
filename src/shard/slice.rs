@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::database::bundle::{self, Bundle};
 use crate::database::common::{DBPaths, FlexalignDatabase, IndexFormat};
 use crate::database::hashed_lines::HashedLines;
+use crate::database::repeat::{RepeatIndex, RepeatLookup};
 use crate::options::Options;
 
 use super::db::ShardRange;
@@ -133,6 +134,8 @@ pub struct WindowShardDB<
     store: ShardStore<C, F, HEADER_THRESHOLD>,
     lo: u64,
     hi: u64,
+    /// `--repeat-index`: this shard's keys of the repeat index (`RepeatIndex::load_window`).
+    repeat: Option<Arc<RepeatIndex>>,
 }
 
 impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THRESHOLD: usize>
@@ -154,7 +157,14 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
             )),
             IndexFormat::Blob => return Err(std::io::Error::other("a blob index is not sharded")),
         };
-        Ok(Self { store, lo: range.lo, hi: range.hi })
+        Ok(Self { store, lo: range.lo, hi: range.hi, repeat: None })
+    }
+
+    /// Answers the dropped cores of this shard's keys from `repeat` (their window of the repeat
+    /// index), as the unsharded index does from the whole of it.
+    pub fn with_repeat(mut self, repeat: RepeatIndex) -> Self {
+        self.repeat = Some(Arc::new(repeat));
+        self
     }
 
     pub fn range(&self) -> ShardRange {
@@ -167,7 +177,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
             ShardStore::Compact(p) => p.memory_bytes(),
             ShardStore::Hashed(p, _) => p.memory_bytes(),
         };
-        k + v
+        k + v + self.repeat.as_ref().map_or(0, |r| r.memory_bytes())
     }
 }
 
@@ -211,6 +221,13 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         }
         for i in next..keys.len() {
             f(i, None);
+        }
+    }
+
+    fn repeat_lookup_batch<'s>(&'s self, queries: &[(u64, u32)], max: usize, f: &mut dyn FnMut(usize, RepeatLookup<'s>)) {
+        // The window holds this shard's dropped cores only: any other key is not a repeat here.
+        if let Some(r) = &self.repeat {
+            r.lookup_batch(queries, max, f);
         }
     }
 

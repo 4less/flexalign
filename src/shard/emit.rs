@@ -90,7 +90,10 @@ pub fn emit_ranges<const F: usize>(
         match range.vrange.has_header() {
             true => {
                 // flank_slack = 0: the sharded record stores one distance per range.
-                let (min_dist, count) = match range.resolve_flex(max_best_flex, 0, dist_buf, &mut idx) {
+                // A repeat-index run keeps every cell, as the unsharded walk does (its length was
+                // bounded by --repeat-bucket-max when it was looked up).
+                let limit = if range.repeat { MAX_KEPT_TIES } else { max_best_flex };
+                let (min_dist, count) = match range.resolve_flex(limit, 0, dist_buf, &mut idx) {
                     None => {
                         stats.discarded += 1;
                         if recovery.is_some() {
@@ -118,6 +121,7 @@ pub fn emit_ranges<const F: usize>(
                     headered: true,
                     min_dist: min_dist as u8,
                     recovery: false,
+                    unresolved: false,
                     cells,
                 });
             }
@@ -132,6 +136,7 @@ pub fn emit_ranges<const F: usize>(
                     // Meaningless without headers; the replay reads it only when `headered`.
                     min_dist: 0,
                     recovery: false,
+                    unresolved: false,
                     cells,
                 });
             }
@@ -171,6 +176,7 @@ pub fn emit_ranges<const F: usize>(
                     headered: true,
                     min_dist: min_dist as u8,
                     recovery: true,
+                    unresolved: false,
                     cells,
                 });
             }

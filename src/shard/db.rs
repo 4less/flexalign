@@ -113,6 +113,14 @@ impl<D: FlexalignDatabase> FlexalignDatabase for ShardedDB<D> {
         self.inner.get_vrange(canonical_kmer)
     }
 
+    /// The inner index's repeat lookups for this shard's keys only, as a shard holding its window
+    /// of the repeat index would answer them.
+    fn repeat_lookup_batch<'s>(&'s self, queries: &[(u64, u32)], max: usize, f: &mut dyn FnMut(usize, crate::database::repeat::RepeatLookup<'s>)) {
+        let at: Vec<usize> = (0..queries.len()).filter(|&j| self.range.contains(queries[j].0)).collect();
+        let inside: Vec<(u64, u32)> = at.iter().map(|&j| queries[j]).collect();
+        self.inner.repeat_lookup_batch(&inside, max, &mut |j, r| f(at[j], r));
+    }
+
     // References are not sharded (ProjectShard.md scope) -- every shard sees all of them, and the
     // rejoin's reference-based stages need them intact.
     fn get_rid(&self, reference: &str) -> Option<&usize> {

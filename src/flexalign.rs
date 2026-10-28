@@ -148,9 +148,6 @@ pub fn run(args: Args) {
             // One shard is the whole index: the unsharded run does that in one pass over the reads,
             // the sharded pipeline in two plus an evidence file.
             if let Some(n_shards) = chosen.filter(|&n| n > 1) {
-                if options.args.repeat_index {
-                    eprintln!("--repeat-index is not used by sharded runs yet; aligning without it.");
-                }
                 run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, &options, n_shards);
                 return;
             }

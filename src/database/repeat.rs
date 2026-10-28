@@ -393,6 +393,77 @@ impl RepeatIndex {
         (Arc::new(r), "built")
     }
 
+    /// Makes sure `<index_file>.repeat` exists for this index and cap, building and writing it if
+    /// not, without keeping it in memory: a sharded run then reads one shard's keys of it at a time
+    /// ([`Self::load_window`]). Returns what was done.
+    pub fn ensure_built<const K: usize, const C: usize, const F: usize, const S: usize, const L: usize>(
+        index_file: &str,
+        reference: &Path,
+        rid_of: impl FnOnce() -> HashMap<String, usize>,
+        cap: u64,
+        threads: usize,
+    ) -> std::io::Result<&'static str> {
+        let stamp = stamp_of(index_file).unwrap_or((0, 0));
+        let path = path_for(index_file);
+        if let Ok(head) = Self::read_head(&path) {
+            if head[0] == cap && (head[1], head[2]) == stamp {
+                return Ok("present");
+            }
+        }
+        let mut r = Self::build::<K, C, F, S, L>(reference, &rid_of(), cap, threads);
+        r.stamp = stamp;
+        r.save(&path)?;
+        Ok("built")
+    }
+
+    /// The header's seven numbers: cap, stamp (length, mtime), keys, entries, directory, runs.
+    fn read_head(path: &str) -> std::io::Result<[u64; 7]> {
+        let mut r = File::open(path)?;
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        if magic != MAGIC {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a repeat index"));
+        }
+        let mut head = [0u64; 7];
+        for v in &mut head {
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            *v = u64::from_le_bytes(b);
+        }
+        Ok(head)
+    }
+
+    /// The dropped cores in `[lo, hi)` of the repeat index at `path` (a shard's key range): only
+    /// their entries are read, and their table and directories rebuilt for them alone.
+    pub fn load_window(path: &str, lo: u64, hi: u64) -> std::io::Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        let [cap, len, modified, n_keys, n, _, _] = Self::read_head(path)?;
+        let mut r = BufReader::with_capacity(1 << 24, File::open(path)?);
+        let base = 8 + 7 * 8;
+        let mut keys = vec![0u32; n_keys as usize];
+        let mut starts = vec![0u64; n_keys as usize + 1];
+        r.seek(SeekFrom::Start(base))?;
+        r.read_exact(as_bytes_mut(&mut keys))?;
+        r.read_exact(as_bytes_mut(&mut starts))?;
+        // Keys are sorted: the window is a contiguous run of them, and of their entries.
+        let a = keys.partition_point(|&k| (k as u64) < lo);
+        let b = keys.partition_point(|&k| (k as u64) < hi);
+        let (ea, eb) = (starts[a], starts[b]);
+        let keys: Vec<u32> = keys[a..b].to_vec();
+        let starts: Vec<u64> = starts[a..=b].iter().map(|&s| s - ea).collect();
+        let flanks_at = base + n_keys * 4 + (n_keys + 1) * 8;
+        let cells_at = flanks_at + n * 4;
+        let mut flanks = vec![0u32; (eb - ea) as usize];
+        let mut cells = vec![VCell(0); (eb - ea) as usize];
+        r.seek(SeekFrom::Start(flanks_at + ea * 4))?;
+        r.read_exact(as_bytes_mut(&mut flanks))?;
+        r.seek(SeekFrom::Start(cells_at + ea * 8))?;
+        r.read_exact(as_bytes_mut(&mut cells))?;
+        let (meta, dir, runs) = Self::make_dirs(&starts, &flanks);
+        let (table, table_shift) = Self::make_table(&keys);
+        Ok(Self { cap, stamp: (len, modified), keys, starts, flanks, cells, table, table_shift, meta, dir, runs })
+    }
+
     fn save(&self, path: &str) -> std::io::Result<()> {
         let tmp = format!("{path}.tmp{}", std::process::id());
         {
@@ -545,6 +616,60 @@ mod tests {
             }
         }
         assert!(matches!(rep.lookup(5, 0, 10), RepeatLookup::NotRepeat));
+    }
+
+    /// A shard's window of a saved repeat index answers every lookup of its keys as the whole index
+    /// does, and knows nothing of the other keys.
+    #[test]
+    fn windows_answer_as_the_whole() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut entries: Vec<(u64, u64)> = Vec::new();
+        for key in [3u32, 77, 1000, 1 << 20, (1 << 28) + 5] {
+            for e in 0..500u64 {
+                let flank = (next() % 60) as u32;
+                for c in 0..(if e % 40 == 0 { 20 } else { 1 }) {
+                    entries.push((((key as u64) << 32) | flank as u64, e * 100 + c));
+                }
+            }
+        }
+        entries.sort_unstable();
+        let (mut keys, mut starts, mut flanks, mut cells) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for &(sk, cell) in &entries {
+            if keys.last() != Some(&((sk >> 32) as u32)) {
+                keys.push((sk >> 32) as u32);
+                starts.push(flanks.len() as u64);
+            }
+            flanks.push(sk as u32);
+            cells.push(VCell(cell));
+        }
+        starts.push(flanks.len() as u64);
+        let (table, table_shift) = RepeatIndex::make_table(&keys);
+        let (meta, dir, runs) = RepeatIndex::make_dirs(&starts, &flanks);
+        let whole = RepeatIndex { cap: 256, stamp: (1, 2), keys, starts, flanks, cells, table, table_shift, meta, dir, runs };
+        let path = std::env::temp_dir().join(format!("flexalign_repeat_window_{}", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        whole.save(&path).unwrap();
+        let bounds = [0u64, 50, 1001, 1 << 20, 1 << 32];
+        for w in bounds.windows(2) {
+            let win = RepeatIndex::load_window(&path, w[0], w[1]).unwrap();
+            assert_eq!((win.cap, win.stamp), (256, (1, 2)));
+            for &key in &whole.keys {
+                for q in 0..64u32 {
+                    for max in [1usize, 19, 20, 1000] {
+                        let (a, b) = (whole.lookup(key as u64, q, max), win.lookup(key as u64, q, max));
+                        if (w[0]..w[1]).contains(&(key as u64)) {
+                            let n = match &a { RepeatLookup::Range(r) => r.len(), _ => 0 };
+                            assert!(b.is_range_of(n), "key {key} flank {q} max {max} in {w:?}");
+                            assert_eq!(matches!(a, RepeatLookup::Unresolved), matches!(b, RepeatLookup::Unresolved));
+                        } else {
+                            assert!(matches!(b, RepeatLookup::NotRepeat), "key {key} outside {w:?}");
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     /// Every key's entries in the repeat index (built with cap 0, so it keeps every key) equal the

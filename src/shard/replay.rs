@@ -72,6 +72,8 @@ pub struct ReplaySeedExtractor<const K: usize, const C: usize, const F: usize> {
     /// Unused scratch to satisfy `walk_ranges` (the replay carries pre-resolved cells and never
     /// scans flanks); kept as a field so the call allocates nothing.
     flex_scratch: Vec<u8>,
+    /// The mate's unresolved repeat cores, summed over the shards' markers (`--repeat-index`).
+    unresolved: usize,
 }
 
 impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F> {
@@ -82,7 +84,7 @@ impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F
     /// With the min-ranges recovery of `min_ranges` (the shard passes must have written recovery
     /// evidence: `emit_ranges` with `Recovery`).
     pub fn with_recovery(max_ranges: usize, min_ranges: usize) -> Self {
-        Self { seeds: Vec::new(), ranges: Vec::new(), max_ranges, min_ranges, flex_scratch: Vec::new() }
+        Self { seeds: Vec::new(), ranges: Vec::new(), max_ranges, min_ranges, flex_scratch: Vec::new(), unresolved: 0 }
     }
 
     /// Collects one mate's ranges out of the groups the N shard cursors yielded for this read.
@@ -91,9 +93,20 @@ impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F
     /// across shards is arbitrary and meaningless -- `generate` re-establishes the global order.
     pub fn gather(&mut self, groups: &[GroupRecord], mate: u8) {
         self.ranges.clear();
+        self.unresolved = 0;
         for g in groups.iter().filter(|g| g.mate == mate) {
-            self.ranges.extend(g.ranges.iter().cloned());
+            for r in &g.ranges {
+                match r.unresolved {
+                    true => self.unresolved += r.n_positions as usize,
+                    false => self.ranges.push(r.clone()),
+                }
+            }
         }
+    }
+
+    /// The gathered mate's cores the repeat index could not resolve, over all shards.
+    pub fn unresolved(&self) -> usize {
+        self.unresolved
     }
 
     /// Restores the global rank order, walks the budget, and sorts the seeds.
@@ -160,11 +173,27 @@ mod tests {
     use super::*;
 
     fn rec(qpos: u32, n_positions: u32, headered: bool, min_dist: u8, cells: &[u64]) -> RangeRecord {
-        RangeRecord { qpos, n_positions, headered, min_dist, recovery: false, cells: cells.to_vec() }
+        RangeRecord { qpos, n_positions, headered, min_dist, recovery: false, unresolved: false, cells: cells.to_vec() }
     }
 
     fn group(mate: u8, ranges: Vec<RangeRecord>) -> GroupRecord {
         GroupRecord { idx: 0, mate, ranges }
+    }
+
+    /// Unresolved markers are counted, per mate and over every shard, and never walked as ranges.
+    #[test]
+    fn gather_counts_unresolved_markers_apart() {
+        let marker = |n| RangeRecord { qpos: 0, n_positions: n, headered: false, min_dist: 0, recovery: false, unresolved: true, cells: Vec::new() };
+        let mut r = ReplaySeedExtractor::<31, 15, 16>::new(15);
+        let groups = vec![
+            group(0, vec![rec(1, 5, true, 0, &[1]), marker(4)]),
+            group(1, vec![marker(2)]),
+            group(0, vec![marker(3)]),
+        ];
+        r.gather(&groups, 0);
+        assert_eq!((r.ranges().len(), r.unresolved()), (1, 7));
+        r.gather(&groups, 1);
+        assert_eq!((r.ranges().len(), r.unresolved()), (0, 2));
     }
 
     #[test]

@@ -33,7 +33,7 @@ use crate::options::Options;
 
 use super::chunkfile::{ChunkFileReader, ChunkFileWriter};
 use super::emit::{emit_ranges, EmitStats, Recovery};
-use super::record::{GroupReader, GroupRecord, GroupWriter};
+use super::record::{GroupReader, GroupRecord, GroupWriter, RangeRecord};
 use super::replay::ReplaySeedExtractor;
 
 fn add_emit(a: &mut EmitStats, b: &EmitStats) {
@@ -98,6 +98,7 @@ pub fn run_shard_pass_to_disk<
     max_best_flex: usize,
     recovery: Option<Recovery>,
     max_headered: usize,
+    repeat_max: usize,
 ) -> io::Result<EmitStats> {
     let writer = Arc::new(ChunkFileWriter::create(evidence_path, n_chunks)?);
 
@@ -134,7 +135,8 @@ pub fn run_shard_pass_to_disk<
     }
 
     let mut kmer_ex = StdKmerExtractor::<K, C, ClosedSyncmer<C, S, L>>::default();
-    let mut range_ex = StdRangeExtractor::<K, C, F, D>::new(db);
+    // `--repeat-index`: the shard answers its own dropped cores from its window of the repeat index.
+    let mut range_ex = StdRangeExtractor::<K, C, F, D>::new(db).with_repeat(repeat_max);
     let mut scratch = Stats::default();
 
     let init = PassState {
@@ -156,6 +158,18 @@ pub fn run_shard_pass_to_disk<
             let mut records = Vec::new();
             let est = emit_ranges::<F>(ranges, max_best_flex, recovery, max_headered, &mut dist_buf, &mut records);
             add_emit(&mut st.emit, &est);
+            let unresolved = range_ex.last_unresolved();
+            if unresolved > 0 {
+                records.push(RangeRecord {
+                    qpos: 0,
+                    n_positions: unresolved as u32,
+                    headered: false,
+                    min_dist: 0,
+                    recovery: false,
+                    unresolved: true,
+                    cells: Vec::new(),
+                });
+            }
             if !records.is_empty() {
                 st.gw
                     .push(&GroupRecord { idx: id.idx_in_batch as u32, mate, ranges: records })
@@ -318,9 +332,12 @@ pub fn run_disk_rejoin_align<
         let groups = batch_map.get(&(id.idx_in_batch as u32)).unwrap_or(&empty);
         replay_fwd.gather(groups, 0);
         replay_rev.gather(groups, 1);
+        let unresolved = replay_fwd.unresolved() + replay_rev.unresolved();
         let seeds_fwd = replay_fwd.generate(&mut sort_time);
         let seeds_rev = replay_rev.generate(&mut sort_time);
+        crate::align::modular_workflow::set_unresolved(unresolved);
         modular_pe.align_from_seeds(rec_fwd, rec_rev, seeds_fwd, seeds_rev, stats);
+        crate::align::modular_workflow::set_unresolved(0);
     };
 
     Ok(
