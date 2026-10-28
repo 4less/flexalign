@@ -36,6 +36,11 @@ use crate::shard::emit::Recovery;
 use crate::shard::slice::{ShardBounds, WindowShardDB};
 
 const BUFFER_SIZE: usize = 1 << 24;
+/// FASTQ bytes per read batch, in the passes and the rejoin alike (batch ids must agree). Each worker
+/// holds its batch's decoded evidence during the rejoin, so `threads` batches are resident at once:
+/// at 16 MB a 1M-pair sample was ~20 batches, all of them resident -- the whole sample's evidence,
+/// 5.9 GB peak on bacteroides against 3.4 GB unsharded. 1 MB, as the unsharded reader uses.
+const READ_BATCH_BYTES: usize = 1 << 20;
 const MAX_HEADERED: usize = 15;
 
 /// One sample of a batch: its read FILES and its output path. The reads are never held in memory.
@@ -120,7 +125,7 @@ pub fn run_sharded<
     let samples: Vec<ShardSample> = pairs
         .into_iter()
         .map(|(r1, r2, out)| {
-            let n_batches = count_batches(open_reads(&r1), open_reads(&r2), BUFFER_SIZE, threads);
+            let n_batches = count_batches(open_reads(&r1), open_reads(&r2), READ_BATCH_BYTES, threads);
             ShardSample { r1, r2, out, n_batches }
         })
         .collect();
@@ -180,7 +185,7 @@ pub fn run_sharded<
                 Box<dyn Read + Send>,
             >(
                 open_reads(&s.r1), open_reads(&s.r2), &shard, s.n_batches, &evidence[i][j],
-                BUFFER_SIZE, threads, max_best_flex, recovery, MAX_HEADERED, repeat_max,
+                READ_BATCH_BYTES, threads, max_best_flex, recovery, MAX_HEADERED, repeat_max,
             )
             .expect("shard pass");
             eprintln!(
@@ -214,7 +219,7 @@ pub fn run_sharded<
             Box<dyn Read + Send>,
         >(
             open_reads(&s.r1), open_reads(&s.r2), &full, options, out_buffer, &ev,
-            options.args.ranges, BUFFER_SIZE, threads,
+            options.args.ranges, READ_BATCH_BYTES, threads,
         )
         .expect("rejoin");
         total_alignments += stats.alignments_successful as usize;
