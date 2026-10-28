@@ -47,6 +47,8 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     /// Since the last `generate`: dropped cores met, and those whose exact K-mer run was empty or too long.
     repeat_cores: usize,
     repeat_unresolved: usize,
+    /// `repeat_unresolved` of the last `generate`, for [`RangeExtractor::last_unresolved`].
+    last_unresolved: usize,
     /// A read's keys the index lacks, as (key, flank), and their index in `keys`; reused.
     missing: Vec<(u64, u32)>,
     missing_at: Vec<usize>,
@@ -90,9 +92,14 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         // stats.time_range_sorting += duration;
         stats.ranges += self.ranges.len();
         stats.repeat_cores += std::mem::take(&mut self.repeat_cores);
-        stats.repeat_unresolved += std::mem::take(&mut self.repeat_unresolved);
+        self.last_unresolved = std::mem::take(&mut self.repeat_unresolved);
+        stats.repeat_unresolved += self.last_unresolved;
 
         &self.ranges
+    }
+
+    fn last_unresolved(&self) -> usize {
+        self.last_unresolved
     }
 
     fn unique_hits_strided(&mut self, kmers: &[(usize, Kmer<K>)], stride: usize, max_positions: usize, out: &mut Vec<UniqueHit>) -> bool {
@@ -227,7 +234,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new(), repeat_max: 0, repeat_cores: 0, repeat_unresolved: 0, missing: Vec::new(), missing_at: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new(), repeat_max: 0, repeat_cores: 0, repeat_unresolved: 0, last_unresolved: 0, missing: Vec::new(), missing_at: Vec::new() }
     }
 
     /// Asks the repeat index about the keys the main index lacks, keeping exact K-mer runs of at

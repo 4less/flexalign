@@ -118,6 +118,28 @@ pub struct Args {
     #[arg(long = "unpaired-penalty", default_value_t = 34)]
     pub unpaired_penalty: i32,
 
+    /// A pair whose best and second-best anchor pairs tie on the anchor score (MAPQ 0) takes the
+    /// margin of their gapped alignments instead, up to this MAPQ. Lifts reads the alignments tell
+    /// apart out of MAPQ 0, at a small cost in precision at MAPQ >= 1 (human: recall at MAPQ >= 1
+    /// 96.79 -> 97.08 %, precision 99.88 -> 99.81 %). 0 (default) keeps MAPQ 0.
+    #[arg(long = "tie-mapq-cap", default_value_t = 0)]
+    pub tie_mapq_cap: u8,
+
+    /// With `--repeat-index`: MAPQ ceiling for a pair with at least `--unresolved-min-cores` cores
+    /// the repeat index could not resolve and fewer than `--unresolved-max-seeds` seeds behind its
+    /// placement. Such a pair was placed among the copies seeding saw, and the copy it came from
+    /// may be one it did not (human: 83 % of these right, against 99-100 % for other pairs).
+    #[arg(long = "unresolved-mapq-cap", default_value_t = 3)]
+    pub unresolved_mapq_cap: u8,
+
+    /// See `--unresolved-mapq-cap`.
+    #[arg(long = "unresolved-min-cores", default_value_t = 6)]
+    pub unresolved_min_cores: usize,
+
+    /// See `--unresolved-mapq-cap`.
+    #[arg(long = "unresolved-max-seeds", default_value_t = 10)]
+    pub unresolved_max_seeds: u32,
+
     /// Do not write a mate the winning pair has no usable alignment for from its own best aligned
     /// candidate (the lone mate fallback); leave it unmapped.
     #[arg(long = "no-lone-mate-fallback", action)]

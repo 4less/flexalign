@@ -249,6 +249,11 @@ pub struct UniqueHit {
 
 pub trait RangeExtractor<const C: usize, const F: usize> {
     fn generate(&mut self, kmers: &[(usize, Kmer<C>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>];
+    /// Of the k-mers the last `generate` looked up, those whose core the index dropped and the
+    /// repeat index could not resolve: copies of the read that seeding cannot see.
+    fn last_unresolved(&self) -> usize {
+        0
+    }
     /// The fast-hit lookup (`--fast-hit`): every position of every k-mer whose key has at most
     /// `max_positions` positions in the index (and so no flank headers), without materialising
     /// ranges. Returns false when the implementation cannot answer, in which case the caller
@@ -361,15 +366,6 @@ impl StdPairedAnchorMAPQ {
         })
     }
 
-    fn score_paired_ext(a: &AnchorPair) -> i32 {
-        (match &a.0 {
-            Some(a) => a.score,
-            None => 0,
-        }) + (match &a.1 {
-            Some(a) => a.score,
-            None => 0,
-        })
-    }
 }
 impl PairedAnchorMAPQ for StdPairedAnchorMAPQ {
     /// Phred-style pseudo-MAPQ in the SAM range `[0, 60]`.
@@ -386,8 +382,33 @@ impl PairedAnchorMAPQ for StdPairedAnchorMAPQ {
     /// than the maximum: on a marker DB a lone hit is empirically less reliable than a decisive
     /// margin over a real competitor, so it must not sit at the top of the MAPQ sweep.
     fn anchor_mapq(anchors: &mut [AnchorPair]) -> u8 {
-        Self::mapq_from(anchors, false)
+        Self::mapq_from(anchors, false, 0)
     }
+}
+
+/// Reference offsets within this many bases are one locus: two anchors built from different seeds
+/// of the same placement differ by the indels between those seeds, not more.
+const SAME_LOCUS: i64 = 32;
+
+/// Whether `other` places nothing `best` does not: every mate it places sits at `best`'s
+/// placement of that mate. Such a pair is the best pair again (built from other seeds, or with a
+/// mate left out), not a competitor, and must not count as the runner-up -- it would tie the read
+/// with itself.
+fn same_placement(best: &AnchorPair, other: &AnchorPair) -> bool {
+    fn same(best: &Option<Anchor>, other: &Option<Anchor>) -> bool {
+        match (best, other) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(b), Some(o)) => {
+                b.reference == o.reference
+                    && match (b.seeds.first(), o.seeds.first()) {
+                        (Some(x), Some(y)) => (x.offset() - y.offset()).abs() <= SAME_LOCUS,
+                        _ => false,
+                    }
+            }
+        }
+    }
+    same(&best.0, &other.0) && same(&best.1, &other.1)
 }
 
 impl StdPairedAnchorMAPQ {
@@ -399,21 +420,32 @@ impl StdPairedAnchorMAPQ {
     /// and separate cleanly once actually aligned, and it is the aligned score the anchors are
     /// finally ranked by -- so scoring the margin any other way can report high confidence for a
     /// read whose top-2 alignments are indistinguishable.
-    pub fn mapq_from(anchors: &[AnchorPair], from_alignment: bool) -> u8 {
+    ///
+    /// The second-best is the best pair placed somewhere else (see [`same_placement`]). In the
+    /// alignment form a mate a pair does not place costs `unpaired_penalty`, as in the ranking, so
+    /// one mate alone elsewhere does not tie a pair that places both.
+    pub fn mapq_from(anchors: &[AnchorPair], from_alignment: bool, unpaired_penalty: i32) -> u8 {
         assert!(!anchors.is_empty());
 
         const MAPQ_MAX: f64 = 60.0;
         const MAPQ_UNIQUE: u8 = 30;
+        let runner_up = anchors[1..].iter().find(|p| !same_placement(&anchors[0], p));
         if from_alignment {
             // Aligned scores are <= 0 PENALTIES (0 = perfect, -1_000_000 = failed), the opposite
             // convention to anchor scores -- see `approx_ani`, which negates them into a cost. So
             // the margin is over costs (lower is better), not scores: a best with a small cost
             // against a second with a large one is a confident read, and equal costs are a tie.
-            if anchors.len() <= 1 {
+            let Some(runner_up) = runner_up else {
                 return MAPQ_UNIQUE;
-            }
-            let c1 = (-Self::score_paired_ext(&anchors[0])).max(0) as f64;
-            let c2 = (-Self::score_paired_ext(&anchors[1])).max(0) as f64;
+            };
+            let cost = |p: &AnchorPair| {
+                [&p.0, &p.1]
+                    .iter()
+                    .map(|a| a.as_ref().map_or(unpaired_penalty as i64, |a| (-a.score as i64).max(0)))
+                    .sum::<i64>()
+            };
+            let c1 = cost(&anchors[0]) as f64;
+            let c2 = cost(runner_up) as f64;
             if c2 <= 0.0 {
                 return 0; // the runner-up is also a perfect alignment: no margin at all
             }
@@ -426,10 +458,10 @@ impl StdPairedAnchorMAPQ {
         if s1 == 0 {
             return 0;
         }
-        if anchors.len() <= 1 {
+        let Some(runner_up) = runner_up else {
             return MAPQ_UNIQUE;
-        }
-        let s2 = score(&anchors[1]).max(0);
+        };
+        let s2 = score(runner_up).max(0);
         let rel_margin = 1.0 - (s2 as f64 / s1 as f64); // in [0, 1]
         (MAPQ_MAX * rel_margin).round().clamp(0.0, MAPQ_MAX) as u8
     }
@@ -689,6 +721,34 @@ mod tests {
     fn pair(id: u64, both: bool) -> AnchorPair {
         let a = Anchor::from_seed(&Seed { rpos: id, rval: id, qpos: 0, mismatch: 0, length: 31, flag: 0 });
         AnchorPair(Some(a.clone()), both.then_some(a))
+    }
+
+    fn mate(rpos: u64, length: u8, score: i32) -> Option<Anchor> {
+        let mut a = Anchor::from_seed(&Seed { rpos, rval: 0, qpos: 0, mismatch: 0, length, flag: 0 });
+        a.score = score;
+        Some(a)
+    }
+
+    /// The best pair found again (from other seeds) is no competitor: it must not tie the read
+    /// with itself.
+    #[test]
+    fn mapq_skips_the_best_pair_found_twice() {
+        let anchors = [
+            AnchorPair(mate(1000, 31, 0), mate(1200, 31, 0)),
+            AnchorPair(mate(1001, 31, 0), mate(1200, 31, 0)),
+            AnchorPair(mate(90_000, 20, 0), mate(90_200, 20, 0)),
+        ];
+        assert!(StdPairedAnchorMAPQ::mapq_from(&anchors, false, 34) > 0);
+        assert_eq!(StdPairedAnchorMAPQ::mapq_from(&anchors[..2], false, 34), 30, "nothing else: unique");
+    }
+
+    /// One mate placed elsewhere does not tie a pair that places both: the missing mate costs the
+    /// unpaired penalty, as in the ranking.
+    #[test]
+    fn mapq_charges_a_runner_up_its_missing_mate() {
+        let anchors = [AnchorPair(mate(1000, 31, 0), mate(1200, 31, 0)), AnchorPair(mate(90_000, 31, 0), None)];
+        assert_eq!(StdPairedAnchorMAPQ::mapq_from(&anchors, true, 34), 60);
+        assert_eq!(StdPairedAnchorMAPQ::mapq_from(&anchors, true, 0), 0, "free: a tie");
     }
 
     #[test]

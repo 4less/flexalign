@@ -1470,7 +1470,10 @@ impl<
         let seeds_rev = self.seed_extractor_rev.take_seeds();
         stats.seeds += seeds_fwd.len() + seeds_rev.len();
 
+        UNRESOLVED.with(|u| u.set(self.range_extractor_fwd.last_unresolved() + self.range_extractor_rev.last_unresolved()));
         self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats);
+        // Replayed seeds (the sharded rejoin) come without a lookup, so without a count.
+        UNRESOLVED.with(|u| u.set(0));
 
         self.seed_extractor_fwd.put_seeds(seeds_fwd);
         self.seed_extractor_rev.put_seeds(seeds_rev);
@@ -2345,7 +2348,21 @@ impl<
         // are now known -- which is the margin MAPQ should describe. Recompute here rather than
         // keeping the pre-alignment estimate made before any of these candidates were aligned.
         if self.options.args.mapq_from_alignment && !extension_anchors.is_empty() {
-            pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true);
+            pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true, self.options.args.unpaired_penalty);
+        } else if self.options.args.tie_mapq_cap > 0 && pseudo_mapq == 0 && !extension_anchors.is_empty() {
+            // The anchors cannot tell the best pair from the runner-up; the alignments may.
+            pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true, self.options.args.unpaired_penalty)
+                .min(self.options.args.tie_mapq_cap);
+        }
+        // Cores the main index dropped and the repeat index could not resolve stand for copies
+        // seeding never saw, any of which may be the true locus. A pair placed on few seeds next to
+        // many such cores is placed among the copies it happened to see, not all of them.
+        let unresolved = UNRESOLVED.with(|u| u.get());
+        let support = extension_anchors.first().map_or(0, |b| {
+            b.0.as_ref().map_or(0, |a| a.seed_count) + b.1.as_ref().map_or(0, |a| a.seed_count)
+        });
+        if unresolved >= self.options.args.unresolved_min_cores && support < self.options.args.unresolved_max_seeds {
+            pseudo_mapq = pseudo_mapq.min(self.options.args.unresolved_mapq_cap);
         }
 
         if self.options.args.dump_anchors {
@@ -2985,3 +3002,10 @@ fn prefetch_line(bytes: &[u8]) {
         let _ = bytes;
     }
 }
+
+thread_local! {
+    /// Unresolved repeat cores of the pair being aligned (`RangeExtractor::last_unresolved`, both
+    /// mates), set by `run_pair` for the MAPQ in `align_from_seeds`.
+    static UNRESOLVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
