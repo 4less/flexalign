@@ -577,8 +577,10 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                     // eprintln!("Insert size: {:?}   {:?}, {:?}", insert_size(Some(a_fwd), Some(a_rev), read_length), a_fwd.reference_pos(read_length), a_rev.reference_pos(read_length));
                 } else {
                     let pushed_before = self.anchors.len();
-                    for a_fwd in &self.anchors_fwd {
-                        for a_rev in &self.anchors_rev {
+                    let mut paired_fwd = vec![false; self.anchors_fwd.len()];
+                    let mut paired_rev = vec![false; self.anchors_rev.len()];
+                    for (i, a_fwd) in self.anchors_fwd.iter().enumerate() {
+                        for (j, a_rev) in self.anchors_rev.iter().enumerate() {
                             match insert_size(
                                 Some(a_fwd),
                                 Some(a_rev),
@@ -595,6 +597,8 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                                             .last_mut()
                                             .unwrap()
                                             .resolve_orientation(read_length_fwd, read_length_rev);
+                                        paired_fwd[i] = true;
+                                        paired_rev[j] = true;
                                     }
                                 }
                                 None => panic!(
@@ -603,11 +607,18 @@ impl PairedAnchorExtractor for StdPairedAnchorExtractor {
                             };
                         }
                     }
-                    // Both sides had anchors but nothing came within the insert-size cutoff, and
-                    // there is no fallback -- so this reference contributes no candidate at all,
-                    // for either mate.
+                    // Both sides had anchors but nothing came within the insert-size cutoff.
                     if n_fwd > 0 && n_rev > 0 && self.anchors.len() == pushed_before {
                         stats.pair_leak_insert_size += 1;
+                    }
+                    // An anchor with no partner within the insert cutoff is still a candidate for
+                    // its own mate, as on a reference only that mate reached; dropping it lost the
+                    // true locus of a mate whose partner seeded only elsewhere on the reference.
+                    for (a, _) in self.anchors_fwd.iter().zip(&paired_fwd).filter(|(_, &p)| !p) {
+                        self.anchors.push(AnchorPair(Some(a.clone()), None));
+                    }
+                    for (a, _) in self.anchors_rev.iter().zip(&paired_rev).filter(|(_, &p)| !p) {
+                        self.anchors.push(AnchorPair(None, Some(a.clone())));
                     }
                 }
                 current_idx += 2;
@@ -741,11 +752,14 @@ mod tests {
         let mut stats = Stats::default();
         let anchors = ex.generate(&seeds_fwd, &seeds_rev, 150, 150, &mut stats);
 
-        let lone_on_ref1 = anchors
+        // The far ref-1 locus has no partner: kept once as a lone candidate of its own mate. The
+        // near one is paired, and a leak into the trailing group would add both again.
+        let lone_on_ref1: Vec<_> = anchors
             .iter()
-            .filter(|AnchorPair(a, b)| a.is_none() && b.as_ref().is_some_and(|b| b.reference == 1))
-            .count();
-        assert_eq!(lone_on_ref1, 0, "ref-1 anchors leaked into the trailing single-mate group");
+            .filter_map(|AnchorPair(a, b)| if a.is_none() { b.as_ref().filter(|b| b.reference == 1) } else { None })
+            .collect();
+        assert_eq!(lone_on_ref1.len(), 1, "ref-1 anchors leaked into the trailing single-mate group");
+        assert!(lone_on_ref1[0].seeds.iter().all(|s| s.rpos >= 400_000));
         assert!(anchors.iter().any(|AnchorPair(a, b)| a.is_some() && b.is_some()));
         assert!(anchors
             .iter()
