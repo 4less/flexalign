@@ -108,6 +108,12 @@ pub trait SeedRange<const K: usize, const C: usize, const F: usize> {
         dist_buf: &mut Vec<u8>,
         seeds: &mut Vec<Seed>,
     ) -> RangeVerdict;
+
+    /// The flank-tie limit for this range: `max_best_flex`, or every cell of a repeat-index run
+    /// (all its flanks equal the read's, and its length was bounded when it was looked up).
+    fn best_flex_limit(&self, max_best_flex: usize) -> usize {
+        max_best_flex
+    }
 }
 
 /// Walks ranges in order, emitting seeds until the `--ranges` budget is spent.
@@ -134,7 +140,7 @@ where
     let mut headers_scanned = 0usize;
 
     for range in ranges {
-        let verdict = range.emit_seeds(max_best_flex, flank_slack, dist_buf, seeds);
+        let verdict = range.emit_seeds(range.best_flex_limit(max_best_flex), flank_slack, dist_buf, seeds);
         // `resolve_flex` leaves one cached distance per scanned flank in `dist_buf`, so its length
         // is exactly this range's header-scan count (0 for headerless ranges and for the replay,
         // which pre-resolves cells and never touches `dist_buf`).
@@ -209,6 +215,11 @@ impl<'a, const F: usize> Range<'a, F> {
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for Range<'a, F> {
+    #[inline]
+    fn best_flex_limit(&self, max_best_flex: usize) -> usize {
+        if self.repeat { MAX_KEPT_TIES } else { max_best_flex }
+    }
+
     fn emit_seeds(
         &self,
         max_best_flex: usize,

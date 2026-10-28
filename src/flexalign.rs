@@ -148,6 +148,9 @@ pub fn run(args: Args) {
             // One shard is the whole index: the unsharded run does that in one pass over the reads,
             // the sharded pipeline in two plus an evidence file.
             if let Some(n_shards) = chosen.filter(|&n| n > 1) {
+                if options.args.repeat_index {
+                    eprintln!("--repeat-index is not used by sharded runs yet; aligning without it.");
+                }
                 run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, &options, n_shards);
                 return;
             }
@@ -165,19 +168,30 @@ pub fn run(args: Args) {
     let build = options.args.force_build || !index_compatible;
 
     // Build or load database
+    // The repeat index is part of the load: its time counts in "Loading index took".
+    let attach_repeat = |db: &mut DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>| {
+        if options.args.repeat_index {
+            db.attach_repeat_index(&db_paths, &options.reference, options.args.max_range_size, options.args.threads as usize);
+        }
+    };
     let db: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = match build {
         true => {
             
-            let (_duration, result) = 
+            let (_duration, mut result) = 
                 time(|| DB::build(&options));
             let _ = result.save(&db_paths, GLOBAL_VERSION);
+            attach_repeat(&mut result);
             result
 
         },
         false => {
             eprintln!("Load index.");
             let (duration, result) =
-                time(|| DB::load(&db_paths, GLOBAL_VERSION));
+                time(|| {
+                    let mut db = DB::load(&db_paths, GLOBAL_VERSION);
+                    attach_repeat(&mut db);
+                    db
+                });
             eprintln!("Loading index took: {:?}", duration);
             result
         },

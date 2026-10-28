@@ -128,6 +128,18 @@ pub struct Args {
     #[arg(long = "no-overhang-rescue", action)]
     pub no_overhang_rescue: bool,
 
+    /// Seed the cores the index drops for having more than --max-range-size positions (young
+    /// repeats: LINE-1, satellites) from a repeat index kept next to the index as `<index>.repeat`,
+    /// built on the first run that asks for it. A read's core then finds the positions where its
+    /// whole K-mer (core and flanks) occurs.
+    #[arg(long = "repeat-index", action)]
+    pub repeat_index: bool,
+
+    /// Most positions a repeat core's exact K-mer may have to be used as seeds (at most 128);
+    /// more leave the core unresolved (`--repeat-index`).
+    #[arg(long = "repeat-bucket-max", default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=128))]
+    pub repeat_bucket_max: u16,
+
     /// Minimum number of read bases an alignment must actually place for the record to be emitted.
     ///
     /// This is a BASE COUNT, not a fraction. A fraction is the wrong shape on a marker DB: its

@@ -13,6 +13,7 @@ use super::bundle::{self, Bundle, NameTable, Names};
 use super::refseq2::{self, RefSeq2};
 use super::hashed_lines::HashedLines;
 use super::common::{DBPaths, load_references, FlexalignDatabase, IndexFormat, index_format};
+use super::repeat::{RepeatIndex, RepeatLookup};
 
 
 /// The full-mode index. `Owned` is a freshly built map still on the heap (build-then-align in one
@@ -356,6 +357,8 @@ pub struct DB<
     rid_to_rname: Names,
     rname_to_rid: HashMap<String, usize>,
     references: RefStore,
+    /// The positions of the cores the index dropped (`--repeat-index`).
+    repeat: Option<Arc<RepeatIndex>>,
 }
 
 impl<
@@ -426,7 +429,7 @@ impl<
             } else {
                 HashMap::new()
             };
-            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references };
+            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references, repeat: None };
         }
         let io_before = super::common::disk_read_bytes();
 
@@ -474,7 +477,7 @@ impl<
         eprintln!("  -> {read_gb:.1} GB read from disk (reference only; the {} index is mapped but untouched)",
                   paths.index_blob_file());
 
-        Self { flexmap, rid_to_rname: Names::Owned(rid_to_rname), rname_to_rid: HashMap::new(), references }
+        Self { flexmap, rid_to_rname: Names::Owned(rid_to_rname), rname_to_rid: HashMap::new(), references, repeat: None }
     }
 }
 
@@ -505,6 +508,13 @@ impl<
 
     fn prefetch_keys(&self, keys: &[u64]) {
         self.flexmap.prefetch_keys(keys)
+    }
+
+    #[inline]
+    fn repeat_lookup_batch<'s>(&'s self, queries: &[(u64, u32)], max: usize, f: &mut dyn FnMut(usize, RepeatLookup<'s>)) {
+        if let Some(r) = &self.repeat {
+            r.lookup_batch(queries, max, f);
+        }
     }
 
     fn release_references(&self) {
@@ -545,6 +555,7 @@ impl<
             rid_to_rname: Names::Owned(rid_to_rname),
             rname_to_rid,
             references: RefStore::Owned(references),
+            repeat: None,
         }
     }
 
@@ -673,6 +684,7 @@ impl<
             rid_to_rname: Names::Owned(rid_to_rname),
             rname_to_rid,
             references,
+            repeat: None,
         }
     }
     
@@ -705,6 +717,23 @@ impl<
     const CELLS_PER_BODY: u64,
     const HEADER_THRESHOLD: usize,
 > DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> {
+    /// Loads the repeat index of this index (`<index>.repeat`), building it first when it is missing
+    /// or was built from another index or cap (`--repeat-index`).
+    pub fn attach_repeat_index(&mut self, paths: &DBPaths, reference: &std::path::Path, cap: usize, threads: usize) {
+        let format = index_format();
+        let index_file = if format == IndexFormat::Blob { paths.index_blob_file() } else { paths.bundle_file(format) };
+        let (duration, (repeat, how)) = time(|| {
+            RepeatIndex::load_or_build::<K, C, F, S, L>(&index_file, reference, || {
+                (1..).map_while(|i| self.get_rname(i).map(|n| (n.to_string(), i))).collect()
+            }, cap as u64, threads)
+        });
+        eprintln!(
+            "Repeat index {how} in {:.2}s: {} dropped cores, {} positions, {:.2} GB",
+            duration.as_secs_f64(), repeat.key_count(), repeat.entries(), repeat.memory_bytes() as f64 / 1e9
+        );
+        self.repeat = Some(repeat);
+    }
+
     /// The index, reference and names as separate files, as before bundles (and for the blob
     /// format, and for shard slicing, which reads the name files and the reference blob).
     pub fn save_separate(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error> {
@@ -858,7 +887,7 @@ impl<
             references.len(),
             names.len(),
         );
-        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references }
+        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references, repeat: None }
     }
 }
 

@@ -6,7 +6,7 @@ use flexmap::range::AnyRange;
 use kmerrs::consecutive::kmer::Kmer;
 use kmerrs::kmer_utils::mask_coremer;
 
-use crate::{align::{common::{RangeExtractor, UniqueHit}, process::seed_extractor::MAX_KEPT_TIES, stats::Stats}, database::common::FlexalignDatabase};
+use crate::{align::{common::{RangeExtractor, UniqueHit}, process::seed_extractor::MAX_KEPT_TIES, stats::Stats}, database::{common::FlexalignDatabase, repeat::RepeatLookup}};
 
 // pub type Range<'a, const F: usize> = (usize, Kmer<F>, VRange<'a>, usize);
 
@@ -18,6 +18,9 @@ pub struct Range<'a, const F: usize> {
     pub range_size: u32,
     pub core_min_phredq: u16,
     pub flex_min_phredq: u16,
+    /// From the repeat index: positions where the read's whole K-mer occurs, of a core the main
+    /// index dropped. Every cell's flank equals the read's.
+    pub repeat: bool,
 }
 
 #[derive(Clone)]
@@ -39,6 +42,14 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     flex_scratch: Vec<u8>,
     /// The keys `prefetch` fetches ahead, reused across reads.
     prefetch_keys: Vec<u64>,
+    /// `--repeat-bucket-max` with `--repeat-index`, else 0: a missing key is then not asked about.
+    repeat_max: usize,
+    /// Since the last `generate`: dropped cores met, and those whose exact K-mer run was empty or too long.
+    repeat_cores: usize,
+    repeat_unresolved: usize,
+    /// A read's keys the index lacks, as (key, flank), and their index in `keys`; reused.
+    missing: Vec<(u64, u32)>,
+    missing_at: Vec<usize>,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
@@ -78,6 +89,8 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         // let (duration, _) = stage_time(|| self.ranges.sort_unstable_by_key(|r| r.2.positions.len()));
         // stats.time_range_sorting += duration;
         stats.ranges += self.ranges.len();
+        stats.repeat_cores += std::mem::take(&mut self.repeat_cores);
+        stats.repeat_unresolved += std::mem::take(&mut self.repeat_unresolved);
 
         &self.ranges
     }
@@ -177,20 +190,51 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
         // All of the read's keys in one call, so that the index can fetch them ahead.
         let db: &'a D = self.db;
-        let (ranges, key_info) = (&mut self.ranges, &self.key_info);
+        let (ranges, key_info, keys) = (&mut self.ranges, &self.key_info, &self.keys);
+        let repeat_max = self.repeat_max;
+        let (missing, missing_at) = (&mut self.missing, &mut self.missing_at);
+        missing.clear();
+        missing_at.clear();
         db.for_each_vrange(&self.keys, &mut |i, range| {
             if let Some(range) = range {
                 let (qpos, fmer) = (key_info[i].0, key_info[i].1.clone());
                 let range_size = range.len() as u32;
-                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0 });
+                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: false });
+            } else if repeat_max > 0 {
+                missing.push((keys[i], key_info[i].1.0 as u32));
+                missing_at.push(i);
             }
         });
+        // The keys the index lacks, asked of the repeat index together (their lookups overlap).
+        if !missing.is_empty() {
+            let (mut repeat_cores, mut repeat_unresolved) = (0usize, 0usize);
+            db.repeat_lookup_batch(missing, repeat_max, &mut |j, found| {
+                repeat_cores += 1;
+                match found {
+                    RepeatLookup::Range(range) => {
+                        let (qpos, fmer) = (key_info[missing_at[j]].0, key_info[missing_at[j]].1.clone());
+                        let range_size = range.len() as u32;
+                        ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: true });
+                    }
+                    _ => repeat_unresolved += 1,
+                }
+            });
+            self.repeat_cores += repeat_cores;
+            self.repeat_unresolved += repeat_unresolved;
+        }
     }
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new(), repeat_max: 0, repeat_cores: 0, repeat_unresolved: 0, missing: Vec::new(), missing_at: Vec::new() }
+    }
+
+    /// Asks the repeat index about the keys the main index lacks, keeping exact K-mer runs of at
+    /// most `max` positions (0: off).
+    pub fn with_repeat(mut self, max: usize) -> Self {
+        self.repeat_max = max;
+        self
     }
 }
 
