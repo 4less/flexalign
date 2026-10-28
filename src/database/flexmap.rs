@@ -18,7 +18,7 @@ use super::common::{DBPaths, load_references, FlexalignDatabase, IndexFormat, in
 /// The full-mode index. `Owned` is a freshly built map still on the heap (build-then-align in one
 /// run); `Mmap` is the memory-mapped blob loaded from disk -- open is near-instant and only the
 /// keys/values actually queried are paged in, so a cold multi-GB index no longer costs a full read.
-/// `Compact` and `Hashed` are flexmap's packed index (`--index-format`, compact by default), read
+/// `Compact` and `Hashed` are flexmap's packed index (runs use `Hashed`), read
 /// into huge pages on all threads: the same answers in about half the memory, and a lookup pipeline
 /// that fetches a read's keys and values ahead. All answer `get_vrange`.
 #[derive(Clone)]

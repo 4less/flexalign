@@ -95,7 +95,7 @@ impl ShardBounds {
         let bounds = match format {
             IndexFormat::Hashed => PackedFlexmap::<HashedKeys, C, F, T>::split_in_file(&file, offset, n_shards, threads)?,
             IndexFormat::Compact => PackedFlexmap::<CompactKeys, C, F, T>::split_in_file(&file, offset, n_shards, threads)?,
-            IndexFormat::Blob => return Err(std::io::Error::other("a blob index is not sharded; use --index-format compact or hashed")),
+            IndexFormat::Blob => return Err(std::io::Error::other("a blob index is not sharded")),
         };
         let b = Self { format, bundle_len, bundle_modified_ns, bounds };
         std::fs::write(&path, serde_json::to_string_pretty(&b).expect("serialize shard bounds"))?;

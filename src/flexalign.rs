@@ -97,8 +97,8 @@ pub fn run(args: Args) {
     crate::database::common::EAGER_REF
         .store(!options.args.lazy_ref, std::sync::atomic::Ordering::Relaxed);
 
-    // The format asked for (the packed index by default), for the whole index and for shards alike.
-    crate::database::common::set_index_format(options.args.index_format);
+    // The packed index with the line-hashed key table, for the whole index and for shards alike.
+    crate::database::common::set_index_format(IndexFormat::Hashed);
 
     if !options.reference.exists() {
         eprintln!("Reference does not exist {:?}", options.reference);
@@ -119,7 +119,7 @@ pub fn run(args: Args) {
     // discoverable from the reference path alone, so the sharded pipeline is selected here rather
     // than by reaching for a separate executable. --shards N picks a shard count (its bounds are
     // computed on first use); --no-shards ignores them. An index not built yet is built first, below.
-    let format = options.args.index_format;
+    let format = IndexFormat::Hashed;
     let bundle_ready = format != IndexFormat::Blob
         && std::path::Path::new(&db_paths.bundle_file(format)).exists()
         && DB::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>::index_compatible(&db_paths)
@@ -188,10 +188,6 @@ pub fn run(args: Args) {
     let shards = options.args.shards.filter(|&n| !options.args.no_shards && n > 1);
     if options.args.shard_slice.is_some() || shards.is_some() {
         drop(db);
-        if format == IndexFormat::Blob {
-            eprintln!("A blob index is not sharded: use --index-format compact or hashed, or --no-shards.");
-            exit(5);
-        }
         match options.args.shard_slice {
             Some(n_shards) => shard_bounds::<C, F, HEADER_THRESHOLD>(&db_paths, format, n_shards, options.args.threads as usize),
             None => run_sharded::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(&db_paths, &options, shards.unwrap()),

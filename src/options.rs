@@ -393,15 +393,6 @@ pub struct Args {
     #[arg(long = "lazy-ref")]
     pub lazy_ref: bool,
 
-    /// The k-mer index to build, convert to and load. `compact` (default): flexmap's packed index,
-    /// bit-packed values and a key table of the used keys only (about half the memory of the blob,
-    /// faster lookups). `hashed`: the same with a line-hashed key table (one cache line a lookup,
-    /// a little more memory). `blob`: the Flexmap blob, memory-mapped. An existing blob is converted
-    /// to the packed index on first use. `--shard-slice` and sharded runs slice into this format
-    /// (compact or blob; a hashed index cannot be sharded).
-    #[arg(long = "index-format", value_enum, default_value = "compact")]
-    pub index_format: IndexFormat,
-
     /// Write the per-stage timing block as a machine-readable TSV to this path (one row per
     /// metric: `input\tmetric\tvalue\tunit`), in addition to the human-readable stderr block.
     /// The file is truncated on open; one section is appended per input file processed.
@@ -541,7 +532,8 @@ pub fn get_styles() -> clap::builder::Styles {
         )
 }
 
-/// The k-mer index a run builds, converts to and loads (`--index-format`).
+/// The k-mer index a run builds, converts to and loads. Runs always use `Hashed`; the other
+/// formats remain for the examples and tools that read older indexes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexFormat {

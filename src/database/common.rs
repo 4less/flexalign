@@ -18,7 +18,7 @@ pub fn eager_ref() -> bool {
     EAGER_REF.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The index a run builds, converts to and loads (`--index-format`): flexmap's packed index with a
+/// The index a run builds, converts to and loads (always `Hashed` for runs): flexmap's packed index with a
 /// compact key table (the default), with a line-hashed key table, or the Flexmap blob. A process-wide
 /// switch for the same reason as `EAGER_REF`: `FlexalignDatabase::load` takes only paths.
 pub use crate::options::IndexFormat;

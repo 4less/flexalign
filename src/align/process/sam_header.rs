@@ -99,7 +99,7 @@ pub fn write<D: FlexalignDatabase>(options: &Options, db: &D, buffer: &mut Outpu
     buffer.write_with(|b| b.extend_from_slice(b"@HD\tVN:1.6\tSO:unsorted\n"));
     buffer.flush();
 
-    let format = options.args.index_format;
+    let format = crate::database::common::index_format();
     let bundle = (format != IndexFormat::Blob)
         .then(|| DBPaths::new(&options.reference).bundle_file(format));
 

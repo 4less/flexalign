@@ -158,12 +158,11 @@ construction in `src/align/process_fastq.rs`.
 `src/database/` — `common.rs` defines the `FlexalignDatabase` trait
 (`get_rname` / `get_reference` / `get_vrange` / `build` / `save` / `load`) and
 `DBPaths` (the `.flex.*` file naming). `flexmap.rs` implements it over a `FlexmapStore`:
-flexmap's packed index (`--index-format compact`, the default, or `hashed`; file
-`.flex.index.compact` / `.hashed`, read into memory on all threads) or the Flexmap blob
-(`--index-format blob`, memory-mapped). An existing blob is converted to the packed index on the
-first run that asks for it. `--shard-slice` and sharded runs slice into the run's format: compact
-shards (`.s<n>.shard<i>.compact`, cut by flexmap's `PackedFlexmap::slice`) or blob shards; a hashed
-index cannot be sharded (its key table needs a power-of-two key space). Lookups return
+flexmap's packed index with the line-hashed key table (file `.flex.index.hashed.bundle`, read into
+memory on all threads). Runs always use it: there is no `--index-format` option any more. The
+compact key table and the Flexmap blob remain in the code for the examples and for converting an
+existing blob, which a run converts to the hashed index on first use. `--shard-slice` and sharded
+runs compute shard bounds over the hashed bundle. Lookups return
 `flexmap::range::AnyRange`, which reads either index; `for_each_vrange` looks up one read's keys
 in one call so that the packed index can fetch them ahead. `build.rs` handles index
 construction. `GLOBAL_VERSION` (`src/lib.rs`) is the on-disk format version checked
