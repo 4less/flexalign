@@ -19,7 +19,7 @@ pub fn eager_ref() -> bool {
 }
 
 /// The index a run builds, converts to and loads (`--index-format`): flexmap's packed index with a
-/// compact key table (the default), with a line-hashed key table, or the Flexmap blob. A process-wide
+/// line-hashed key table (the default), or the Flexmap blob. A process-wide
 /// switch for the same reason as `EAGER_REF`: `FlexalignDatabase::load` takes only paths.
 pub use crate::options::IndexFormat;
 
@@ -27,17 +27,15 @@ pub static INDEX_FORMAT: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomic
 
 pub fn index_format() -> IndexFormat {
     match INDEX_FORMAT.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => IndexFormat::Compact,
-        1 => IndexFormat::Hashed,
+        0 => IndexFormat::Hashed,
         _ => IndexFormat::Blob,
     }
 }
 
 pub fn set_index_format(format: IndexFormat) {
     let v = match format {
-        IndexFormat::Compact => 0,
-        IndexFormat::Hashed => 1,
-        IndexFormat::Blob => 2,
+        IndexFormat::Hashed => 0,
+        IndexFormat::Blob => 1,
     };
     INDEX_FORMAT.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -246,12 +244,10 @@ impl DBPaths {
         format!("{}.bundle", self.index_packed_file(format))
     }
 
-    /// The packed index file of `format` (`Compact` or `Hashed`).
+    /// The packed (hashed) index file. `format` is `Hashed`; the blob has its own file.
     pub fn index_packed_file(&self, format: IndexFormat) -> String {
-        match format {
-            IndexFormat::Hashed => format!("{}.hashed", self.index_path.to_string_lossy()),
-            _ => format!("{}.compact", self.index_path.to_string_lossy()),
-        }
+        debug_assert_eq!(format, IndexFormat::Hashed, "only the hashed index is a packed file");
+        format!("{}.hashed", self.index_path.to_string_lossy())
     }
 
     /// The reference and its name tables, which every index format needs.

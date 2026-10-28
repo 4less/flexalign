@@ -138,7 +138,7 @@ fn sharded_runs_give_the_unsharded_alignments() {
     let dir = std::env::temp_dir().join(format!("flexalign-shard-parity-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let (reference, r1, r2) = write_fixture(&dir);
-    for format in ["hashed", "compact"] {
+    for format in ["hashed"] {
         let base = run(&reference, &r1, &r2, &dir.join(format!("{format}-none")), &["--index-format", format, "--no-shards", "--no-fast-hit"]);
         assert!(base.len() > 4000, "{format}: only {} records unsharded", base.len());
         for n in ["2", "4"] {

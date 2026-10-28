@@ -11,13 +11,13 @@
 //!   addressing, so a lookup is the unsharded lookup, through the same code ([`HashedLines`] for a
 //!   hashed table) -- asked only for keys of the range.
 //!
-//! A packed index (compact or hashed) is sharded this way. A blob index has no bundle and is not
+//! A hashed index is sharded this way. A blob index has no bundle and is not
 //! sharded.
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use flexmap::packed::{CompactKeys, HashedKeys, PackedFlexmap};
+use flexmap::packed::{HashedKeys, PackedFlexmap};
 use flexmap::range::AnyRange;
 use serde::{Deserialize, Serialize};
 
@@ -94,8 +94,7 @@ impl ShardBounds {
         let file = std::fs::File::open(&bundle)?;
         let bounds = match format {
             IndexFormat::Hashed => PackedFlexmap::<HashedKeys, C, F, T>::split_in_file(&file, offset, n_shards, threads)?,
-            IndexFormat::Compact => PackedFlexmap::<CompactKeys, C, F, T>::split_in_file(&file, offset, n_shards, threads)?,
-            IndexFormat::Blob => return Err(std::io::Error::other("a blob index is not sharded; use --index-format compact or hashed")),
+            IndexFormat::Blob => return Err(std::io::Error::other("a blob index is not sharded; use --index-format hashed")),
         };
         let b = Self { format, bundle_len, bundle_modified_ns, bounds };
         std::fs::write(&path, serde_json::to_string_pretty(&b).expect("serialize shard bounds"))?;
@@ -108,11 +107,10 @@ impl ShardBounds {
     }
 }
 
-/// A shard's index: a window of a compact or hashed index (a hashed one with flexalign's reader
-/// of its key table, as the unsharded index).
+/// A shard's index: a window of the hashed index, with flexalign's reader of its key table, as the
+/// unsharded index.
 #[derive(Clone)]
 enum ShardStore<const C: usize, const F: usize, const HEADER_THRESHOLD: usize> {
-    Compact(Arc<PackedFlexmap<CompactKeys, C, F, HEADER_THRESHOLD>>),
     Hashed(Arc<PackedFlexmap<HashedKeys, C, F, HEADER_THRESHOLD>>, HashedLines),
 }
 
@@ -149,9 +147,6 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
                 let lines = HashedLines::new(&p.keys);
                 ShardStore::Hashed(Arc::new(p), lines)
             }
-            IndexFormat::Compact => ShardStore::Compact(Arc::new(
-                PackedFlexmap::<CompactKeys, C, F, HEADER_THRESHOLD>::read_window(&file, offset, range.lo, range.hi, threads)?,
-            )),
             IndexFormat::Blob => return Err(std::io::Error::other("a blob index is not sharded")),
         };
         Ok(Self { store, lo: range.lo, hi: range.hi })
@@ -164,7 +159,6 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
     /// Bytes of the index this shard holds in memory.
     pub fn memory_bytes(&self) -> usize {
         let (k, v) = match &self.store {
-            ShardStore::Compact(p) => p.memory_bytes(),
             ShardStore::Hashed(p, _) => p.memory_bytes(),
         };
         k + v
@@ -180,7 +174,6 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
         }
         // The window keeps the whole index's addressing: the key is looked up as it is.
         match &self.store {
-            ShardStore::Compact(p) => p.get(canonical_kmer).map(AnyRange::from),
             ShardStore::Hashed(p, h) => h.locate(canonical_kmer).map(|(start, slots)| AnyRange::from(p.values.range(start, slots))),
         }
     }
@@ -206,7 +199,6 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
             next = at[j] + 1;
         };
         match &self.store {
-            ShardStore::Compact(p) => p.for_each_prefetched(&inside, |j, r| emit(j, r.map(AnyRange::from))),
             ShardStore::Hashed(p, h) => h.for_each(&**p, &inside, |j, r| emit(j, r.map(AnyRange::from))),
         }
         for i in next..keys.len() {

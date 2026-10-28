@@ -6,7 +6,7 @@
 //!
 //! Run:
 //!   cargo +nightly run --release --example shard_slice_verify -- \
-//!       <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards> [compact|hashed]
+//!       <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards> [hashed]
 
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -53,14 +53,13 @@ fn read_all(path: &str) -> Vec<u8> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        eprintln!("usage: {} <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards> [compact|hashed]", args[0]);
+        eprintln!("usage: {} <reference.fna> <reads_1.fq[.gz]> <reads_2.fq[.gz]> <n_shards> [hashed]", args[0]);
         std::process::exit(2);
     }
     let reference = &args[1];
     let n_shards: usize = args[4].parse().expect("n_shards must be an integer");
     let format = match args.get(5).map(String::as_str) {
-        None | Some("compact") => IndexFormat::Compact,
-        Some("hashed") => IndexFormat::Hashed,
+        None | Some("hashed") => IndexFormat::Hashed,
         Some(other) => panic!("unknown index format {other}"),
     };
     // The oracle below loads the whole index in the format the shards are windows of.

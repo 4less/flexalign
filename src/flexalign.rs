@@ -189,7 +189,7 @@ pub fn run(args: Args) {
     if options.args.shard_slice.is_some() || shards.is_some() {
         drop(db);
         if format == IndexFormat::Blob {
-            eprintln!("A blob index is not sharded: use --index-format compact or hashed, or --no-shards.");
+            eprintln!("A blob index is not sharded: use --index-format hashed, or --no-shards.");
             exit(5);
         }
         match options.args.shard_slice {

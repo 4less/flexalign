@@ -195,7 +195,7 @@ pub struct Args {
     #[arg(long = "anchor-gate-flank", default_value_t = 6)]
     pub anchor_gate_flank: u32,
 
-    /// Map the packed index (compact or hashed) into memory instead of reading it: nothing to
+    /// Map the hashed index into memory instead of reading it: nothing to
     /// copy at start-up, pages fault in as they are touched. Worth it when the file is in the
     /// page cache and the run is short; the read-in path gets huge pages, this does not.
     #[arg(long = "index-mmap", action)]
@@ -393,13 +393,11 @@ pub struct Args {
     #[arg(long = "lazy-ref")]
     pub lazy_ref: bool,
 
-    /// The k-mer index to build, convert to and load. `compact` (default): flexmap's packed index,
-    /// bit-packed values and a key table of the used keys only (about half the memory of the blob,
-    /// faster lookups). `hashed`: the same with a line-hashed key table (one cache line a lookup,
-    /// a little more memory). `blob`: the Flexmap blob, memory-mapped. An existing blob is converted
-    /// to the packed index on first use. `--shard-slice` and sharded runs slice into this format
-    /// (compact or blob; a hashed index cannot be sharded).
-    #[arg(long = "index-format", value_enum, default_value = "compact")]
+    /// The k-mer index to build, convert to and load. `hashed` (default): flexmap's packed index,
+    /// bit-packed values and a line-hashed key table (one cache line a lookup; about half the
+    /// memory of the blob). `blob`: the Flexmap blob, memory-mapped. An existing blob is converted
+    /// to the hashed index on first use. Sharded runs (`--shards`, `--shard-slice`) need `hashed`.
+    #[arg(long = "index-format", value_enum, default_value = "hashed")]
     pub index_format: IndexFormat,
 
     /// Write the per-stage timing block as a machine-readable TSV to this path (one row per
@@ -545,8 +543,6 @@ pub fn get_styles() -> clap::builder::Styles {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IndexFormat {
-    /// Packed values, compact key table: the least memory.
-    Compact,
     /// Packed values, line-hashed key table: one cache line a lookup, ~10 bytes a used key more.
     Hashed,
     /// The Flexmap blob (memory-mapped).
