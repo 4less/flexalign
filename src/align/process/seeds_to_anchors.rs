@@ -48,14 +48,22 @@ impl SeedsToAnchors for GroupSeeds {
             // }
 
             // eprintln!("Try merge....");
-            anchor_tmp.iter().tuple_combinations().for_each(|(a, b)| {
-                let new_anchor = a.try_merge(b, max_indel, read_length);
-
-                if let Some(mut a ) = new_anchor {
+            // Clusters that merge across an indel become one anchor; every cluster that merges
+            // with none is kept as it is. Keeping only the merges dropped all the other loci on
+            // the reference -- on a chromosome, every other copy of a repeat, the true one among
+            // them, whenever any two clusters anywhere on it merged.
+            let mut merged = vec![false; anchor_tmp.len()];
+            for (i, j) in (0..anchor_tmp.len()).tuple_combinations() {
+                if let Some(mut a) = anchor_tmp[i].try_merge(&anchor_tmp[j], max_indel, read_length) {
                     a.0.flagged_for_indel = true;
                     anchors.push(a.0);
+                    merged[i] = true;
+                    merged[j] = true;
                 }
-            });
+            }
+            if merged.iter().any(|&m| m) {
+                anchors.extend(anchor_tmp.iter().zip(&merged).filter(|(_, &m)| !m).map(|(a, _)| a.clone()));
+            }
             // eprintln!("Done trying merge....");
             
         } else {
@@ -65,5 +73,27 @@ impl SeedsToAnchors for GroupSeeds {
         if anchors.is_empty() {
             anchors.extend_from_slice(&anchor_tmp.as_slice());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(qpos: u32, rpos: u64) -> Seed {
+        Seed { rpos, rval: 0, qpos, mismatch: 0, length: 31, flag: 0 }
+    }
+
+    /// Two clusters that merge across an indel used to take every other locus on the reference
+    /// with them: only the merge was kept.
+    #[test]
+    fn a_merge_keeps_the_other_loci_on_the_reference() {
+        // Offsets 1000 and 1004 merge (a 4-base indel); 50_000 is another copy.
+        let seeds = [seed(0, 1000), seed(60, 1064), seed(20, 50_020)];
+        let mut anchors = Vec::new();
+        GroupSeeds::group_into_anchor(&seeds, 150, &mut anchors);
+        let starts: Vec<u64> = anchors.iter().flat_map(|a| a.seeds.iter().map(|s| s.rpos)).collect();
+        assert!(anchors.iter().any(|a| a.flagged_for_indel), "the near clusters merge: {anchors:?}");
+        assert!(starts.contains(&50_020), "the far locus survives the merge: {anchors:?}");
     }
 }
