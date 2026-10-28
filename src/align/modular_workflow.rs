@@ -1041,7 +1041,7 @@ impl<
 
         let best = anchors.first().unwrap();
         let ref_string = &self.db.get_rname(best.reference as usize).unwrap();
-        let reference = &self.db.get_reference(best.reference as usize).unwrap();
+        let reference = self.db.get_reference(best.reference as usize).unwrap();
 
         let best_corelen = best.core_matches() - best.mismatches as usize - best.indels();
         let second_best_corelen = if anchors.len() > 1 {
@@ -2090,8 +2090,8 @@ impl<
                 .enumerate()
                 .for_each(|(_i, AnchorPair(a1, a2) )| {
                     let reference = match a1 {
-                        Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),
-                        None => &self
+                        Some(a) => self.db.get_reference(a.reference as usize).unwrap(),
+                        None => self
                             .db
                             .get_reference(a2.as_ref().unwrap().reference as usize)
                             .unwrap(),
@@ -2409,7 +2409,7 @@ impl<
             &best_extended_anchor_pair.1.as_ref().unwrap().reference
         };
 
-        let _reference = &self.db.get_reference(*reference_id as usize).unwrap();
+        let _reference = self.db.get_reference(*reference_id as usize).unwrap();
 
         // if pseudo_mapq == 0 && extension_anchors.len() > 1 {
         //     let one = &extension_anchors[0];
@@ -2531,8 +2531,8 @@ impl<
         //     // eprintln!("Best after:  {:?}", best_after);
         //     anchors.iter().for_each(|AnchorPair(a1, a2)| {
         //         let reference = match a1 {
-        //             Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),
-        //             None => &self.db.get_reference(a2.as_ref().unwrap().reference as usize).unwrap(),
+        //             Some(a) => self.db.get_reference(a.reference as usize).unwrap(),
+        //             None => self.db.get_reference(a2.as_ref().unwrap().reference as usize).unwrap(),
         //         };
 
         //         let hamming1 = match a1 {

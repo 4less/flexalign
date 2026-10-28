@@ -131,7 +131,7 @@ impl<D: FlexalignDatabase> FlexalignDatabase for ShardedDB<D> {
         self.inner.get_rname(id)
     }
 
-    fn get_reference(&self, id: usize) -> Option<&[u8]> {
+    fn get_reference(&self, id: usize) -> Option<crate::database::refview::RefView<'_>> {
         self.inner.get_reference(id)
     }
     fn get_reference_len(&self, id: usize) -> Option<usize> {

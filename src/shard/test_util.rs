@@ -48,7 +48,7 @@ impl FlexalignDatabase for MockDb {
     fn get_rname(&self, _id: usize) -> Option<&str> {
         None
     }
-    fn get_reference(&self, _id: usize) -> Option<&[u8]> {
+    fn get_reference(&self, _id: usize) -> Option<crate::database::refview::RefView<'_>> {
         None
     }
     fn build(_options: &Options) -> Self {

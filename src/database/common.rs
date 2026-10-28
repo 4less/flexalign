@@ -273,7 +273,7 @@ impl DBPaths {
 pub trait FlexalignDatabase {
     fn get_rid(&self, reference: &str) -> Option<&usize>;
     fn get_rname(&self, id: usize) -> Option<&str>;
-    fn get_reference(&self, id: usize) -> Option<&[u8]>;
+    fn get_reference(&self, id: usize) -> Option<crate::database::refview::RefView<'_>>;
     /// The length of reference `id`, without its sequence (a packed reference decodes nothing).
     fn get_reference_len(&self, id: usize) -> Option<usize> {
         self.get_reference(id).map(|r| r.len())
@@ -316,7 +316,7 @@ impl<D: FlexalignDatabase> FlexalignDatabase for &D {
     fn get_rname(&self, id: usize) -> Option<&str> {
         (**self).get_rname(id)
     }
-    fn get_reference(&self, id: usize) -> Option<&[u8]> {
+    fn get_reference(&self, id: usize) -> Option<crate::database::refview::RefView<'_>> {
         (**self).get_reference(id)
     }
     fn get_reference_len(&self, id: usize) -> Option<usize> {

@@ -1,3 +1,4 @@
+use crate::database::refview::RefView;
 use std::{cmp::{max, min}, fmt::Display, iter::zip, ops::Range};
 
 use bioreader::sequence::fastq_record::{OwnedFastqRecord, RefFastqRecord};
@@ -288,7 +289,7 @@ impl AnchorSeed {
 }
 
 
-pub fn seed_match(seed: &AnchorSeed, query: &[u8], reference: &[u8]) -> bool {
+pub fn seed_match(seed: &AnchorSeed, query: &[u8], reference: RefView<'_>) -> bool {
     fn seed_match(query_seed: &[u8], reference_seed: &[u8]) -> bool {
         hamming(query_seed, reference_seed) == 0
     }
@@ -524,7 +525,7 @@ impl Anchor {
     }
 
 
-    pub fn whole_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, _max_score: i32) -> Status {
+    pub fn whole_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: RefView<'_>, free_ends: usize, _max_score: i32) -> Status {
         let (mut qr, mut rr) = self.whole(query.len(), reference.len());
 
         self.cigar = Some(Cigar::new());
@@ -598,7 +599,7 @@ impl Anchor {
     /// change that: `extend_left` moves `qpos` and `rpos` by the same amount and `extend_right` moves
     /// `qend`/`rend` together, so the diagonal — and therefore the window — is invariant. Passing it
     /// in removes a second full SIMD pass per aligned anchor. `None` recomputes it.
-    pub fn align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, max_score: i32, screen_hamming: Option<u32>, trace: &mut AlignTrace) -> Status {
+    pub fn align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: RefView<'_>, free_ends: usize, max_score: i32, screen_hamming: Option<u32>, trace: &mut AlignTrace) -> Status {
         if self.seed_status.is_valid() {
             if crate::STAGE_TRACE {
                 let start = std::time::Instant::now();
@@ -644,7 +645,7 @@ impl Anchor {
         }
     }
 
-    pub fn smart_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: &[u8], free_ends: usize, mut max_score: i32, trace: &mut AlignTrace) -> Status {
+    pub fn smart_align(&mut self, aligner: &mut (impl Align + Heuristic), query: &[u8], reference: RefView<'_>, free_ends: usize, mut max_score: i32, trace: &mut AlignTrace) -> Status {
         assert!(self.seed_status.0);
         
         // Accurate alignment of flanks first.
@@ -767,7 +768,7 @@ impl Anchor {
         Status::OK
     }
 
-    pub fn align_left_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize, budget: i32) -> (i32, Status, usize, usize) {
+    pub fn align_left_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: RefView<'_>, free_ends: usize, budget: i32) -> (i32, Status, usize, usize) {
         
 
         // Accurate alignment of flanks first.
@@ -890,7 +891,7 @@ impl Anchor {
         self.cigar.as_mut().unwrap()
     }
 
-    pub fn align_right_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: &[u8], free_ends: usize, budget: i32) -> (i32, Status) {
+    pub fn align_right_flank(&mut self, aligner: &mut impl Align, query: &[u8], reference: RefView<'_>, free_ends: usize, budget: i32) -> (i32, Status) {
         // Accurate alignment of flanks first.
         // Add threshold later and do hamming first, and if the score can possibly improve with perfect alignment, do that
 
@@ -968,7 +969,7 @@ impl Anchor {
         (score, status)
     }
 
-    pub fn align_middle(&mut self, query: &[u8], reference: &[u8], max_score: &mut i32) -> AlignmentResult {
+    pub fn align_middle(&mut self, query: &[u8], reference: RefView<'_>, max_score: &mut i32) -> AlignmentResult {
         let mut current_i = 0;
         let mut next_i = 1;
 
@@ -1028,7 +1029,7 @@ impl Anchor {
         return Ok((score, Status::OK));
     }
 
-    pub fn extend_seeds(&mut self, query: &[u8], reference: &[u8]) {
+    pub fn extend_seeds(&mut self, query: &[u8], reference: RefView<'_>) {
         assert!(self.seed_status.is_valid());
         // Check orientation before this !
         if !self.orientation_set { 
@@ -1167,7 +1168,7 @@ impl Anchor {
         // }
     }
 
-    pub fn hamming(&self, query: &[u8], reference: &[u8]) -> u64 {
+    pub fn hamming(&self, query: &[u8], reference: RefView<'_>) -> u64 {
         let (qr, rr) = self.whole(query.len(), reference.len());
 
         if qr.end > query.len() {
@@ -1184,7 +1185,7 @@ impl Anchor {
         triple_accel::hamming(&query[qr], &reference[rr]) as u64
     }
 
-    pub fn indel_hamming(&self, query: &[u8], reference: &[u8]) -> u64 {
+    pub fn indel_hamming(&self, query: &[u8], reference: RefView<'_>) -> u64 {
         let (qr, rr) = self.whole(query.len(), reference.len());
 
         if qr.end > query.len() {
@@ -1334,13 +1335,13 @@ impl Anchor {
         ((first.qbegin()..last.qend()), (first.rbegin()..last.rend()))
     }
 
-    pub fn all_seeds_valid(&self, query: &[u8], reference: &[u8]) -> bool {
+    pub fn all_seeds_valid(&self, query: &[u8], reference: RefView<'_>) -> bool {
         self.seeds.iter().all(|s| {
             hamming(&query[s.qrange()], &reference[s.rrange()]) == 0
         })
     }
 
-    pub fn validate_seeds(&self, query: &[u8], reference: &[u8]) -> bool {
+    pub fn validate_seeds(&self, query: &[u8], reference: RefView<'_>) -> bool {
         // println!("Validate: {}\nLENGTH: {}", self, self.seeds.len());
 
         self.seeds.iter().all(|s| {
@@ -1352,7 +1353,7 @@ impl Anchor {
         })
     }
 
-    pub fn valid_seed_check(&self, query: &[u8], reference: &[u8]) {
+    pub fn valid_seed_check(&self, query: &[u8], reference: RefView<'_>) {
         self.seeds.iter().for_each(|s| {
             eprintln!("Seed: {}", s);
             eprintln!("\tQ: {}", String::from_utf8_lossy(&query[s.qrange()]));
@@ -1360,13 +1361,13 @@ impl Anchor {
         });
     }
 
-    pub fn valid_seed_count(&self, query: &[u8], reference: &[u8]) -> usize {
+    pub fn valid_seed_count(&self, query: &[u8], reference: RefView<'_>) -> usize {
         self.seeds.iter().filter(|&s| {
             hamming(&query[s.qrange()], &reference[s.rrange()]) == 0
         }).count()
     }
 
-    pub fn are_all_seeds_valid_any_config(&self, query: &[u8], query_rc: &[u8], reference: &[u8]) -> bool {
+    pub fn are_all_seeds_valid_any_config(&self, query: &[u8], query_rc: &[u8], reference: RefView<'_>) -> bool {
         self.seeds.iter().all(|fwd| {
             let mut rev = fwd.clone();
             rev.reverse(query.len());
@@ -1382,13 +1383,13 @@ impl Anchor {
         })
     }
 
-    pub fn are_all_seeds_valid(&self, query: &[u8], reference: &[u8]) -> bool {
+    pub fn are_all_seeds_valid(&self, query: &[u8], reference: RefView<'_>) -> bool {
         self.seeds.iter().all(|seed| {
             hamming(&query[seed.qrange()], &reference[seed.rrange()]) == 0 
         })
     }
 
-    pub fn any_orientation_valid(&mut self, rec: &RefFastqRecord, rec_rc: &OwnedFastqRecord, reference: &[u8]) -> bool {
+    pub fn any_orientation_valid(&mut self, rec: &RefFastqRecord, rec_rc: &OwnedFastqRecord, reference: RefView<'_>) -> bool {
         // println!("Any orientation valid");
         // println!("F REC   {}/{}", self.valid_seed_count(rec.seq(), reference), self.seeds.len());
         // println!("F RECRC {}/{}", self.valid_seed_count(rec_rc.seq(), reference), self.seeds.len());
@@ -1482,7 +1483,7 @@ impl Anchor {
         self
     }
 
-    pub fn visualize_alignment(&self, query: &[u8], reference: &[u8]) -> bool {
+    pub fn visualize_alignment(&self, query: &[u8], reference: RefView<'_>) -> bool {
         let mut old: &AnchorSeed = self.seeds.first().unwrap();
         eprintln!("Q {} {}", query.len(), String::from_utf8_lossy(query));
         eprintln!("{:?}", old);
@@ -1756,7 +1757,7 @@ pub enum AnchorSeedConfig {
     None,
 }
 
-pub fn get_seed_config(seed: &AnchorSeed, query: &[u8], query_rc: &[u8], reference: &[u8]) -> AnchorSeedConfig {
+pub fn get_seed_config(seed: &AnchorSeed, query: &[u8], query_rc: &[u8], reference: RefView<'_>) -> AnchorSeedConfig {
 
     fn seed_match(query_seed: &[u8], reference_seed: &[u8]) -> bool {
         hamming(query_seed, reference_seed) == 0
@@ -1896,7 +1897,7 @@ pub(crate) mod tests {
         let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
         let reference = query.clone();
         let mut a = anchor(&[(5, 5, 10)]);
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         // The whole 5bp left flank matches, so the seed swallows it.
         assert_eq!(a.seeds[0].qbegin(), 0);
         assert_eq!(a.seeds[0].rbegin(), 0);
@@ -1909,7 +1910,7 @@ pub(crate) mod tests {
         let mut reference = query.clone();
         reference[3] = b'T';
         let mut a = anchor(&[(5, 5, 10)]);
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         // Flank is query[0..5]; scanning right-to-left, positions 4 matches then 3 mismatches,
         // so the seed may only take 1 base.
         assert_eq!(a.seeds[0].qbegin(), 4, "must stop AT the mismatch, not past it");
@@ -1921,7 +1922,7 @@ pub(crate) mod tests {
         let query = b"AAAAACCCCCGGGGGTTTTT".to_vec();
         let reference = query.clone();
         let mut a = anchor(&[(5, 5, 10)]);
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         assert_eq!(a.seeds.last().unwrap().qend(), 20);
         assert_eq!(a.seeds.last().unwrap().rend(), 20);
     }
@@ -1932,7 +1933,7 @@ pub(crate) mod tests {
         let mut reference = query.clone();
         reference[17] = b'A'; // query[15..20] is the right flank; index 17 is its 3rd base
         let mut a = anchor(&[(5, 5, 10)]);
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         assert_eq!(a.seeds.last().unwrap().qend(), 17);
     }
 
@@ -1942,7 +1943,7 @@ pub(crate) mod tests {
         let reference = query.clone();
         // Two seeds with a 5bp gap that matches perfectly: they must collapse into one.
         let mut a = anchor(&[(0, 0, 5), (10, 10, 5)]);
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         assert_eq!(a.seeds.len(), 1, "a fully matching interior must merge the seeds");
         assert_eq!(a.seeds[0].qbegin(), 0);
         assert_eq!(a.seeds[0].qend(), 20, "and then extend over both flanks");
@@ -1954,7 +1955,7 @@ pub(crate) mod tests {
         let mut reference = query.clone();
         reference[7] = b'A'; // interior is query[5..10]; index 7 is its middle base
         let mut a = anchor(&[(0, 0, 5), (10, 10, 5)]);
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         assert_eq!(a.seeds.len(), 2, "a mismatching interior must NOT merge");
         // Left seed grows right up to the mismatch, right seed grows left back down to it, so
         // exactly the one bad base is left uncovered.
@@ -1975,7 +1976,7 @@ pub(crate) mod tests {
         a.cigar = Some(Cigar::new());
 
         let (score, status, _, _) =
-            a.align_left_flank(&mut NoWfa, &query, &reference, 10, 100);
+            a.align_left_flank(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 100);
 
         assert!(matches!(status, Status::OK));
         assert_eq!(score, -penalties::MISMATCH, "one mismatch, priced gaplessly");
@@ -1993,7 +1994,7 @@ pub(crate) mod tests {
 
         // Budget below one mismatch: the anchor must die here rather than inside WFA.
         let (score, status, _, _) =
-            a.align_left_flank(&mut NoWfa, &query, &reference, 10, penalties::MISMATCH - 1);
+            a.align_left_flank(&mut NoWfa, &query, RefView::Bytes(&reference), 10, penalties::MISMATCH - 1);
 
         assert!(matches!(status, Status::Dropped));
         assert_eq!(score, std::i32::MIN);
@@ -2007,7 +2008,7 @@ pub(crate) mod tests {
         let mut a = anchor(&[(5, 5, 10)]);
         a.cigar = Some(Cigar::new());
 
-        let (score, status) = a.align_right_flank(&mut NoWfa, &query, &reference, 10, 100);
+        let (score, status) = a.align_right_flank(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 100);
 
         assert!(matches!(status, Status::OK));
         assert_eq!(score, -penalties::MISMATCH);
@@ -2024,7 +2025,7 @@ pub(crate) mod tests {
         a.cigar = Some(Cigar::new());
 
         let (score, status) =
-            a.align_right_flank(&mut NoWfa, &query, &reference, 10, penalties::MISMATCH - 1);
+            a.align_right_flank(&mut NoWfa, &query, RefView::Bytes(&reference), 10, penalties::MISMATCH - 1);
 
         assert!(matches!(status, Status::Dropped));
         assert_eq!(score, std::i32::MIN);
@@ -2038,8 +2039,8 @@ pub(crate) mod tests {
         let mut a = anchor(&[(0, 0, 20)]);
         a.cigar = Some(Cigar::new());
 
-        let (ls, lstatus, _, _) = a.align_left_flank(&mut NoWfa, &query, &reference, 10, 100);
-        let (rs, rstatus) = a.align_right_flank(&mut NoWfa, &query, &reference, 10, 100);
+        let (ls, lstatus, _, _) = a.align_left_flank(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 100);
+        let (rs, rstatus) = a.align_right_flank(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 100);
 
         assert!(matches!(lstatus, Status::OK));
         assert!(matches!(rstatus, Status::OK));
@@ -2062,7 +2063,7 @@ pub(crate) mod tests {
         a.cigar = Some(Cigar::new());
 
         let mut budget = 100;
-        let (score, status) = a.align_middle(&query, &reference, &mut budget).unwrap();
+        let (score, status) = a.align_middle(&query, RefView::Bytes(&reference), &mut budget).unwrap();
 
         assert!(matches!(status, Status::OK));
         assert_eq!(score, -2 * penalties::MISMATCH);
@@ -2081,7 +2082,7 @@ pub(crate) mod tests {
 
         // Enough for one mismatch, not two.
         let mut budget = penalties::MISMATCH + 1;
-        let (score, status) = a.align_middle(&query, &reference, &mut budget).unwrap();
+        let (score, status) = a.align_middle(&query, RefView::Bytes(&reference), &mut budget).unwrap();
 
         assert!(matches!(status, Status::Dropped));
         assert_eq!(score, std::i32::MIN);
@@ -2102,7 +2103,7 @@ pub(crate) mod tests {
         let mut a = anchor(&[(0, 0, 20)]);
 
         // 3 mismatches cost 30; budget 20 cannot be met by any alignment on this diagonal.
-        let status = a.align(&mut NoWfa, &query, &reference, 10, 2 * penalties::MISMATCH, None, &mut AlignTrace::default());
+        let status = a.align(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 2 * penalties::MISMATCH, None, &mut AlignTrace::default());
 
         assert!(matches!(status, Status::Dropped));
         assert_eq!(a.score, std::i32::MIN);
@@ -2116,7 +2117,7 @@ pub(crate) mod tests {
         reference[0] = b'T'; // a single mismatch, at the very start of the read
         let mut a = anchor(&[(8, 8, 4)]);
 
-        let status = a.align(&mut NoWfa, &query, &reference, 10, 2 * penalties::MISMATCH, None, &mut AlignTrace::default());
+        let status = a.align(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 2 * penalties::MISMATCH, None, &mut AlignTrace::default());
 
         assert!(matches!(status, Status::OK));
         // Extension swallows everything except the mismatching first base, which is then priced
@@ -2140,7 +2141,7 @@ pub(crate) mod tests {
         reference[0..12].copy_from_slice(&query[8..20]);
 
         let mut a = anchor(&[(8, 0, 4)]);
-        let status = a.align(&mut NoWfa, &query, &reference, 10, 10 * penalties::MISMATCH, None, &mut AlignTrace::default());
+        let status = a.align(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 10 * penalties::MISMATCH, None, &mut AlignTrace::default());
         assert!(matches!(status, Status::OK));
 
         assert_eq!(cigar_of(&a), "SSSSSSSSMMMMMMMMMMMM");
@@ -2159,7 +2160,7 @@ pub(crate) mod tests {
         reference[0..12].copy_from_slice(&query[8..20]);
 
         let mut a = anchor(&[(8, 0, 4)]);
-        a.align(&mut NoWfa, &query, &reference, 10, 10 * penalties::MISMATCH, None, &mut AlignTrace::default());
+        a.align(&mut NoWfa, &query, RefView::Bytes(&reference), 10, 10 * penalties::MISMATCH, None, &mut AlignTrace::default());
 
         let cigar = a.cigar.as_ref().unwrap();
         assert_eq!(cigar.query_aligned(), 12, "only the placed bases count as aligned");
@@ -2181,7 +2182,7 @@ pub(crate) mod tests {
         let query = vec![b'A'; 20];
         let reference = vec![b'A'; 20];
         let mut wfa = crate::align::process::alignment::LIBWFA2Alignment::default();
-        let (_score, status, _, _) = a.align_left_flank(&mut wfa, &query, &reference, 4, 1000);
+        let (_score, status, _, _) = a.align_left_flank(&mut wfa, &query, RefView::Bytes(&reference), 4, 1000);
 
         assert!(matches!(status, Status::OK));
         // 10 outside the flank, 4 of them pulled in as dovetail -> at least 6 must be clipped.
@@ -2210,8 +2211,8 @@ pub(crate) mod tests {
 
         let a = anchor(&[(0, 0, 8)]);
 
-        let plain = a.hamming(&query, &reference);
-        let indel = a.indel_hamming(&query, &reference);
+        let plain = a.hamming(&query, RefView::Bytes(&reference));
+        let indel = a.indel_hamming(&query, RefView::Bytes(&reference));
 
         assert_eq!(plain, 10, "fixed-diagonal Hamming is blind to the shift");
         assert_eq!(indel, 0, "the offset-scanning estimate finds the shifted diagonal");
@@ -2260,7 +2261,7 @@ mod prefilter_reuse_tests {
         let mut a = anchor(&[(5, 5, 4), (12, 12, 4)]);
 
         let before = a.whole(query.len(), reference.len());
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
         let after = a.whole(query.len(), reference.len());
 
         assert_eq!(before, after, "whole() must survive seed extension unchanged");
@@ -2283,8 +2284,8 @@ mod prefilter_reuse_tests {
             let mut recomputed = anchor(&[(8, 8, 4)]);
             let mut reused = anchor(&[(8, 8, 4)]);
 
-            let s1 = recomputed.align(&mut NoWfa, &query, &reference, 10, budget, None, &mut AlignTrace::default());
-            let s2 = reused.align(&mut NoWfa, &query, &reference, 10, budget, Some(screen_h), &mut AlignTrace::default());
+            let s1 = recomputed.align(&mut NoWfa, &query, RefView::Bytes(&reference), 10, budget, None, &mut AlignTrace::default());
+            let s2 = reused.align(&mut NoWfa, &query, RefView::Bytes(&reference), 10, budget, Some(screen_h), &mut AlignTrace::default());
 
             assert_eq!(format!("{:?}", s1), format!("{:?}", s2), "budget {budget}");
             assert_eq!(recomputed.score, reused.score, "budget {budget}");
@@ -2323,7 +2324,7 @@ mod indel_merge_tests {
         let mut a = anchor(&[(0, 0, 4), (12, 7, 4)]);
         a.flagged_for_indel = true;
 
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
 
         assert_eq!(a.seeds.len(), 2, "an indel gap must NOT collapse the two seeds into one");
         let last = a.seeds.last().unwrap();
@@ -2341,7 +2342,7 @@ mod indel_merge_tests {
         let reference = query.clone();
         let mut a = anchor(&[(0, 0, 4), (8, 8, 4)]);
 
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
 
         assert_eq!(a.seeds.len(), 1, "an exactly matching equal-length gap still merges");
         assert!(a.seeds[0].rend() <= reference.len());
@@ -2358,7 +2359,7 @@ mod indel_merge_tests {
 
         let mut a = anchor(&[(0, 0, 4), (12, 7, 4)]);
         a.flagged_for_indel = true;
-        a.extend_seeds(&query, &reference);
+        a.extend_seeds(&query, RefView::Bytes(&reference));
 
         let (qr, rr) = a.right_flank(query.len(), reference.len());
         assert!(qr.end <= query.len(), "query flank {:?} exceeds {}", qr, query.len());

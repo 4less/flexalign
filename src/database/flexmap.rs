@@ -302,6 +302,20 @@ pub enum RefStore {
     Packed(RefSeq2),
 }
 impl RefStore {
+    /// Sequence `id` for alignment: a long packed sequence (a chromosome) is decoded a window at
+    /// a time (`RefView`), a short one whole, as `get` does.
+    #[inline]
+    fn view(&self, id: usize) -> crate::database::refview::RefView<'_> {
+        use crate::database::refview::RefView;
+        match self {
+            RefStore::Packed(p) if p.seq_len(id) > refseq2::MAX_PACKED_LEN => {
+                RefView::Packed { store: p, id, len: p.seq_len(id) }
+            }
+            _ => RefView::Bytes(self.get(id)),
+        }
+    }
+
+    /// Sequence `id` whole (a packed one decoded whole: for writing it out, not per read).
     #[inline]
     fn get(&self, id: usize) -> &[u8] {
         match self {
@@ -695,9 +709,9 @@ impl<
         self.save_separate(paths, version)
     }
 
-    fn get_reference(&self, id: usize) -> Option<&[u8]> {
+    fn get_reference(&self, id: usize) -> Option<crate::database::refview::RefView<'_>> {
         if id < self.references.len() {
-            Some(self.references.get(id))
+            Some(self.references.view(id))
         } else {
             None
         }
@@ -795,9 +809,10 @@ impl<
     /// (`paths.bundle_file(format)`).
     fn save_bundle(&self, paths: &DBPaths) -> Result<(), std::io::Error> {
         let file = paths.bundle_file(index_format());
-        // A reference of short sequences (a marker database) is stored at 2 bits a base; one with
-        // a long sequence (a whole genome) keeps its bytes. Decoding a packed reference to write
-        // it again goes through this thread's scratch, reset per sequence.
+        // The reference is stored at 2 bits a base (`refseq2::packable`): a marker database's
+        // sequences are handed out whole, a genome's a window at a time (`RefView`). Decoding a
+        // packed reference to write it again goes through this thread's scratch, reset per
+        // sequence.
         let packed = refseq2::packable(self.references.len(), &|i| {
             refseq2::reset_scratch();
             self.references.get(i)

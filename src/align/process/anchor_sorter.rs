@@ -20,7 +20,7 @@ impl<'a, D: FlexalignDatabase> PairedAnchorHeuristicSorter<'a, D> {
         Self { db }
     }
 
-    pub fn fix_anchor(a: &mut Anchor, query: &[u8], query_rc: &[u8], reference: &[u8]) -> FixAnchorResult {
+    pub fn fix_anchor(a: &mut Anchor, query: &[u8], query_rc: &[u8], reference: crate::database::refview::RefView<'_>) -> FixAnchorResult {
         // println!("\n##################################################################################################\n___QueryLength: {}\n____ BEFORE {}", query.len(), a);
         let v = a.are_all_seeds_valid(if a.forward { query } else { query_rc }, reference);
 
@@ -106,9 +106,9 @@ impl<'a, D: FlexalignDatabase> PairedAnchorSorter for PairedAnchorHeuristicSorte
         let _ = stats;
 
         anchors.iter_mut().for_each(|AnchorPair(a1, a2)| {
-            let reference: &&[u8] = match a1 {
-                Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),
-                None => &self.db.get_reference(a2.as_ref().unwrap().reference as usize).unwrap(),
+            let reference = match a1 {
+                Some(a) => self.db.get_reference(a.reference as usize).unwrap(),
+                None => self.db.get_reference(a2.as_ref().unwrap().reference as usize).unwrap(),
             };
 
             // Treat each anchor in three stages.

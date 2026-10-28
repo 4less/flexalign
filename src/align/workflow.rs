@@ -156,7 +156,7 @@ impl<
 
         let best = self.anchors.first().unwrap();
         let ref_string = &self.db.get_rname(best.reference as usize).unwrap();
-        let reference = &self.db.get_reference(best.reference as usize).unwrap();
+        let reference = self.db.get_reference(best.reference as usize).unwrap();
 
         let best_corelen = best.core_matches() - best.mismatches as usize - best.indels();
         let second_best_corelen = if self.anchors.len() > 1 {
@@ -254,7 +254,7 @@ impl<
             return true
         }
         
-        let reference = &self.db.get_reference(anchor.reference as usize).unwrap();
+        let reference = self.db.get_reference(anchor.reference as usize).unwrap();
 
         if anchor.seeds.first().unwrap().rpos as usize > reference.len() {
             eprintln!("Seed and anchor are invalid\n{}", anchor.to_string());
@@ -305,8 +305,8 @@ impl<
         let best_first = best.seeds.first().unwrap();
         let _ref_string = &self.db.get_rname(best.reference as usize).unwrap();
 
-        let reference = &self.db.get_reference(best.reference as usize).unwrap();
-        let seq = *reference;
+        let reference = self.db.get_reference(best.reference as usize).unwrap();
+        let seq = reference;
         // let start = if best.ref_pos < 100 { 0 } else {best.ref_pos - 100} as usize;
         // let end: usize = min(seq.len(), best.ref_pos as usize + 100) as usize;
         let start = best_first.rpos as usize + F/2 as usize;

@@ -237,7 +237,7 @@ impl<const C: usize, const F: usize, const CELLS_PER_BODY: u64, const HEADER_THR
     fn get_rname(&self, _id: usize) -> Option<&str> {
         None
     }
-    fn get_reference(&self, _id: usize) -> Option<&[u8]> {
+    fn get_reference(&self, _id: usize) -> Option<crate::database::refview::RefView<'_>> {
         None
     }
     fn build(_options: &Options) -> Self {

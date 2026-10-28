@@ -39,7 +39,7 @@ impl<'a, D: FlexalignDatabase> StdPairedAnchorExtender<'a, D> {
         a: &mut Anchor,
         query: &[u8],
         query_rc: &[u8],
-        reference: &[u8],
+        reference: crate::database::refview::RefView<'_>,
     ) -> FixAnchorResult {
         // println!("\n##################################################################################################\n___QueryLength: {}\n____ BEFORE {}", query.len(), a);
         let v = a.are_all_seeds_valid(if a.forward { query } else { query_rc }, reference);
@@ -157,7 +157,7 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
                         let end = (start + read_len).min(reference.len());
                         let mut off = start;
                         while off < end {
-                            prefetch(&reference[off..]);
+                            prefetch(reference.prefetch(off));
                             off += 64;
                         }
                     }
@@ -185,9 +185,9 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
             // }
             _previous_score = current_score;
 
-            let reference: &&[u8] = match a_fwd {
-                Some(a) => &self.db.get_reference(a.reference as usize).unwrap(),
-                None => &self
+            let reference = match a_fwd {
+                Some(a) => self.db.get_reference(a.reference as usize).unwrap(),
+                None => self
                     .db
                     .get_reference(a_rev.as_ref().unwrap().reference as usize)
                     .unwrap(),
@@ -301,19 +301,16 @@ impl<'a, D: FlexalignDatabase> PairedAnchorExtender for StdPairedAnchorExtender<
 }
 
 
-/// Touches the cache line(s) at the start of `bytes` without waiting for them.
+/// Touches the cache line at `p` without waiting for it.
 #[inline(always)]
-fn prefetch(bytes: &[u8]) {
+fn prefetch(p: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        _mm_prefetch(bytes.as_ptr() as *const i8, _MM_HINT_T0);
-        if bytes.len() > 64 {
-            _mm_prefetch(bytes.as_ptr().add(64) as *const i8, _MM_HINT_T0);
-        }
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = bytes;
+        let _ = p;
     }
 }

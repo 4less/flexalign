@@ -44,9 +44,30 @@ fn code(b: u8) -> Option<u8> {
     }
 }
 
-/// Whether the sequences `seq(0..n)` are all short enough to be packed.
+/// Whether the sequences `seq(0..n)` are worth packing: all short (a marker database, handed out
+/// whole), or -- a genome, handed out a window at a time (`RefView`) -- few enough bytes outside
+/// ACGT that their runs (16 bytes each) take under an eighth of what packing saves. bioreader
+/// uppercases what it reads, so a genome's runs are its N and IUPAC stretches.
 pub fn packable<'s>(n: usize, seq: &dyn Fn(usize) -> &'s [u8]) -> bool {
-    n > 0 && (0..n).all(|i| seq(i).len() <= MAX_PACKED_LEN)
+    if n == 0 {
+        return false;
+    }
+    if (0..n).all(|i| seq(i).len() <= MAX_PACKED_LEN) {
+        return true;
+    }
+    let (mut bases, mut runs) = (0usize, 0usize);
+    for i in 0..n {
+        let s = seq(i);
+        bases += s.len();
+        let mut prev = b'A';
+        for &b in s {
+            if code(b).is_none() && b != prev {
+                runs += 1;
+            }
+            prev = if code(b).is_none() { b } else { b'A' };
+        }
+    }
+    RUN_BYTES * runs < bases * 3 / 4 / 8
 }
 
 /// Writes the section for sequences `seq(0..n)`; returns its length in bytes.
@@ -131,6 +152,41 @@ const LUT: [u32; 256] = {
     t
 };
 
+/// 32 bases (8 packed bytes at `src`) to ASCII at `dst`: each output byte takes its packed byte
+/// (shuffle), keeps its 2 bits (four shifts, each kept where it applies), and maps them to ACGT.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn decode32(src: *const u8, dst: *mut u8) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_set1_epi64x((src as *const u64).read_unaligned() as i64);
+        let b = _mm256_shuffle_epi8(
+            v,
+            _mm256_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7),
+        );
+        let m3 = _mm256_set1_epi8(3);
+        // Byte j keeps bits 2 (j % 4) and up: shift every byte by each of 0, 2, 4, 6 and keep the
+        // one for its position (epi16 shifts are fine: the & 3 drops what crossed from the
+        // neighbour byte).
+        let pos = |k: i32| _mm256_set1_epi32(0xFF << (8 * k));
+        let c = _mm256_or_si256(
+            _mm256_or_si256(
+                _mm256_and_si256(_mm256_and_si256(b, m3), pos(0)),
+                _mm256_and_si256(_mm256_and_si256(_mm256_srli_epi16(b, 2), m3), pos(1)),
+            ),
+            _mm256_or_si256(
+                _mm256_and_si256(_mm256_and_si256(_mm256_srli_epi16(b, 4), m3), pos(2)),
+                _mm256_and_si256(_mm256_and_si256(_mm256_srli_epi16(b, 6), m3), pos(3)),
+            ),
+        );
+        let acgt = _mm256_setr_epi8(
+            b'A' as i8, b'C' as i8, b'G' as i8, b'T' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            b'A' as i8, b'C' as i8, b'G' as i8, b'T' as i8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        );
+        _mm256_storeu_si256(dst as *mut __m256i, _mm256_shuffle_epi8(acgt, c));
+    }
+}
+
 /// A REFSEQ2 section, read in: views into bytes it keeps alive.
 #[derive(Clone)]
 pub struct RefSeq2 {
@@ -193,25 +249,55 @@ impl RefSeq2 {
         (pos, len, unsafe { *p.add(12) })
     }
 
+    /// The packed byte holding base `i` of sequence `id` (for prefetching).
+    #[inline]
+    pub fn packed_ptr(&self, id: usize, i: usize) -> *const u8 {
+        unsafe { self.packed.add(((*self.starts.add(id) + i as u64) / 4) as usize) }
+    }
+
     /// Decodes sequence `id` into `out` (exactly its length).
     pub fn decode(&self, id: usize, out: &mut [u8]) {
-        let len = self.seq_len(id);
-        debug_assert_eq!(out.len(), len);
-        let start = unsafe { *self.starts.add(id) };
-        let packed = unsafe { std::slice::from_raw_parts(self.packed.add((start / 4) as usize), (len + 3) / 4) };
-        let full = len / 4;
-        for (k, &byte) in packed[..full].iter().enumerate() {
-            out[4 * k..4 * k + 4].copy_from_slice(&LUT[byte as usize].to_le_bytes());
+        self.decode_range(id, 0, self.seq_len(id), out);
+    }
+
+    /// Decodes bases `[from, to)` of sequence `id` into `out` (exactly `to - from` long).
+    pub fn decode_range(&self, id: usize, from: usize, to: usize, out: &mut [u8]) {
+        debug_assert!(from <= to && to <= self.seq_len(id));
+        debug_assert_eq!(out.len(), to - from);
+        let n = to - from;
+        if n == 0 {
+            return;
         }
-        if full < packed.len() {
-            let tail = LUT[packed[full] as usize].to_le_bytes();
-            out[4 * full..].copy_from_slice(&tail[..len - 4 * full]);
+        // In packed bases: every sequence starts on a byte, the window need not.
+        let start = unsafe { *self.starts.add(id) } + from as u64;
+        let skip = (start % 4) as usize;
+        let packed = unsafe { std::slice::from_raw_parts(self.packed.add((start / 4) as usize), (skip + n + 3) / 4) };
+        let (mut o, mut k) = (0usize, 0usize);
+        if skip != 0 {
+            let head = LUT[packed[0] as usize].to_le_bytes();
+            let take = (4 - skip).min(n);
+            out[..take].copy_from_slice(&head[skip..skip + take]);
+            (o, k) = (take, 1);
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        while o + 32 <= n {
+            // SAFETY: 32 bases left means 8 packed bytes from k, and 32 output bytes from o.
+            unsafe { decode32(packed.as_ptr().add(k), out.as_mut_ptr().add(o)) };
+            (o, k) = (o + 32, k + 8);
+        }
+        while o + 4 <= n {
+            out[o..o + 4].copy_from_slice(&LUT[packed[k] as usize].to_le_bytes());
+            (o, k) = (o + 4, k + 1);
+        }
+        if o < n {
+            let tail = LUT[packed[k] as usize].to_le_bytes();
+            out[o..].copy_from_slice(&tail[..n - o]);
         }
         if self.n_runs == 0 {
             return;
         }
-        // The runs inside [start, start + len): the first whose end is past start, on.
-        let end = start + len as u64;
+        // The runs inside [start, start + n): the first whose end is past start, on.
+        let end = start + n as u64;
         let (mut lo, mut hi) = (0usize, self.n_runs);
         while lo < hi {
             let m = lo + (hi - lo) / 2;
@@ -227,6 +313,36 @@ impl RefSeq2 {
             let to = (pos + l as u64).min(end) - start;
             out[from as usize..to as usize].fill(byte);
         }
+    }
+
+    /// Bases `[from, to)` of sequence `id`, decoded into this thread's scratch (valid until the
+    /// next [`reset_scratch`] on this thread). For a long sequence (a chromosome), where decoding
+    /// the whole of it per read would cost more than the read.
+    ///
+    /// A read asks for overlapping windows of the same locus several times (screen, extension,
+    /// alignment, output), so a window inside one decoded since the reset is handed out of it, and
+    /// a new one is decoded with `WINDOW_PAD` bases either side (from a byte boundary) so the next
+    /// request nearby lands inside it.
+    #[inline]
+    pub fn get_range(&self, id: usize, from: usize, to: usize) -> &[u8] {
+        if from >= to {
+            return &[];
+        }
+        SCRATCH.with(|s| {
+            let mut s = s.borrow_mut();
+            if let Some(&(_, wf, _, ptr)) =
+                s.windows.iter().rev().take(SEEN_SEARCH).find(|w| w.0 == id && w.1 <= from && to <= w.2)
+            {
+                return unsafe { std::slice::from_raw_parts(ptr.add(from - wf), to - from) };
+            }
+            let wf = from.saturating_sub(WINDOW_PAD) / 4 * 4;
+            let wt = (to + WINDOW_PAD).min(self.seq_len(id));
+            let out = s.alloc(wt - wf);
+            let out = unsafe { std::slice::from_raw_parts_mut(out, wt - wf) };
+            self.decode_range(id, wf, wt, out);
+            s.windows.push((id, wf, wt, out.as_ptr()));
+            unsafe { std::slice::from_raw_parts(out.as_ptr().add(from - wf), to - from) }
+        })
     }
 
     /// Sequence `id`, decoded into this thread's scratch (valid until the next [`reset_scratch`]
@@ -256,10 +372,14 @@ struct Scratch {
     chunk: usize,
     used: usize,
     seen: Vec<(usize, *const u8, usize)>,
+    /// Windows of long sequences: (id, from, to, bytes).
+    windows: Vec<(usize, usize, usize, *const u8)>,
 }
 
 const CHUNK: usize = 1 << 20;
 const SEEN_SEARCH: usize = 256;
+/// Bases decoded beyond a requested window on either side (`get_range`).
+const WINDOW_PAD: usize = 64;
 
 impl Scratch {
     fn alloc(&mut self, len: usize) -> *mut u8 {
@@ -281,7 +401,7 @@ impl Scratch {
 }
 
 thread_local! {
-    static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch { chunks: Vec::new(), chunk: 0, used: 0, seen: Vec::new() }) };
+    static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch { chunks: Vec::new(), chunk: 0, used: 0, seen: Vec::new(), windows: Vec::new() }) };
 }
 
 /// Forgets this thread's decoded sequences: called when a read (pair) starts, after which no slice
@@ -291,6 +411,7 @@ pub fn reset_scratch() {
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
         s.seen.clear();
+        s.windows.clear();
         s.chunks.truncate(1);
         s.chunk = 0;
         s.used = 0;
@@ -350,5 +471,55 @@ mod tests {
         }
         roundtrip(&seqs);
         roundtrip(&[b"TTTT".to_vec()]);
+    }
+
+    #[test]
+    fn windows_of_a_long_sequence_match_its_bytes() {
+        // A chromosome-like sequence past MAX_PACKED_LEN, with N runs, after a short one (so its
+        // packed start is not 0): every window, at every offset mod 4, decodes to its bytes.
+        let mut x = 99u64;
+        let mut long: Vec<u8> = (0..MAX_PACKED_LEN + 5003)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                b"ACGT"[(x % 4) as usize]
+            })
+            .collect();
+        long[..37].fill(b'N');
+        long[1000..1013].fill(b'N');
+        long[40_001] = b'R';
+        let n = long.len();
+        long[n - 9..].fill(b'N');
+        let seqs = vec![b"ACG".to_vec(), long.clone()];
+        assert!(packable(seqs.len(), &|i| &seqs[i]));
+        let mut buf = Vec::new();
+        write_to(&mut buf, seqs.len(), &|i| &seqs[i]).unwrap();
+        let path = std::env::temp_dir().join(format!("refseq2-win-{}", std::process::id()));
+        std::fs::write(&path, &buf).unwrap();
+        let bytes = SharedBytes::read(&std::fs::File::open(&path).unwrap(), 0, buf.len(), 2).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let r = RefSeq2::from_shared(&bytes, 0, buf.len()).unwrap();
+        let view = crate::database::refview::RefView::Packed { store: &r, id: 1, len: n };
+        assert_eq!(view.len(), n);
+        for from in [0usize, 1, 2, 3, 30, 36, 37, 38, 997, 999, 1000, 1001, 1012, 1013, 39_999, 40_001, n - 300, n - 10, n - 1] {
+            for len in [0usize, 1, 2, 3, 4, 5, 7, 31, 150, 301] {
+                let to = (from + len).min(n);
+                reset_scratch();
+                assert_eq!(&view[from..to], &long[from..to], "window {from}..{to}");
+            }
+        }
+        reset_scratch();
+        assert_eq!(view[40_001], b'R');
+        assert_eq!(&view[n - 5..n], &long[n - 5..]);
+        assert_eq!(&view[0..5], &long[..5]);
+        reset_scratch();
+    }
+
+    #[test]
+    fn a_genome_of_one_byte_runs_is_not_packed() {
+        // Lowercase-like bytes everywhere: their runs would cost more than packing saves.
+        let s: Vec<u8> = (0..MAX_PACKED_LEN + 1000).map(|i| if i % 2 == 0 { b'a' } else { b'c' }).collect();
+        assert!(!packable(1, &|_| &s));
     }
 }
