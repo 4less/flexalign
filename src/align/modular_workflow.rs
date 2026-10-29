@@ -477,7 +477,7 @@ fn rescue_overhang<D: FlexalignDatabase>(
         a.seed_count += 1;
     }
     a.mismatches = mm;
-    // Not evidence from the index: the MAPQ caps' seed support leaves these out, as BWT seeds.
+    // Not evidence from the index.
     a.counter1 = a.seed_count as u16;
     a.set_forward(forward, mate.len());
     // What the extender establishes for an anchor from the index (`anchor_extender`): seeds in
@@ -1537,10 +1537,10 @@ impl<
         // out of: it gets more flank ties kept per core and more candidates aligned. The others
         // keep the defaults, so the effort stays with the reads that need it.
         let lim = self.options.args.adaptive_multiplicity;
-        let hard = |ranges: &[crate::align::process::range_extractor::Range<F>]| !ranges.iter().any(|r| !r.repeat && r.vrange.len() <= lim);
+        let hard = |ranges: &[crate::align::process::range_extractor::Range<F>]| !ranges.iter().any(|r| r.vrange.len() <= lim);
         let difficult = self.options.args.adaptive && (hard(ranges_fwd) || hard(ranges_rev));
         // The fewest copies of any core a mate kept (0: none kept).
-        let minmult = |ranges: &[crate::align::process::range_extractor::Range<F>]| ranges.iter().filter(|r| !r.repeat).map(|r| r.vrange.len()).min().unwrap_or(0);
+        let minmult = |ranges: &[crate::align::process::range_extractor::Range<F>]| ranges.iter().map(|r| r.vrange.len()).min().unwrap_or(0);
         let (minmult_fwd, minmult_rev) = (minmult(ranges_fwd), minmult(ranges_rev));
         // --mapq-copies: a pair whose mates' least repeated cores have many copies is placed among
         // copies seeding did not all reach. Its MAPQ ceiling falls with the log of both counts (a
@@ -1590,7 +1590,6 @@ impl<
         let seeds_rev = self.seed_extractor_rev.take_seeds();
         stats.seeds += seeds_fwd.len() + seeds_rev.len();
 
-        UNRESOLVED.with(|u| u.set(self.range_extractor_fwd.last_unresolved() + self.range_extractor_rev.last_unresolved()));
         // Seedless: no seed at all -- or, with --seedless-multiplicity N, none from a core of at
         // most N positions (with a raised --max-range-size, a mate seeded only by cores of
         // thousands of copies is placed among the copies its seeds reached).
@@ -1598,111 +1597,17 @@ impl<
         let seedless_mate = |seeds: &[Seed], re: &RE| seeds.is_empty() || (lim > 0 && re.ranges_at_most(lim) == 0);
         SEEDLESS.with(|u| u.set(seedless_mate(&seeds_fwd, &self.range_extractor_fwd) as u8 + seedless_mate(&seeds_rev, &self.range_extractor_rev) as u8));
         if std::env::var_os("FA_READ_STATS").is_some() {
-            let (a, b) = (self.range_extractor_fwd.last_counts(), self.range_extractor_rev.last_counts());
+            // Per pair: each mate's fewest core copies, and (ranges seeded, ranges dropped for
+            // flank ties) of each mate.
             let (ta, tb) = (self.seed_extractor_fwd.last_ties(), self.seed_extractor_rev.last_ties());
-            eprintln!("READMULT\t{}\t{}\t{}",
+            eprintln!("READSTAT\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').split('/').next().unwrap_or(""),
-                minmult_fwd, minmult_rev);
-            eprintln!("READSTAT\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').split('/').next().unwrap_or(""),
-                a.0, a.1, a.2, a.3, seeds_fwd.len(), b.0, b.1, b.2, b.3, seeds_rev.len(), ta.0, ta.1, tb.0, tb.1);
+                minmult_fwd, minmult_rev, ta.0, ta.1, tb.0, tb.1);
         }
-        // Seeds from the repeat BWT compete only on the alignment. A pair the BWT may help is
-        // aligned as seeded (written at once when the output can take it back, else a dry run) and
-        // then, as needed, again with the BWT's extra seeds, each a dry run; another result is
-        // written only when it does better.
-        //   * Unresolved cores (--bwt-min-dropped of them in a mate) and a mate below
-        //     --bwt-redo-ani: their copies, found by the BWT, as seeds. Written when strictly
-        //     better: in a tandem array they are many equally plausible copies, and ranked among
-        //     the other candidates they would crowd out a placement the other seeds found.
-        //   * A pair left under the unresolved-repeat MAPQ cap (--pair-resolve): every copy of
-        //     each mate's long exact stretches, kept where the two mates' copies make proper
-        //     pairs, as seeds of both. When every stretch was listed whole, the candidates are
-        //     complete: the cap is lifted and the MAPQ is the aligned margin, and the result is
-        //     written on a tie too.
-        let pair_possible = self.options.args.pair_resolve
-            && self.db.repeat_bwt().is_some()
-            && UNRESOLVED.with(|u| u.get()) >= self.options.args.unresolved_min_cores;
-        if self.range_extractor_fwd.bwt_eligible() || self.range_extractor_rev.bwt_eligible() || pair_possible {
-            let probe = |this: &mut Self, f: &[Seed], r: &[Seed], write: bool, stats: &mut Stats| {
-                DRY.with(|d| d.set(Some((0.0, 0.0, i64::MIN, write, false))));
-                this.align_from_seeds(rec_fwd, rec_rev, f, r, stats);
-                let (a1, a2, score, _, capped) = DRY.with(|d| d.take()).unwrap_or((0.0, 0.0, i64::MIN, write, false));
-                (a1, a2, score, capped)
-            };
-            // Written straight away when the output can take it back (SAM only); dry otherwise.
-            let mark = if self.output.has_a() { None } else { self.output.b.as_mut().and_then(|o| o.mark()) };
-            let (a1, a2, base_score, capped) = probe(self, &seeds_fwd, &seeds_rev, mark.is_some(), stats);
-            // (seeds, BWT_SEARCHED, PAIR_COMPLETE) of the result to write instead, and its score.
-            let mut chosen: Option<(Vec<Seed>, Vec<Seed>, bool, bool)> = None;
-            let mut chosen_score = base_score;
-            let min_ani = self.options.args.bwt_redo_ani;
-            if (self.range_extractor_fwd.bwt_eligible() || self.range_extractor_rev.bwt_eligible()) && !(a1 >= min_ani && a2 >= min_ani) {
-                let mut all = [seeds_fwd.clone(), seeds_rev.clone()];
-                let mut added = false;
-                for (m, rec) in [(0usize, rec_fwd), (1, rec_rev)] {
-                    let (re, se) = if m == 0 {
-                        (&mut self.range_extractor_fwd, &mut self.seed_extractor_fwd)
-                    } else {
-                        (&mut self.range_extractor_rev, &mut self.seed_extractor_rev)
-                    };
-                    let extra = re.bwt_extra(rec);
-                    if extra.is_empty() {
-                        continue;
-                    }
-                    let saved = se.take_seeds();
-                    se.generate(extra, stats);
-                    let new = se.take_seeds();
-                    se.put_seeds(saved);
-                    added |= !new.is_empty();
-                    all[m].extend(new);
-                    crate::align::common::sort_short_by_key(&mut all[m], |seed: &Seed| (seed.rval, seed.rpos));
-                }
-                if added {
-                    let score = probe(self, &all[0], &all[1], false, stats).2;
-                    if score > chosen_score {
-                        let [f, r] = all;
-                        chosen = Some((f, r, true, false));
-                        chosen_score = score;
-                    }
-                }
-            }
-            if pair_possible && capped {
-                if let Some((f, r, complete)) = self.paired_copy_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev) {
-                    let score = probe(self, &f, &r, false, stats).2;
-                    if score > chosen_score || (complete && score >= chosen_score) {
-                        chosen = Some((f, r, false, complete));
-                        chosen_score = score;
-                    }
-                }
-            }
-            let _ = chosen_score;
-            match (chosen, mark) {
-                (Some((f, r, bwt, complete)), _) => {
-                    if let Some(at) = mark {
-                        self.output.b.as_mut().unwrap().rollback(at);
-                    }
-                    BWT_SEARCHED.with(|u| u.set(bwt));
-                    PAIR_COMPLETE.with(|u| u.set(complete));
-                    self.align_from_seeds(rec_fwd, rec_rev, &f, &r, stats);
-                    PAIR_COMPLETE.with(|u| u.set(false));
-                }
-                // Already written.
-                (None, Some(_)) => {}
-                (None, None) => self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats),
-            }
-            if mark.is_some() {
-                self.output.b.as_mut().unwrap().release();
-            }
-        } else {
-            self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats);
-        }
-        // Replayed seeds (the sharded rejoin) come without a lookup, so without a count.
-        UNRESOLVED.with(|u| u.set(0));
+        self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats);
         SEEDLESS.with(|u| u.set(0));
         ALIGN_TOP_Y.with(|u| u.set(0));
         COPIES_CAP.with(|u| u.set(60));
-        BWT_SEARCHED.with(|u| u.set(false));
 
         self.seed_extractor_fwd.put_seeds(seeds_fwd);
         self.seed_extractor_rev.put_seeds(seeds_rev);
@@ -1728,87 +1633,6 @@ impl<
         } else {
             self.align_from_seeds_traced(rec_fwd, rec_rev, seeds_fwd, seeds_rev, stats);
         }
-    }
-
-    /// `--pair-resolve`: the seeds of both mates plus one per k-mer of each copy of a mate's long
-    /// exact stretches (`RepeatBwt::read_copies`) that makes a proper pair with a copy of the other
-    /// mate (one reference, opposite strands, within MAX_INSERT); None when no copies pair. The
-    /// flag: both mates' copies were listed whole.
-    fn paired_copy_seeds(
-        &mut self,
-        rec_fwd: &RefFastqRecord,
-        rec_rev: &RefFastqRecord,
-        seeds_fwd: &[Seed],
-        seeds_rev: &[Seed],
-    ) -> Option<(Vec<Seed>, Vec<Seed>, bool)> {
-        use crate::database::rbwt::{BwtScratch, ReadCopy};
-        let bwt = self.db.repeat_bwt()?;
-        let (min_len, max) = (self.options.args.pair_min_match as usize, self.options.args.pair_max_copies as usize);
-        let mut scratch = BwtScratch::default();
-        let (mut c1, mut c2) = (Vec::new(), Vec::new());
-        let ok1 = bwt.read_copies(rec_fwd.seq(), min_len, max, &mut scratch, &mut c1);
-        let ok2 = bwt.read_copies(rec_rev.seq(), min_len, max, &mut scratch, &mut c2);
-        // Every pair has its first mate at one of that mate's copies: one mate's list whole is
-        // enough for the pairs to be complete -- as long as each of its copies found a partner
-        // copy. A copy whose partner's list was cut short is dropped below, and with it maybe the
-        // true pair.
-        let complete_later = (ok1, ok2);
-        let (mut keep1, mut keep2) = (vec![false; c1.len()], vec![false; c2.len()]);
-        for (i, a) in c1.iter().enumerate() {
-            let from = c2.partition_point(|b| (b.rid, b.start) < (a.rid, a.start - MAX_INSERT));
-            for (k, b) in c2[from..].iter().enumerate() {
-                if b.rid != a.rid || b.start > a.start + MAX_INSERT {
-                    break;
-                }
-                if b.rc != a.rc {
-                    keep1[i] = true;
-                    keep2[from + k] = true;
-                }
-            }
-        }
-        if !keep1.iter().any(|&k| k) {
-            return None;
-        }
-        let strict = (complete_later.0 && complete_later.1)
-            || (complete_later.0 && keep1.iter().all(|&k| k))
-            || (complete_later.1 && keep2.iter().all(|&k| k));
-        // Complete on one mate only, with copies of it left unpaired: about 9 in 10 right on human
-        // (strict: about all) -- complete, but its MAPQ held to --pair-loose-mapq.
-        let complete = complete_later.0 || complete_later.1;
-        PAIR_LOOSE.with(|u| u.set(complete && !strict));
-        let k = C;
-        let mut starts = Vec::new();
-        let mut seeds_of = |copies: &[ReadCopy], keep: &[bool], base: &[Seed], len: usize, qs: &[usize]| {
-            let mut out = base.to_vec();
-            for (c, _) in copies.iter().zip(keep).filter(|(_, &kk)| kk) {
-                for &q in qs {
-                    if q + k > len {
-                        continue;
-                    }
-                    let off = if c.rc { len - q - k } else { q };
-                    if off < c.j as usize || off + k > c.e as usize || c.start + (off as i64) < 0 {
-                        continue;
-                    }
-                    out.push(Seed {
-                        rpos: (c.start + off as i64) as u64,
-                        rval: c.rid,
-                        qpos: q as u32,
-                        mismatch: 0,
-                        length: k as u8,
-                        flag: crate::align::data_structures::common::SEED_FROM_BWT,
-                    });
-                }
-            }
-            crate::align::common::sort_short_by_key(&mut out, |seed: &Seed| (seed.rval, seed.rpos));
-            out
-        };
-        starts.clear();
-        self.range_extractor_fwd.kmer_starts(&mut starts);
-        let f = seeds_of(&c1, &keep1, seeds_fwd, rec_fwd.seq().len(), &starts);
-        starts.clear();
-        self.range_extractor_rev.kmer_starts(&mut starts);
-        let r = seeds_of(&c2, &keep2, seeds_rev, rec_rev.seq().len(), &starts);
-        Some((f, r, complete))
     }
 
     fn align_from_seeds_traced(
@@ -2703,48 +2527,11 @@ impl<
             pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true, self.options.args.unpaired_penalty)
                 .min(self.options.args.tie_mapq_cap);
         }
-        // Cores the main index dropped and the repeat index could not resolve stand for copies
-        // seeding never saw, any of which may be the true locus. A pair placed on few seeds next to
-        // many such cores is placed among the copies it happened to see, not all of them.
-        let unresolved = UNRESOLVED.with(|u| u.get());
-        // Seeds from the repeat BWT do not count: they stand for copies of those same cores.
-        let support = extension_anchors.first().map_or(0, |b| {
-            b.0.as_ref().map_or(0, |a| a.seed_count - a.counter1 as u32) + b.1.as_ref().map_or(0, |a| a.seed_count - a.counter1 as u32)
-        });
         // The lowest cap applied below, for a MAPQ recomputed after the output's mate rescue.
         let mut mapq_ceiling: u8 = 60;
-        let pair_complete = PAIR_COMPLETE.with(|u| u.get());
-        // Mates the index and the repeat index gave no seed at all (every core dropped and its copies
-        // too many): placed by the BWT or a rescue only. Human: both mates so, 22 % right at MAPQ >= 1;
-        // one, 85 %; neither, 99 %.
+        // Mates the index gave no seed at all (every core dropped): placed by a rescue only.
         let seedless = SEEDLESS.with(|u| u.get());
         let seedless_cap = match seedless { 2 => self.options.args.seedless_pair_mapq, 1 => self.options.args.seedless_mate_mapq, _ => 60 };
-        if pair_complete && !extension_anchors.is_empty() {
-            // Every copy of the pair's long stretches was a candidate: the aligned margin is the MAPQ.
-            pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true, self.options.args.unpaired_penalty);
-            if PAIR_LOOSE.with(|u| u.get()) {
-                pseudo_mapq = pseudo_mapq.min(self.options.args.pair_loose_mapq);
-                mapq_ceiling = mapq_ceiling.min(self.options.args.pair_loose_mapq);
-            }
-        }
-        if !pair_complete && unresolved >= self.options.args.unresolved_min_cores && support < self.options.args.unresolved_max_seeds {
-            // Placed by the repeat BWT's copies among those the repeat index left open: lower still
-            // (measured on human: about half of these are right).
-            let cap = if BWT_SEARCHED.with(|u| u.get()) { self.options.args.bwt_unresolved_cap } else { self.options.args.unresolved_mapq_cap };
-            pseudo_mapq = pseudo_mapq.min(cap);
-            mapq_ceiling = mapq_ceiling.min(cap);
-        }
-        // A pair aligned with the repeat BWT's seeds was placed among the copies its matches
-        // listed, not among every copy a base or two from the read.
-        // Its copies were listed by the BWT, so the anchors' seed margin says little: take the
-        // margin between the best and the second-best aligned pair.
-        if BWT_SEARCHED.with(|u| u.get()) {
-            if !extension_anchors.is_empty() {
-                pseudo_mapq = pseudo_mapq.min(StdPairedAnchorMAPQ::mapq_from(extension_anchors, true, self.options.args.unpaired_penalty));
-            }
-            pseudo_mapq = pseudo_mapq.min(self.options.args.bwt_mapq_cap);
-            mapq_ceiling = mapq_ceiling.min(self.options.args.bwt_mapq_cap);
-        }
         pseudo_mapq = pseudo_mapq.min(seedless_cap);
         mapq_ceiling = mapq_ceiling.min(seedless_cap);
         // Not part of the ceiling: the rescue's runner-up search below still runs, and its MAPQ
@@ -3138,19 +2925,6 @@ impl<
         let rev_pass = rev_alone
             || (min_mate_bases < min_aligned_bases
                 && rev_out.as_ref().is_some_and(|m| ok_backed(m, fwd_alone)));
-        // A dry run (`run_pair` deciding whether the repeat BWT is needed): report what would be
-        // written, write nothing.
-        if let Some((_, _, _, write, _)) = DRY.with(|d| d.get()) {
-            let ani = |pass: bool, m: &Option<MateOut>| if pass { m.as_ref().map_or(0.0, |m| m.ani) } else { 0.0 };
-            // The pair's alignment score; a mate not written costs as much as the worst mate the
-            // identity gate lets through, so writing a mate always beats dropping it.
-            let unwritten = -(self.options.args.unpaired_penalty.max(0) as i64) - 1_000_000;
-            let score = |pass: bool, m: &Option<MateOut>| if pass { m.as_ref().map_or(unwritten, |m| m.anchor.score as i64) } else { unwritten };
-            DRY.with(|d| d.set(Some((ani(fwd_pass, &fwd_out), ani(rev_pass, &rev_out), score(fwd_pass, &fwd_out) + score(rev_pass, &rev_out), write, mapq_ceiling < 60))));
-            if !write {
-                return;
-            }
-        }
         if fwd_pass && !fwd_alone {
             stats.mate_backed_emitted += 1;
         }
@@ -3474,31 +3248,12 @@ fn prefetch_line(bytes: &[u8]) {
     }
 }
 
-/// Sets the unresolved repeat cores of the pair `align_from_seeds` aligns next on this thread: the
-/// sharded rejoin's count, gathered from the shards' evidence. `run_pair` sets its own.
-pub fn set_unresolved(n: usize) {
-    UNRESOLVED.with(|u| u.set(n));
-}
-
 thread_local! {
-    /// Unresolved repeat cores of the pair being aligned (`RangeExtractor::last_unresolved`, both
-    /// mates), set by `run_pair` for the MAPQ in `align_from_seeds`.
-    static UNRESOLVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static BWT_SEARCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set (to anything) around `align_from_seeds` to have it leave here the identity of each mate
-    /// it writes (0 for none), the pair's score and whether its MAPQ was capped as a repeat; with
-    /// the fourth field false (a dry run) it then writes nothing.
-    static DRY: std::cell::Cell<Option<(f64, f64, i64, bool, bool)>> = const { std::cell::Cell::new(None) };
-    /// Set while a pair is aligned from `paired_copy_seeds` whose candidates are complete.
-    static PAIR_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Mates of the pair being aligned without a seed from the index or the repeat index (0..=2).
+    /// Mates of the pair being aligned without a seed from the index (0..=2).
     static SEEDLESS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// `--adaptive`: the alignment window of the pair being aligned, when not --align-top-y (0).
     static ALIGN_TOP_Y: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// `--mapq-copies`: the MAPQ ceiling of the pair being aligned from its cores' copy counts.
     static COPIES_CAP: std::cell::Cell<u8> = const { std::cell::Cell::new(60) };
-    /// Set by `paired_copy_seeds`: its candidates are complete on one mate only, with copies of it
-    /// left unpaired.
-    static PAIR_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

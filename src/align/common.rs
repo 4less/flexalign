@@ -249,30 +249,9 @@ pub struct UniqueHit {
 
 pub trait RangeExtractor<const C: usize, const F: usize> {
     fn generate(&mut self, kmers: &[(usize, Kmer<C>)], rec: &RefFastqRecord, stats: &mut Stats) -> &[Range<'_, F>];
-    /// Of the k-mers the last `generate` looked up, those whose core the index dropped and the
-    /// repeat index could not resolve: copies of the read that seeding cannot see.
-    fn last_unresolved(&self) -> usize {
-        0
-    }
-    /// Whether the read of the last `generate` is one to search in the repeat BWT (`--repeat-bwt`):
-    /// enough of its cores left unresolved by the repeat index.
-    fn bwt_eligible(&self) -> bool {
-        false
-    }
-    /// (k-mers looked up, found in the index, repeat-index ranges, dropped cores left unresolved)
-    /// of the last `generate` (diagnostic).
-    fn last_counts(&self) -> (usize, usize, usize, usize) {
-        (0, 0, 0, 0)
-    }
     /// How many of the last `generate`'s index ranges have at most `limit` positions.
     fn ranges_at_most(&self, _limit: usize) -> usize {
         usize::MAX
-    }
-    /// The read positions of the k-mers the last `generate` looked up.
-    fn kmer_starts(&self, _out: &mut Vec<usize>) {}
-    /// The repeat BWT's ranges for the read of the last `generate` (searched now, on demand).
-    fn bwt_extra(&mut self, _rec: &RefFastqRecord) -> &[Range<'_, F>] {
-        &[]
     }
     /// The fast-hit lookup (`--fast-hit`): every position of every k-mer whose key has at most
     /// `max_positions` positions in the index (and so no flank headers), without materialising

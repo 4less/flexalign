@@ -7,7 +7,7 @@ use itertools::Itertools;
 
 use crate::align::{common::{penalties, Align, AlignStage, AlignTrace, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
 
-use super::common::{hamming, Seed, SEED_FROM_BWT};
+use super::common::{hamming, Seed};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -306,7 +306,7 @@ pub struct Anchor {
     pub orientation_set: bool,
     pub flagged_for_indel: bool,
     pub flag: u8, // 20
-    /// Seeds from the repeat BWT among `seed_count` (`SEED_FROM_BWT`).
+    /// Seeds not from the index among `seed_count` (a rescue's).
     pub counter1: u16,
     pub counter2: u16, // 24
     pub seeds: Vec<AnchorSeed>, // 40
@@ -330,7 +330,7 @@ impl Anchor {
             orientation_set: false,
             flagged_for_indel: false,
             flag: 0,
-            counter1: (seed.flag & SEED_FROM_BWT) as u16,
+            counter1: 0,
             counter2: 0,
             score: 0,
             seeds: vec! [AnchorSeed{ qpos: seed.qpos, rpos: seed.rpos, length: seed.length as u32 }],
@@ -357,7 +357,7 @@ impl Anchor {
             addr_of_mut!((*p).orientation_set).write(false);
             addr_of_mut!((*p).flagged_for_indel).write(false);
             addr_of_mut!((*p).flag).write(0);
-            addr_of_mut!((*p).counter1).write((seed.flag & SEED_FROM_BWT) as u16);
+            addr_of_mut!((*p).counter1).write(0);
             addr_of_mut!((*p).counter2).write(0);
             addr_of_mut!((*p).score).write(0);
             addr_of_mut!((*p).seeds).write(vec![AnchorSeed { qpos: seed.qpos, rpos: seed.rpos, length: seed.length as u32 }]);
@@ -1595,7 +1595,6 @@ impl Anchor {
 
     pub fn add_seed(&mut self, seed: &Seed, read_length: u32) {
         self.seed_count += 1;
-        self.counter1 += (seed.flag & SEED_FROM_BWT) as u16;
 
         let s: &mut AnchorSeed = self.seeds.first_mut().unwrap();
 

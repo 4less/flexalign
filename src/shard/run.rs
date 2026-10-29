@@ -25,9 +25,7 @@ use bioreader::utils::is_gzip;
 use flate2::read::GzDecoder;
 
 use crate::database::common::DBPaths;
-use crate::database::common::FlexalignDatabase;
 use crate::database::flexmap::DB;
-use crate::database::repeat::RepeatIndex;
 use crate::io::output_buffer::{OutputBuffer, OutputTarget};
 use crate::options::Options;
 use crate::shard::disk::{count_batches, run_disk_rejoin_align, run_shard_pass_to_disk};
@@ -147,33 +145,12 @@ pub fn run_sharded<
     let max_best_flex = options.args.max_best_flex.min(cap);
     let recovery = (options.args.min_ranges > 0).then(|| Recovery { min_ranges: options.args.min_ranges, flex: 128.min(cap) });
 
-    // --repeat-index: the repeat index must exist for this bundle and cap. It is never held whole:
-    // each shard reads its own keys of it (`load_window`), so the one-shard memory bound holds.
-    let repeat_file = options.args.repeat_index.then(|| {
-        let bundle = paths.bundle_file(format);
-        let t = Instant::now();
-        let how = RepeatIndex::ensure_built::<K, C, F, S, L>(&bundle, &options.reference, || {
-            let names: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = DB::load_reference_only(paths);
-            (1..).map_while(|i| names.get_rname(i).map(|n| (n.to_string(), i))).collect()
-        }, options.args.max_range_size as u64, threads as usize)
-        .unwrap_or_else(|e| panic!("repeat index of {bundle}: {e}"));
-        eprintln!("Repeat index {how} in {:.2}s: {}", t.elapsed().as_secs_f64(), crate::database::repeat::path_for(&bundle));
-        crate::database::repeat::path_for(&bundle)
-    });
-    let repeat_max = if options.args.repeat_index { options.args.repeat_bucket_max as usize } else { 0 };
-
     let t_pass = Instant::now();
     for (i, &range) in ranges.iter().enumerate() {
         let t_load = Instant::now();
-        let mut shard: ShardOf<C, F, CELLS_PER_BODY, HEADER_THRESHOLD> =
+        let shard: ShardOf<C, F, CELLS_PER_BODY, HEADER_THRESHOLD> =
             ShardOf::<C, F, CELLS_PER_BODY, HEADER_THRESHOLD>::load(paths, format, range, threads as usize)
                 .unwrap_or_else(|e| panic!("shard {i} ({}..{}): {e}", range.lo, range.hi));
-        if let Some(file) = &repeat_file {
-            let window = RepeatIndex::load_window(file, range.lo, range.hi)
-                .unwrap_or_else(|e| panic!("repeat index window {i} of {file}: {e}"));
-            eprintln!("  shard {i}: repeat window {} dropped cores, {} positions", window.key_count(), window.entries());
-            shard = shard.with_repeat(window);
-        }
         eprintln!(
             "  shard {i}: keys {}..{}, {:.2} GB read in {:.2}s",
             range.lo, range.hi, shard.memory_bytes() as f64 / 1e9, t_load.elapsed().as_secs_f64()
@@ -185,7 +162,7 @@ pub fn run_sharded<
                 Box<dyn Read + Send>,
             >(
                 open_reads(&s.r1), open_reads(&s.r2), &shard, s.n_batches, &evidence[i][j],
-                READ_BATCH_BYTES, threads, max_best_flex, recovery, MAX_HEADERED, repeat_max,
+                READ_BATCH_BYTES, threads, max_best_flex, recovery, MAX_HEADERED,
             )
             .expect("shard pass");
             eprintln!(

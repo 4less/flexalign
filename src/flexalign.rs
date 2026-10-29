@@ -169,25 +169,12 @@ pub fn run(args: Args) {
     let build = options.args.force_build || !index_compatible;
 
     // Build or load database
-    // The repeat index is part of the load: its time counts in "Loading index took".
-    let attach_repeat = |db: &mut DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>| {
-        if options.args.repeat_index {
-            db.attach_repeat_index(&db_paths, &options.reference, options.args.max_range_size, options.args.threads as usize);
-        }
-        if options.args.repeat_bwt {
-            db.attach_repeat_bwt(
-                &db_paths, &options.reference, options.args.max_range_size,
-                options.args.bwt_read_len, options.args.bwt_min_dropped, options.args.threads as usize,
-            );
-        }
-    };
     let db: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = match build {
         true => {
             
-            let (_duration, mut result) = 
+            let (_duration, result) = 
                 time(|| DB::build(&options));
             let _ = result.save(&db_paths, GLOBAL_VERSION);
-            attach_repeat(&mut result);
             result
 
         },
@@ -195,9 +182,7 @@ pub fn run(args: Args) {
             eprintln!("Load index.");
             let (duration, result) =
                 time(|| {
-                    let mut db = DB::load(&db_paths, GLOBAL_VERSION);
-                    attach_repeat(&mut db);
-                    db
+                    DB::load(&db_paths, GLOBAL_VERSION)
                 });
             eprintln!("Loading index took: {:?}", duration);
             result
@@ -272,9 +257,6 @@ fn run_sharded<
     const CELLS_PER_BODY: u64,
     const HEADER_THRESHOLD: usize,
 >(db_paths: &DBPaths, options: &Options, n_shards: usize) {
-    if options.args.repeat_bwt {
-        log::warn!("--repeat-bwt is not used by sharded runs yet: the repeat index alone seeds dropped cores");
-    }
     let pairs = sharded_pairs(options);
     if pairs.is_empty() {
         eprintln!("Sharded alignment is paired-end only: give -1 and -2.");

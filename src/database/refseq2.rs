@@ -412,8 +412,6 @@ pub fn reset_scratch() {
         let mut s = s.borrow_mut();
         s.seen.clear();
         s.windows.clear();
-        // The repeat BWT's ranges of the previous read go with it.
-        super::rbwt::reset_scratch();
         s.chunks.truncate(1);
         s.chunk = 0;
         s.used = 0;

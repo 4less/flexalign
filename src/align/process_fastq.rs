@@ -237,13 +237,11 @@ pub fn process_fastq_wrapper_modular<
         let mut pass_started = input_started;
 
 
-        let repeat_max = if options.args.repeat_index { options.args.repeat_bucket_max as usize } else { 0 };
-        let bwt_max = if options.args.repeat_bwt { options.args.bwt_max_locate as usize } else { 0 };
         let mut modular_fwd = Modular {
             options,
             db,
             kmer_extractor: SyncmerKmerExtractor::<K, C, S, L>::default(),
-            range_extractor: StdRangeExtractor::<K, C, F, FM>::new(db).with_repeat(repeat_max).with_bwt(bwt_max),
+            range_extractor: StdRangeExtractor::<K, C, F, FM>::new(db),
             seed_extractor: StdSeedExtractor::<K, C, F>::new(
                 options.args.max_best_flex,
                 options.args.max_range_size,
@@ -283,7 +281,7 @@ pub fn process_fastq_wrapper_modular<
                     options,
                     db,
                     kmer_extractor: SyncmerKmerExtractor::<K, C, S, L>::default(),
-                    range_extractor: StdRangeExtractor::<K, C, F, FM>::new(db).with_repeat(repeat_max).with_bwt(bwt_max),
+                    range_extractor: StdRangeExtractor::<K, C, F, FM>::new(db),
                     seed_extractor: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,
@@ -305,8 +303,8 @@ pub fn process_fastq_wrapper_modular<
                     db,
                     kmer_extractor_fwd: SyncmerKmerExtractor::<K, C, S, L>::default(),
                     kmer_extractor_rev: SyncmerKmerExtractor::<K, C, S, L>::default(),
-                    range_extractor_fwd: StdRangeExtractor::<K, C, F, FM>::new(db).with_repeat(repeat_max).with_bwt(bwt_max),
-                    range_extractor_rev: StdRangeExtractor::<K, C, F, FM>::new(db).with_repeat(repeat_max).with_bwt(bwt_max),
+                    range_extractor_fwd: StdRangeExtractor::<K, C, F, FM>::new(db),
+                    range_extractor_rev: StdRangeExtractor::<K, C, F, FM>::new(db),
                     seed_extractor_fwd: StdSeedExtractor::<K, C, F>::new(
                         options.args.max_best_flex,
                         options.args.max_range_size,

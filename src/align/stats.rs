@@ -131,10 +131,6 @@ pub struct Stats {
     /// Overhang rescue: lone placed mates whose partner was searched next to them, and found.
     pub overhang_rescue_attempted: usize,
     pub overhang_rescue_found: usize,
-    /// `--repeat-index`: cores the main index dropped, met by reads, and those left unresolved
-    /// (their exact K-mer run empty or over --repeat-bucket-max).
-    pub repeat_cores: usize,
-    pub repeat_unresolved: usize,
     /// `--adaptive`: pairs given the larger flank-tie limit and alignment window.
     pub adaptive_pairs: usize,
     pub adaptive_tied: usize,
@@ -314,8 +310,6 @@ impl Stats {
             ("rescue_succeeded",            self.rescue_succeeded as f64, "count"),
             ("overhang_rescue_attempted",   self.overhang_rescue_attempted as f64, "count"),
             ("overhang_rescue_found",       self.overhang_rescue_found as f64, "count"),
-            ("repeat_cores",                self.repeat_cores as f64, "count"),
-            ("repeat_unresolved",           self.repeat_unresolved as f64, "count"),
             ("adaptive_pairs",              self.adaptive_pairs as f64, "count"),
             ("adaptive_tied",               self.adaptive_tied as f64, "count"),
             ("rescue_skipped_weak",         self.rescue_skipped_weak as f64, "count"),
@@ -469,8 +463,6 @@ impl Merge for Stats {
         self.rescue_succeeded += other.rescue_succeeded;
         self.overhang_rescue_attempted += other.overhang_rescue_attempted;
         self.overhang_rescue_found += other.overhang_rescue_found;
-        self.repeat_cores += other.repeat_cores;
-        self.repeat_unresolved += other.repeat_unresolved;
         self.adaptive_pairs += other.adaptive_pairs;
         self.adaptive_tied += other.adaptive_tied;
         self.rescue_skipped_weak += other.rescue_skipped_weak;
@@ -619,9 +611,7 @@ impl Display for Stats {
             ....fired though a full pair existed........{:?}\n\
             ....pairing: one side grouped to 0 anchors..{:?}\n\
             ....pairing: ^ and other side had several...{:?}\n\
-            ....pairing: no pair within insert size.....{:?}\n\
-            Repeat cores met (--repeat-index)...........{:?}\n\
-            ....left unresolved (no or too many hits)...{:?}\n\n\
+            ....pairing: no pair within insert size.....{:?}\n\n\
             Total Reads.................................{:?}\n\
             Total Alignments............................{:?}\n\
             Total Alignments successful.................{:?}\n\
@@ -659,8 +649,6 @@ impl Display for Stats {
             self.pair_leak_empty_side,
             self.pair_leak_multi_empty,
             self.pair_leak_insert_size,
-            self.repeat_cores,
-            self.repeat_unresolved,
             self.reads_processed,
             self.alignments,
             self.alignments_successful,
@@ -746,8 +734,6 @@ impl Default for Stats {
             rescue_succeeded: 0,
             overhang_rescue_attempted: 0,
             overhang_rescue_found: 0,
-            repeat_cores: 0,
-            repeat_unresolved: 0,
             adaptive_pairs: 0,
             adaptive_tied: 0,
             rescue_skipped_weak: 0,

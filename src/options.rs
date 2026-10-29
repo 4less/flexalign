@@ -125,21 +125,6 @@ pub struct Args {
     #[arg(long = "tie-mapq-cap", default_value_t = 0)]
     pub tie_mapq_cap: u8,
 
-    /// With `--repeat-index`: MAPQ ceiling for a pair with at least `--unresolved-min-cores` cores
-    /// the repeat index could not resolve and fewer than `--unresolved-max-seeds` seeds behind its
-    /// placement. Such a pair was placed among the copies seeding saw, and the copy it came from
-    /// may be one it did not (human: 83 % of these right, against 99-100 % for other pairs).
-    #[arg(long = "unresolved-mapq-cap", default_value_t = 3)]
-    pub unresolved_mapq_cap: u8,
-
-    /// See `--unresolved-mapq-cap`.
-    #[arg(long = "unresolved-min-cores", default_value_t = 6)]
-    pub unresolved_min_cores: usize,
-
-    /// See `--unresolved-mapq-cap`.
-    #[arg(long = "unresolved-max-seeds", default_value_t = 10)]
-    pub unresolved_max_seeds: u32,
-
     /// Do not write a mate the winning pair has no usable alignment for from its own best aligned
     /// candidate (the lone mate fallback); leave it unmapped.
     #[arg(long = "no-lone-mate-fallback", action)]
@@ -149,55 +134,6 @@ pub struct Args {
     /// rescue: the partner's marker, within the insert size, the mate allowed to run off its end).
     #[arg(long = "no-overhang-rescue", action)]
     pub no_overhang_rescue: bool,
-
-    /// Seed the cores the index drops for having more than --max-range-size positions (young
-    /// repeats: LINE-1, satellites) from a repeat index kept next to the index as `<index>.repeat`,
-    /// built on the first run that asks for it. A read's core then finds the positions where its
-    /// whole K-mer (core and flanks) occurs.
-    #[arg(long = "repeat-index", action)]
-    pub repeat_index: bool,
-
-    /// Most positions a repeat core's exact K-mer may have to be used as seeds (at most 128);
-    /// more leave the core unresolved (`--repeat-index`).
-    #[arg(long = "repeat-bucket-max", default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=128))]
-    pub repeat_bucket_max: u16,
-
-    /// Seed reads from regions dense in dropped cores (young repeats) with an FM-index of those
-    /// regions, kept next to the index as `<index>.rbwt` and built on the first run that asks for
-    /// it. A read's match is extended along the read until it tells the copies apart, so copies
-    /// identical over 31 bases but not over the read are resolved. With `--repeat-index`: the BWT
-    /// is asked only about the cores the repeat index leaves unresolved.
-    #[arg(long = "repeat-bwt", action)]
-    pub repeat_bwt: bool,
-
-    /// `--repeat-bwt`: a read is searched when it carries at least this many dropped cores, and the
-    /// index holds the regions where a read would (fewer are placed by the read's other cores).
-    #[arg(long = "bwt-min-dropped", default_value_t = 8)]
-    pub bwt_min_dropped: u32,
-
-    /// `--repeat-bwt`: the read length the indexed regions are sized for (a K-mer's region reaches
-    /// this far less K either side). Longer reads still work; their matches stop at a region's end.
-    #[arg(long = "bwt-read-len", default_value_t = 150)]
-    pub bwt_read_len: u32,
-
-    /// `--repeat-bwt`: a match is turned into positions when it has at most this many occurrences;
-    /// more leave its cores unresolved (counted for the MAPQ cap, as with `--repeat-index`).
-    #[arg(long = "bwt-max-locate", default_value_t = 8)]
-    pub bwt_max_locate: u32,
-
-    /// `--repeat-bwt`: a pair whose mates both align at this identity without the BWT's seeds is
-    /// not tried with them (else the result with them is kept when its pair score is better).
-    #[arg(long = "bwt-redo-ani", default_value_t = 0.99)]
-    pub bwt_redo_ani: f64,
-
-    /// `--repeat-bwt`: the unresolved-repeat MAPQ ceiling (`--unresolved-mapq-cap`) for a pair
-    /// written from the BWT's seeds.
-    #[arg(long = "bwt-unresolved-cap", default_value_t = 1)]
-    pub bwt_unresolved_cap: u8,
-
-    /// `--repeat-bwt`: MAPQ ceiling of a pair written from the BWT's seeds.
-    #[arg(long = "bwt-mapq-cap", default_value_t = 60)]
-    pub bwt_mapq_cap: u8,
 
     /// Minimum number of read bases an alignment must actually place for the record to be emitted.
     ///
@@ -432,26 +368,6 @@ pub struct Args {
     #[arg(long = "rescue-mapq", action)]
     pub rescue_mapq: bool,
 
-    /// With `--repeat-bwt`: a pair left under the unresolved-repeat MAPQ cap is resolved as a pair --
-    /// every copy of each mate's long exact stretches listed by the BWT, kept where the mates'
-    /// copies make proper pairs -- and, when those lists are complete, given the aligned margin as
-    /// MAPQ instead of the cap.
-    #[arg(long = "pair-resolve", action)]
-    pub pair_resolve: bool,
-
-    /// `--pair-resolve`: MAPQ ceiling of a pair resolved on one mate's copies only, some of them left
-    /// without a partner copy (about 9 in 10 right on human).
-    #[arg(long = "pair-loose-mapq", default_value_t = 20)]
-    pub pair_loose_mapq: u8,
-
-    /// `--pair-resolve`: the shortest exact stretch of a mate whose copies are listed.
-    #[arg(long = "pair-min-match", default_value_t = 40)]
-    pub pair_min_match: u32,
-
-    /// `--pair-resolve`: most copies of a stretch listed; one with more leaves the pair incomplete.
-    #[arg(long = "pair-max-copies", default_value_t = 128)]
-    pub pair_max_copies: u32,
-
     /// MAPQ ceiling of a mate whose partner is unmapped or not within 1 kb of it (255: off). On a
     /// genome such mates are mostly wrong at any MAPQ; on a marker database a mate hanging off the
     /// end of a gene often is not, hence off by default.
@@ -463,8 +379,8 @@ pub struct Args {
     #[arg(long = "complete-singles", action)]
     pub complete_singles: bool,
 
-    /// MAPQ ceiling of a pair neither of whose mates got a seed from the index or the repeat index
-    /// (placed by the repeat BWT or a rescue alone).
+    /// MAPQ ceiling of a pair neither of whose mates got a seed from the index (placed by a rescue
+    /// alone).
     #[arg(long = "seedless-pair-mapq", default_value_t = 60)]
     pub seedless_pair_mapq: u8,
 
