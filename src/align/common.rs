@@ -259,6 +259,15 @@ pub trait RangeExtractor<const C: usize, const F: usize> {
     fn bwt_eligible(&self) -> bool {
         false
     }
+    /// (k-mers looked up, found in the index, repeat-index ranges, dropped cores left unresolved)
+    /// of the last `generate` (diagnostic).
+    fn last_counts(&self) -> (usize, usize, usize, usize) {
+        (0, 0, 0, 0)
+    }
+    /// How many of the last `generate`'s index ranges have at most `limit` positions.
+    fn ranges_at_most(&self, _limit: usize) -> usize {
+        usize::MAX
+    }
     /// The read positions of the k-mers the last `generate` looked up.
     fn kmer_starts(&self, _out: &mut Vec<usize>) {}
     /// The repeat BWT's ranges for the read of the last `generate` (searched now, on demand).
@@ -290,6 +299,16 @@ pub trait SeedExtractor<const F: usize> {
     /// `&mut self` elsewhere can hold them without copying; `put_seeds` returns the allocation.
     fn take_seeds(&mut self) -> Vec<Seed>;
     fn put_seeds(&mut self, seeds: Vec<Seed>);
+    /// The flank-tie limit (`--max-best-flex`), and setting it (`--adaptive`).
+    fn max_best_flex(&self) -> usize {
+        0
+    }
+    fn set_max_best_flex(&mut self, _v: usize) {}
+    /// The last `generate`: (ranges that gave seeds, ranges dropped for more flank ties than the
+    /// limit) -- the latter are cores with more equally good copies than were looked at.
+    fn last_ties(&self) -> (usize, usize) {
+        (0, 0)
+    }
 }
 
 pub trait AnchorExtractor {

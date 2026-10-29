@@ -1531,15 +1531,82 @@ impl<
         // Taken out of the extractors (not copied) for the duration of the `&mut self` call below,
         // and put back afterwards so their capacity is reused: two `to_vec()` per pair were a
         // visible share of the allocator time.
+        // --adaptive: a pair with a mate none of whose index ranges has at most
+        // --adaptive-multiplicity positions -- every core of it a repeat of hundreds or thousands of
+        // copies -- is the kind seeding misses the true copy of and the alignment window ranks it
+        // out of: it gets more flank ties kept per core and more candidates aligned. The others
+        // keep the defaults, so the effort stays with the reads that need it.
+        let lim = self.options.args.adaptive_multiplicity;
+        let hard = |ranges: &[crate::align::process::range_extractor::Range<F>]| !ranges.iter().any(|r| !r.repeat && r.vrange.len() <= lim);
+        let difficult = self.options.args.adaptive && (hard(ranges_fwd) || hard(ranges_rev));
+        // The fewest copies of any core a mate kept (0: none kept).
+        let minmult = |ranges: &[crate::align::process::range_extractor::Range<F>]| ranges.iter().filter(|r| !r.repeat).map(|r| r.vrange.len()).min().unwrap_or(0);
+        let (minmult_fwd, minmult_rev) = (minmult(ranges_fwd), minmult(ranges_rev));
+        // --mapq-copies: a pair whose mates' least repeated cores have many copies is placed among
+        // copies seeding did not all reach. Its MAPQ ceiling falls with the log of both counts (a
+        // mate with no core kept counts as --max-range-size copies). Human, cap 4096: a pair whose
+        // best mate has a core of at most 16 copies is wrong 0.3-4 % of the time, one whose best
+        // has more than 256 about 20 %.
+        if self.options.args.mapq_copies > 0 {
+            let full = self.options.args.max_range_size.max(1);
+            let l = |x: usize| ((if x == 0 { full } else { x }) as f64).log2();
+            let (lo, hi) = (l(minmult_fwd).min(l(minmult_rev)), l(minmult_fwd).max(l(minmult_rev)));
+            let q = self.options.args.mapq_copies as f64 - self.options.args.mapq_copies_lo * lo - self.options.args.mapq_copies_hi * hi;
+            COPIES_CAP.with(|u| u.set(q.clamp(0.0, 60.0) as u8));
+        }
+        let default_flex = self.seed_extractor_fwd.max_best_flex();
+        if difficult {
+            stats.adaptive_pairs += 1;
+            self.seed_extractor_fwd.set_max_best_flex(self.options.args.adaptive_flex);
+            self.seed_extractor_rev.set_max_best_flex(self.options.args.adaptive_flex);
+            ALIGN_TOP_Y.with(|u| u.set(self.options.args.adaptive_top_y));
+        }
         let (duration, _) = stage_time(|| self.seed_extractor_fwd.generate(ranges_fwd, stats));
         stats.time_range_header += duration;
         let (duration, _) = stage_time(|| self.seed_extractor_rev.generate(ranges_rev, stats));
         stats.time_range_header += duration;
+        // A mate every core of which was dropped for more equally good flank copies than even the
+        // recovery pass keeps: its copies are many, and the true one is among them only if all
+        // are looked at. --adaptive-ties keeps up to that many; the partner places it among them.
+        let ties = self.options.args.adaptive_ties;
+        if self.options.args.adaptive && ties > 0 {
+            for fwd in [true, false] {
+                let (se, ranges) = if fwd { (&mut self.seed_extractor_fwd, ranges_fwd) } else { (&mut self.seed_extractor_rev, ranges_rev) };
+                let (seeded, tied) = se.last_ties();
+                if seeded == 0 && tied > 0 {
+                    stats.adaptive_tied += 1;
+                    se.set_max_best_flex(ties);
+                    let (duration, _) = stage_time(|| se.generate(ranges, stats));
+                    stats.time_range_header += duration;
+                    se.set_max_best_flex(default_flex);
+                }
+            }
+        }
+        if difficult {
+            self.seed_extractor_fwd.set_max_best_flex(default_flex);
+            self.seed_extractor_rev.set_max_best_flex(default_flex);
+        }
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
         stats.seeds += seeds_fwd.len() + seeds_rev.len();
 
         UNRESOLVED.with(|u| u.set(self.range_extractor_fwd.last_unresolved() + self.range_extractor_rev.last_unresolved()));
+        // Seedless: no seed at all -- or, with --seedless-multiplicity N, none from a core of at
+        // most N positions (with a raised --max-range-size, a mate seeded only by cores of
+        // thousands of copies is placed among the copies its seeds reached).
+        let lim = self.options.args.seedless_multiplicity;
+        let seedless_mate = |seeds: &[Seed], re: &RE| seeds.is_empty() || (lim > 0 && re.ranges_at_most(lim) == 0);
+        SEEDLESS.with(|u| u.set(seedless_mate(&seeds_fwd, &self.range_extractor_fwd) as u8 + seedless_mate(&seeds_rev, &self.range_extractor_rev) as u8));
+        if std::env::var_os("FA_READ_STATS").is_some() {
+            let (a, b) = (self.range_extractor_fwd.last_counts(), self.range_extractor_rev.last_counts());
+            let (ta, tb) = (self.seed_extractor_fwd.last_ties(), self.seed_extractor_rev.last_ties());
+            eprintln!("READMULT\t{}\t{}\t{}",
+                String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').split('/').next().unwrap_or(""),
+                minmult_fwd, minmult_rev);
+            eprintln!("READSTAT\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').split('/').next().unwrap_or(""),
+                a.0, a.1, a.2, a.3, seeds_fwd.len(), b.0, b.1, b.2, b.3, seeds_rev.len(), ta.0, ta.1, tb.0, tb.1);
+        }
         // Seeds from the repeat BWT compete only on the alignment. A pair the BWT may help is
         // aligned as seeded (written at once when the output can take it back, else a dry run) and
         // then, as needed, again with the BWT's extra seeds, each a dry run; another result is
@@ -1632,6 +1699,9 @@ impl<
         }
         // Replayed seeds (the sharded rejoin) come without a lookup, so without a count.
         UNRESOLVED.with(|u| u.set(0));
+        SEEDLESS.with(|u| u.set(0));
+        ALIGN_TOP_Y.with(|u| u.set(0));
+        COPIES_CAP.with(|u| u.set(60));
         BWT_SEARCHED.with(|u| u.set(false));
 
         self.seed_extractor_fwd.put_seeds(seeds_fwd);
@@ -2277,10 +2347,11 @@ impl<
             + &extension_anchors[0].1.as_ref().map_or(0, |a| a.score);
 
 
+        let top_y = match ALIGN_TOP_Y.with(|u| u.get()) { 0 => self.options.args.align_top_y, y => y };
         // Assumes sorted anchors !!
         let anchors_len: usize = extension_anchors.len();
         let mut alignment_anchors =
-            &mut extension_anchors[0..min(self.options.args.align_top_y, anchors_len)];
+            &mut extension_anchors[0..min(top_y, anchors_len)];
         if STAGE_TRACE {
             stats.trace_counts.align_window_pairs += alignment_anchors.len();
             for AnchorPair(a1, a2) in alignment_anchors.iter() {
@@ -2643,6 +2714,11 @@ impl<
         // The lowest cap applied below, for a MAPQ recomputed after the output's mate rescue.
         let mut mapq_ceiling: u8 = 60;
         let pair_complete = PAIR_COMPLETE.with(|u| u.get());
+        // Mates the index and the repeat index gave no seed at all (every core dropped and its copies
+        // too many): placed by the BWT or a rescue only. Human: both mates so, 22 % right at MAPQ >= 1;
+        // one, 85 %; neither, 99 %.
+        let seedless = SEEDLESS.with(|u| u.get());
+        let seedless_cap = match seedless { 2 => self.options.args.seedless_pair_mapq, 1 => self.options.args.seedless_mate_mapq, _ => 60 };
         if pair_complete && !extension_anchors.is_empty() {
             // Every copy of the pair's long stretches was a candidate: the aligned margin is the MAPQ.
             pseudo_mapq = StdPairedAnchorMAPQ::mapq_from(extension_anchors, true, self.options.args.unpaired_penalty);
@@ -2669,6 +2745,12 @@ impl<
             pseudo_mapq = pseudo_mapq.min(self.options.args.bwt_mapq_cap);
             mapq_ceiling = mapq_ceiling.min(self.options.args.bwt_mapq_cap);
         }
+        pseudo_mapq = pseudo_mapq.min(seedless_cap);
+        mapq_ceiling = mapq_ceiling.min(seedless_cap);
+        // Not part of the ceiling: the rescue's runner-up search below still runs, and its MAPQ
+        // is held under this cap too.
+        let copies_cap = COPIES_CAP.with(|u| u.get());
+        pseudo_mapq = pseudo_mapq.min(copies_cap);
 
         if self.options.args.dump_anchors {
             // One write per read: worker threads share stderr, and a single formatted string keeps
@@ -2885,7 +2967,7 @@ impl<
         // (or whose partner has none) never share a pair, and against minibwa this was a third of
         // the reads flexalign missed. Such a mate now takes its own best alignment in the window; it
         // is written as a lone mate, so --lone-mate-mapq-penalty applies to it.
-        let aligned_window = &extension_anchors[..min(self.options.args.align_top_y, extension_anchors.len())];
+        let aligned_window = &extension_anchors[..min(top_y, extension_anchors.len())];
         let fallback = !self.options.args.no_lone_mate_fallback;
         // The winning pair's mates first; the fallback only for a mate the rescue next to its
         // partner (below) does not place either -- a mate's best alignment elsewhere, taken before
@@ -3002,7 +3084,7 @@ impl<
                     // Whole mismatches only: a margin below one is a tie.
                     (per_mm * ((alt_cost - best_cost).max(0) / mm_cost)).min(60)
                 };
-                pseudo_mapq = (q as u8).min(mapq_ceiling);
+                pseudo_mapq = (q as u8).min(mapq_ceiling).min(copies_cap);
             }
         }
 
@@ -3409,6 +3491,12 @@ thread_local! {
     static DRY: std::cell::Cell<Option<(f64, f64, i64, bool, bool)>> = const { std::cell::Cell::new(None) };
     /// Set while a pair is aligned from `paired_copy_seeds` whose candidates are complete.
     static PAIR_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mates of the pair being aligned without a seed from the index or the repeat index (0..=2).
+    static SEEDLESS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// `--adaptive`: the alignment window of the pair being aligned, when not --align-top-y (0).
+    static ALIGN_TOP_Y: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `--mapq-copies`: the MAPQ ceiling of the pair being aligned from its cores' copy counts.
+    static COPIES_CAP: std::cell::Cell<u8> = const { std::cell::Cell::new(60) };
     /// Set by `paired_copy_seeds`: its candidates are complete on one mate only, with copies of it
     /// left unpaired.
     static PAIR_LOOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

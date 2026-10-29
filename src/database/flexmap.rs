@@ -757,6 +757,13 @@ impl<
     /// Loads the repeat BWT of this index (`<index>.rbwt`), building it first when it is missing or
     /// was built from another index or with other parameters (`--repeat-bwt`).
     pub fn attach_repeat_bwt(&mut self, paths: &DBPaths, reference: &std::path::Path, cap: usize, read_len: u32, min_dropped: u32, threads: usize) {
+        if let Some(spec) = std::env::var_os("FA_LOCUS_STATS") {
+            let spec = spec.to_string_lossy().to_string();
+            let (truth, out) = spec.split_once(':').expect("FA_LOCUS_STATS=<truth>:<out>");
+            let rid_of: HashMap<String, usize> = (1..).map_while(|i| self.get_rname(i).map(|n| (n.to_string(), i))).collect();
+            super::rbwt::locus_core_stats::<K, C, F, S, L>(reference, &rid_of, cap as u64, read_len as usize, truth, out, threads);
+            std::process::exit(0);
+        }
         let format = index_format();
         let index_file = if format == IndexFormat::Blob { paths.index_blob_file() } else { paths.bundle_file(format) };
         let (duration, (bwt, how)) = time(|| {

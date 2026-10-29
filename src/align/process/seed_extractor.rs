@@ -261,8 +261,16 @@ impl<'a, const F: usize> Range<'a, F> {
     ) -> RangeVerdict {
         match self.vrange.has_header() {
             true => {
-                let mut idx = [0u32; MAX_KEPT_TIES];
-                match self.resolve_flex(max_best_flex, flank_slack, dist_buf, &mut idx) {
+                let mut small = [0u32; MAX_KEPT_TIES];
+                // `--adaptive-ties` keeps more than the stack buffer holds; rare, so it allocates.
+                let mut big = Vec::new();
+                let idx: &mut [u32] = if max_best_flex <= MAX_KEPT_TIES {
+                    &mut small
+                } else {
+                    big.resize(max_best_flex, 0);
+                    &mut big
+                };
+                match self.resolve_flex(max_best_flex, flank_slack, dist_buf, idx) {
                     None => RangeVerdict::Discarded,
                     Some((_min_dist, n)) => {
                         for &i in &idx[..n] {
@@ -303,6 +311,8 @@ pub struct StdSeedExtractor<const K: usize, const C: usize, const F: usize> {
     /// Reused per-flank distance scratch for the single-pass flex resolution (avoids reallocating
     /// per range/read).
     flex_scratch: Vec<u8>,
+    /// The last `generate`'s (ranges seeded, ranges dropped for too many flank ties).
+    last_ties: (usize, usize),
 }
 
 impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
@@ -316,6 +326,7 @@ impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
             mask_flank_mult,
             flank_slack,
             flex_scratch: Vec::new(),
+            last_ties: (0, 0),
         }
     }
 
@@ -362,6 +373,7 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
             self.max_range_size,
             stats
         );
+        self.last_ties = (retrieved_ranges, discarded_max_flex_count);
 
         if retrieved_ranges < self.min_ranges && discarded_max_flex_count > 0  {
             // eprintln!("----------------- Recover Ranges....");
@@ -372,6 +384,7 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
                 self.max_range_size,
                 stats
             );
+            self.last_ties = (_ranges, _discarded_max_flex_count);
             // eprintln!("{} -> {} (Still discarded: {})", old_ranges, ranges, discarded_max_flex_count);
         }
         
@@ -401,6 +414,18 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
 
     fn put_seeds(&mut self, seeds: Vec<Seed>) {
         self.seeds = seeds;
+    }
+
+    fn max_best_flex(&self) -> usize {
+        self.max_best_flex
+    }
+
+    fn set_max_best_flex(&mut self, v: usize) {
+        self.max_best_flex = v;
+    }
+
+    fn last_ties(&self) -> (usize, usize) {
+        self.last_ties
     }
 }
 

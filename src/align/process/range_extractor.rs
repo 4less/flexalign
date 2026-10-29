@@ -120,6 +120,15 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
         self.bwt_max_locate > 0 && self.db.repeat_bwt().is_some_and(|b| self.unresolved_at.len() >= b.min_dropped())
     }
 
+    fn last_counts(&self) -> (usize, usize, usize, usize) {
+        let repeat = self.ranges.iter().filter(|r| r.repeat && !r.bwt).count();
+        (self.key_info.len(), self.ranges.len() - repeat, repeat, self.last_unresolved)
+    }
+
+    fn ranges_at_most(&self, limit: usize) -> usize {
+        self.ranges.iter().filter(|r| !r.repeat && r.vrange.len() <= limit).count()
+    }
+
     fn kmer_starts(&self, out: &mut Vec<usize>) {
         out.extend(self.key_info.iter().map(|k| k.0));
     }
@@ -226,6 +235,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
         let db: &'a D = self.db;
         let (ranges, key_info, keys) = (&mut self.ranges, &self.key_info, &self.keys);
         let repeat_max = self.repeat_max;
+        let bwt_only = repeat_max == 0 && self.bwt_max_locate > 0;
         let (missing, missing_at) = (&mut self.missing, &mut self.missing_at);
         missing.clear();
         missing_at.clear();
@@ -236,13 +246,26 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
                 let (qpos, fmer) = (key_info[i].0, key_info[i].1.clone());
                 let range_size = range.len() as u32;
                 ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: false, bwt: false });
-            } else if repeat_max > 0 {
+            } else if repeat_max > 0 || bwt_only {
                 missing.push((keys[i], key_info[i].1.0 as u32));
                 missing_at.push(i);
             }
         });
+        // Without a repeat index (--repeat-bwt alone), every key the index lacks that the BWT knows
+        // as dropped is unresolved: the BWT is the only way to its copies.
+        if bwt_only && !missing.is_empty() {
+            if let Some(bwt) = db.repeat_bwt() {
+                for (j, &(key, _)) in missing.iter().enumerate() {
+                    if bwt.is_dropped(key) {
+                        self.repeat_cores += 1;
+                        self.repeat_unresolved += 1;
+                        unresolved_at.push(missing_at[j]);
+                    }
+                }
+            }
+        }
         // The keys the index lacks, asked of the repeat index together (their lookups overlap).
-        if !missing.is_empty() {
+        if repeat_max > 0 && !missing.is_empty() {
             let (mut repeat_cores, mut repeat_unresolved) = (0usize, 0usize);
             db.repeat_lookup_batch(missing, repeat_max, &mut |j, found| {
                 repeat_cores += 1;

@@ -500,6 +500,113 @@ pub fn reset_scratch() {
     });
 }
 
+// --- Analysis ---
+
+/// FA_LOCUS_STATS=<truth.tsv>:<out.tsv> (diagnostic): for every truth mate (read_id, mate, contig,
+/// 1-based pos) the cores the read's span holds on the reference -- kept by the main index (at most
+/// `cap` positions) and dropped -- as `read \t mate \t kept \t dropped`; then, on stderr, how
+/// much reference a "fewer than Y kept cores among the k-mer starts of a read-length window" rule
+/// would select, for several Y.
+pub fn locus_core_stats<const K: usize, const C: usize, const F: usize, const S: usize, const L: usize>(
+    reference: &Path,
+    rid_of: &HashMap<String, usize>,
+    cap: u64,
+    read_len: usize,
+    truth: &str,
+    out: &str,
+    threads: usize,
+) {
+    let threads = threads.max(1);
+    let seqs = read_reference(reference, rid_of);
+    let pieces: Vec<(usize, usize, usize)> = seqs
+        .iter()
+        .enumerate()
+        .flat_map(|(r, (_, s))| (0..s.len()).step_by(PIECE).map(move |a| (r, a, (a + PIECE).min(s.len()))))
+        .collect();
+    let size = 1usize << (2 * C);
+    let mut counts = vec![0u32; size];
+    let atomic: &[AtomicU32] = unsafe { std::slice::from_raw_parts(counts.as_mut_ptr() as *const AtomicU32, size) };
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut cs = ClosedSyncmer::<C, S, L>::new();
+                while let Some(&(r, a, b)) = pieces.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    each_core::<K, C, F, S, L>(&seqs[r].1, a, b, &mut cs, |_, key, _| {
+                        atomic[key as usize].fetch_add(1, Ordering::Relaxed);
+                    });
+                }
+            });
+        }
+    });
+    // Per sequence: core positions, the dropped flag in the low bit.
+    let per: Vec<Mutex<Vec<u64>>> = (0..seqs.len()).map(|_| Mutex::new(Vec::new())).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut cs = ClosedSyncmer::<C, S, L>::new();
+                while let Some(&(r, a, b)) = pieces.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let mut local = Vec::new();
+                    each_core::<K, C, F, S, L>(&seqs[r].1, a, b, &mut cs, |pos, key, _| {
+                        local.push((pos as u64) << 1 | (counts[key as usize] as u64 > cap) as u64);
+                    });
+                    per[r].lock().unwrap().extend(local);
+                }
+            });
+        }
+    });
+    drop(counts);
+    let mut per: Vec<Vec<u64>> = per.into_iter().map(|m| { let mut v = m.into_inner().unwrap(); v.sort_unstable(); v }).collect();
+    let name_to_idx: HashMap<usize, usize> = seqs.iter().enumerate().map(|(i, (rid, _))| (*rid, i)).collect();
+    let lens: Vec<usize> = seqs.iter().map(|(_, s)| s.len()).collect();
+    drop(seqs);
+    let span = read_len.saturating_sub(K) as u64; // k-mer starts of a read at pos: [pos, pos + span]
+    // Truth loci.
+    let mut w = BufWriter::new(File::create(out).expect("locus stats out"));
+    for line in std::io::BufRead::lines(BufReader::new(File::open(truth).expect("truth"))) {
+        let line = line.unwrap();
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 4 { continue; }
+        let Some(&rid) = rid_of.get(f[2]) else { continue };
+        let Some(&i) = name_to_idx.get(&rid) else { continue };
+        let pos = f[3].parse::<u64>().unwrap_or(1) - 1;
+        let v = &per[i];
+        let a = v.partition_point(|&x| x >> 1 < pos);
+        let b = v.partition_point(|&x| x >> 1 <= pos + span);
+        let dropped = v[a..b].iter().filter(|&&x| x & 1 == 1).count();
+        let _ = writeln!(w, "{}\t{}\t{}\t{}", f[0], f[1], b - a - dropped, dropped);
+    }
+    drop(w);
+    // Region sizes: windows [p, p + span] (p a core position) with fewer than Y kept cores, padded
+    // to the whole read either side, merged.
+    for y in [1usize, 2, 3, 4, 6, 8, 10] {
+        let mut total = 0u64;
+        for (i, v) in per.iter_mut().enumerate() {
+            let kept: Vec<u64> = v.iter().filter(|&&x| x & 1 == 0).map(|&x| x >> 1).collect();
+            let (mut cur_a, mut cur_b) = (u64::MAX, 0u64);
+            let (mut a, mut b) = (0usize, 0usize);
+            for &x in v.iter() {
+                let p = x >> 1;
+                while a < kept.len() && kept[a] < p { a += 1; }
+                if b < a { b = a; }
+                while b < kept.len() && kept[b] <= p + span { b += 1; }
+                if b - a < y {
+                    let (wa, wb) = (p.saturating_sub(span), (p + 2 * span + K as u64).min(lens[i] as u64));
+                    if cur_a != u64::MAX && wa <= cur_b {
+                        cur_b = cur_b.max(wb);
+                    } else {
+                        if cur_a != u64::MAX { total += cur_b - cur_a; }
+                        (cur_a, cur_b) = (wa, wb);
+                    }
+                }
+            }
+            if cur_a != u64::MAX { total += cur_b - cur_a; }
+        }
+        eprintln!("LOCUSGRID\tY {}\ttext {:.3} Gbp", y, total as f64 / 1e9);
+    }
+}
+
 // --- Build ---
 
 impl RepeatBwt {

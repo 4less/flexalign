@@ -167,7 +167,7 @@ pub struct Args {
     /// it. A read's match is extended along the read until it tells the copies apart, so copies
     /// identical over 31 bases but not over the read are resolved. With `--repeat-index`: the BWT
     /// is asked only about the cores the repeat index leaves unresolved.
-    #[arg(long = "repeat-bwt", action, requires = "repeat_index")]
+    #[arg(long = "repeat-bwt", action)]
     pub repeat_bwt: bool,
 
     /// `--repeat-bwt`: a read is searched when it carries at least this many dropped cores, and the
@@ -462,6 +462,52 @@ pub struct Args {
     /// that could still beat the best full pair, and rank it as a pair.
     #[arg(long = "complete-singles", action)]
     pub complete_singles: bool,
+
+    /// MAPQ ceiling of a pair neither of whose mates got a seed from the index or the repeat index
+    /// (placed by the repeat BWT or a rescue alone).
+    #[arg(long = "seedless-pair-mapq", default_value_t = 60)]
+    pub seedless_pair_mapq: u8,
+
+    /// A mate also counts as seedless (for --seedless-pair-mapq / --seedless-mate-mapq) when none of
+    /// its index ranges has at most this many positions (0: only a mate without any seed).
+    #[arg(long = "seedless-multiplicity", default_value_t = 0)]
+    pub seedless_multiplicity: usize,
+
+    /// MAPQ ceiling of a pair with one such mate.
+    #[arg(long = "seedless-mate-mapq", default_value_t = 60)]
+    pub seedless_mate_mapq: u8,
+
+    /// Spend more on pairs seeding can see are hard (a mate without an index range of at most
+    /// --adaptive-multiplicity positions): --adaptive-flex flank ties per core, --adaptive-top-y
+    /// candidates aligned.
+    #[arg(long = "adaptive", action)]
+    pub adaptive: bool,
+
+    #[arg(long = "adaptive-multiplicity", default_value_t = 256)]
+    pub adaptive_multiplicity: usize,
+
+    #[arg(long = "adaptive-flex", default_value_t = 128)]
+    pub adaptive_flex: usize,
+
+    #[arg(long = "adaptive-top-y", default_value_t = 16)]
+    pub adaptive_top_y: usize,
+
+    /// MAPQ ceiling from the pair's core copy counts: this minus --mapq-copies-lo x log2 of the
+    /// fewer copies (the mate whose least repeated core has the fewest) minus --mapq-copies-hi x
+    /// log2 of the other mate's. 0: off.
+    #[arg(long = "mapq-copies", default_value_t = 0)]
+    pub mapq_copies: usize,
+
+    #[arg(long = "mapq-copies-lo", default_value_t = 2.0)]
+    pub mapq_copies_lo: f64,
+
+    #[arg(long = "mapq-copies-hi", default_value_t = 3.0)]
+    pub mapq_copies_hi: f64,
+
+    /// With --adaptive: a mate whose every core was dropped for too many flank ties is seeded
+    /// again keeping up to this many ties per core (0: off).
+    #[arg(long = "adaptive-ties", default_value_t = 0)]
+    pub adaptive_ties: usize,
 
     /// MAPQ of a pair with no runner-up at another place.
     #[arg(long = "mapq-unique", default_value_t = 30)]
