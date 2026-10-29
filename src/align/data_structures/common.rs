@@ -13,6 +13,9 @@ impl Display for ResolveOrientationError {
     }
 }
 
+/// `Seed::flag`: the seed came from the repeat BWT (`--repeat-bwt`).
+pub const SEED_FROM_BWT: u8 = 1;
+
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct Seed {

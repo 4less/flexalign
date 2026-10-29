@@ -61,6 +61,18 @@ impl StdSAMOutput {
 }
 
 impl SAMOutput for StdSAMOutput {
+    fn mark(&mut self) -> Option<usize> {
+        Some(self.buffer.mark())
+    }
+
+    fn rollback(&mut self, at: usize) {
+        self.buffer.truncate(at);
+    }
+
+    fn release(&mut self) {
+        self.buffer.release();
+    }
+
     fn write_header(&mut self, references: &[(&str, usize)]) {
         // SO:unsorted -- workers write records as reads stream past, in no reference order.
         let mut header = String::from("@HD\tVN:1.6\tSO:unsorted\n");

@@ -254,6 +254,17 @@ pub trait RangeExtractor<const C: usize, const F: usize> {
     fn last_unresolved(&self) -> usize {
         0
     }
+    /// Whether the read of the last `generate` is one to search in the repeat BWT (`--repeat-bwt`):
+    /// enough of its cores left unresolved by the repeat index.
+    fn bwt_eligible(&self) -> bool {
+        false
+    }
+    /// The read positions of the k-mers the last `generate` looked up.
+    fn kmer_starts(&self, _out: &mut Vec<usize>) {}
+    /// The repeat BWT's ranges for the read of the last `generate` (searched now, on demand).
+    fn bwt_extra(&mut self, _rec: &RefFastqRecord) -> &[Range<'_, F>] {
+        &[]
+    }
     /// The fast-hit lookup (`--fast-hit`): every position of every k-mer whose key has at most
     /// `max_positions` positions in the index (and so no flank headers), without materialising
     /// ranges. Returns false when the implementation cannot answer, in which case the caller
@@ -350,6 +361,12 @@ impl AnchorScore for StdAnchorScore {
     }
 }
 
+/// `--mapq-per-mismatch` (0: the relative margin) and `--mapq-unique`, set once at start-up.
+pub static MAPQ_PER_MISMATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static MAPQ_UNIQUE_SETTING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30);
+/// `--unpaired-penalty`, for the fast-hit path's mismatch-margin MAPQ.
+pub static UNPAIRED_PENALTY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(34);
+
 pub struct StdPairedAnchorMAPQ;
 impl StdPairedAnchorMAPQ {
     fn score(a: &Anchor) -> i32 {
@@ -394,7 +411,7 @@ const SAME_LOCUS: i64 = 32;
 /// placement of that mate. Such a pair is the best pair again (built from other seeds, or with a
 /// mate left out), not a competitor, and must not count as the runner-up -- it would tie the read
 /// with itself.
-fn same_placement(best: &AnchorPair, other: &AnchorPair) -> bool {
+pub fn same_placement(best: &AnchorPair, other: &AnchorPair) -> bool {
     fn same(best: &Option<Anchor>, other: &Option<Anchor>) -> bool {
         match (best, other) {
             (_, None) => true,
@@ -428,7 +445,7 @@ impl StdPairedAnchorMAPQ {
         assert!(!anchors.is_empty());
 
         const MAPQ_MAX: f64 = 60.0;
-        const MAPQ_UNIQUE: u8 = 30;
+        let mapq_unique = MAPQ_UNIQUE_SETTING.load(std::sync::atomic::Ordering::Relaxed) as u8;
         let runner_up = anchors[1..].iter().find(|p| !same_placement(&anchors[0], p));
         if from_alignment {
             // Aligned scores are <= 0 PENALTIES (0 = perfect, -1_000_000 = failed), the opposite
@@ -436,7 +453,7 @@ impl StdPairedAnchorMAPQ {
             // the margin is over costs (lower is better), not scores: a best with a small cost
             // against a second with a large one is a confident read, and equal costs are a tie.
             let Some(runner_up) = runner_up else {
-                return MAPQ_UNIQUE;
+                return mapq_unique;
             };
             let cost = |p: &AnchorPair| {
                 [&p.0, &p.1]
@@ -446,6 +463,13 @@ impl StdPairedAnchorMAPQ {
             };
             let c1 = cost(&anchors[0]) as f64;
             let c2 = cost(runner_up) as f64;
+            // `--mapq-per-mismatch`: the margin in mismatches' worth of cost, at so much MAPQ each
+            // (BWA's shape: one mismatch between best and runner-up is about 30).
+            let per_mm = MAPQ_PER_MISMATCH.load(std::sync::atomic::Ordering::Relaxed);
+            if per_mm > 0 {
+                let margin = ((c2 - c1) / penalties::MISMATCH as f64).max(0.0);
+                return (per_mm as f64 * margin).round().min(MAPQ_MAX) as u8;
+            }
             if c2 <= 0.0 {
                 return 0; // the runner-up is also a perfect alignment: no margin at all
             }
@@ -459,7 +483,7 @@ impl StdPairedAnchorMAPQ {
             return 0;
         }
         let Some(runner_up) = runner_up else {
-            return MAPQ_UNIQUE;
+            return mapq_unique;
         };
         let s2 = score(runner_up).max(0);
         let rel_margin = 1.0 - (s2 as f64 / s1 as f64); // in [0, 1]
@@ -531,6 +555,16 @@ impl<A,B> Or<A,B> {
  pub trait SAMOutput {
     /// Emits `@HD` and one `@SQ` per reference. Must be called once, before any record.
     fn write_header(&mut self, references: &[(&str, usize)]);
+
+    /// Where the output ends now, holding it so that what follows can be taken back
+    /// (`rollback`); None when this output cannot.
+    fn mark(&mut self) -> Option<usize> {
+        None
+    }
+    /// Takes back what was written since `mark` returned `at`.
+    fn rollback(&mut self, _at: usize) {}
+    /// Ends a `mark`.
+    fn release(&mut self) {}
 
     fn write(
         &mut self,

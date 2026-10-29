@@ -41,7 +41,7 @@ use kmerrs::syncmer::closed_syncmer::ClosedSyncmer;
 
 const MAGIC: [u8; 8] = *b"FAREPT02";
 /// A sequence is cut into pieces of this many K-mer starts, so one chromosome spreads over threads.
-const PIECE: usize = 8 << 20;
+pub(crate) const PIECE: usize = 8 << 20;
 
 /// What the repeat index says about a core the main index does not have.
 pub enum RepeatLookup<'a> {
@@ -90,7 +90,7 @@ pub struct RepeatIndex {
 /// Distinct flanks per directory slot a key's directory aims at.
 const DIR_SLOT: usize = 4;
 
-fn stamp_of(index_file: &str) -> std::io::Result<(u64, u64)> {
+pub(crate) fn stamp_of(index_file: &str) -> std::io::Result<(u64, u64)> {
     let meta = std::fs::metadata(index_file)?;
     let modified = meta.modified()?.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
     Ok((meta.len(), modified))
@@ -518,17 +518,17 @@ impl RepeatIndex {
 }
 
 /// The plain-old-data arrays above as bytes (u32, u64 and VCell, which is a repr(C) u64).
-fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
+pub(crate) fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
-fn as_bytes_mut<T: Copy>(v: &mut [T]) -> &mut [u8] {
+pub(crate) fn as_bytes_mut<T: Copy>(v: &mut [T]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
 }
 
 /// `f(position, key, flank)` for every selected core whose K-mer starts in `[a, b)` of `seq`, as
 /// flexmap's build selects and keys them.
-fn each_core<const K: usize, const C: usize, const F: usize, const S: usize, const L: usize>(
+pub(crate) fn each_core<const K: usize, const C: usize, const F: usize, const S: usize, const L: usize>(
     seq: &[u8],
     a: usize,
     b: usize,
@@ -550,7 +550,7 @@ fn each_core<const K: usize, const C: usize, const F: usize, const S: usize, con
 }
 
 /// The reference's sequences with their index ids, read as the index build reads them.
-fn read_reference(path: &Path, rid_of: &HashMap<String, usize>) -> Vec<(usize, Vec<u8>)> {
+pub(crate) fn read_reference(path: &Path, rid_of: &HashMap<String, usize>) -> Vec<(usize, Vec<u8>)> {
     let file = File::open(path).unwrap_or_else(|e| panic!("reference {}: {e}", path.display()));
     let buffer_size = 1 << 24;
     let mut byte_reader = Arc::new(Mutex::new(FastaByteReader::new(file, buffer_size).expect("reference reader")));

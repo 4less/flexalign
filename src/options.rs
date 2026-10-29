@@ -162,6 +162,43 @@ pub struct Args {
     #[arg(long = "repeat-bucket-max", default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=128))]
     pub repeat_bucket_max: u16,
 
+    /// Seed reads from regions dense in dropped cores (young repeats) with an FM-index of those
+    /// regions, kept next to the index as `<index>.rbwt` and built on the first run that asks for
+    /// it. A read's match is extended along the read until it tells the copies apart, so copies
+    /// identical over 31 bases but not over the read are resolved. With `--repeat-index`: the BWT
+    /// is asked only about the cores the repeat index leaves unresolved.
+    #[arg(long = "repeat-bwt", action, requires = "repeat_index")]
+    pub repeat_bwt: bool,
+
+    /// `--repeat-bwt`: a read is searched when it carries at least this many dropped cores, and the
+    /// index holds the regions where a read would (fewer are placed by the read's other cores).
+    #[arg(long = "bwt-min-dropped", default_value_t = 8)]
+    pub bwt_min_dropped: u32,
+
+    /// `--repeat-bwt`: the read length the indexed regions are sized for (a K-mer's region reaches
+    /// this far less K either side). Longer reads still work; their matches stop at a region's end.
+    #[arg(long = "bwt-read-len", default_value_t = 150)]
+    pub bwt_read_len: u32,
+
+    /// `--repeat-bwt`: a match is turned into positions when it has at most this many occurrences;
+    /// more leave its cores unresolved (counted for the MAPQ cap, as with `--repeat-index`).
+    #[arg(long = "bwt-max-locate", default_value_t = 8)]
+    pub bwt_max_locate: u32,
+
+    /// `--repeat-bwt`: a pair whose mates both align at this identity without the BWT's seeds is
+    /// not tried with them (else the result with them is kept when its pair score is better).
+    #[arg(long = "bwt-redo-ani", default_value_t = 0.99)]
+    pub bwt_redo_ani: f64,
+
+    /// `--repeat-bwt`: the unresolved-repeat MAPQ ceiling (`--unresolved-mapq-cap`) for a pair
+    /// written from the BWT's seeds.
+    #[arg(long = "bwt-unresolved-cap", default_value_t = 1)]
+    pub bwt_unresolved_cap: u8,
+
+    /// `--repeat-bwt`: MAPQ ceiling of a pair written from the BWT's seeds.
+    #[arg(long = "bwt-mapq-cap", default_value_t = 60)]
+    pub bwt_mapq_cap: u8,
+
     /// Minimum number of read bases an alignment must actually place for the record to be emitted.
     ///
     /// This is a BASE COUNT, not a fraction. A fraction is the wrong shape on a marker DB: its
@@ -384,6 +421,51 @@ pub struct Args {
     /// score, the reported alignment may not even be the one the MAPQ describes.
     #[arg(long = "mapq-from-alignment", action)]
     pub mapq_from_alignment: bool,
+
+    /// With `--mapq-from-alignment`: MAPQ per mismatch's worth of alignment cost between the best
+    /// pair and the runner-up (capped at 60); 0 uses the relative margin instead.
+    #[arg(long = "mapq-per-mismatch", default_value_t = 0)]
+    pub mapq_per_mismatch: u32,
+
+    /// When the best candidate has one mate and its partner is rescued next to it, rescue the
+    /// partners of the runner-ups too and take the MAPQ from the completed pairs.
+    #[arg(long = "rescue-mapq", action)]
+    pub rescue_mapq: bool,
+
+    /// With `--repeat-bwt`: a pair left under the unresolved-repeat MAPQ cap is resolved as a pair --
+    /// every copy of each mate's long exact stretches listed by the BWT, kept where the mates'
+    /// copies make proper pairs -- and, when those lists are complete, given the aligned margin as
+    /// MAPQ instead of the cap.
+    #[arg(long = "pair-resolve", action)]
+    pub pair_resolve: bool,
+
+    /// `--pair-resolve`: MAPQ ceiling of a pair resolved on one mate's copies only, some of them left
+    /// without a partner copy (about 9 in 10 right on human).
+    #[arg(long = "pair-loose-mapq", default_value_t = 20)]
+    pub pair_loose_mapq: u8,
+
+    /// `--pair-resolve`: the shortest exact stretch of a mate whose copies are listed.
+    #[arg(long = "pair-min-match", default_value_t = 40)]
+    pub pair_min_match: u32,
+
+    /// `--pair-resolve`: most copies of a stretch listed; one with more leaves the pair incomplete.
+    #[arg(long = "pair-max-copies", default_value_t = 128)]
+    pub pair_max_copies: u32,
+
+    /// MAPQ ceiling of a mate whose partner is unmapped or not within 1 kb of it (255: off). On a
+    /// genome such mates are mostly wrong at any MAPQ; on a marker database a mate hanging off the
+    /// end of a gene often is not, hence off by default.
+    #[arg(long = "discordant-mapq-cap", default_value_t = 255)]
+    pub discordant_mapq_cap: u8,
+
+    /// Before the aligned candidates are ranked, rescue the partner next to each one-mate candidate
+    /// that could still beat the best full pair, and rank it as a pair.
+    #[arg(long = "complete-singles", action)]
+    pub complete_singles: bool,
+
+    /// MAPQ of a pair with no runner-up at another place.
+    #[arg(long = "mapq-unique", default_value_t = 30)]
+    pub mapq_unique: u32,
 
     /// Align on N windows of the index, one in memory at a time (RAM-bounded). 1 is the unsharded
     /// run: the whole index in memory, the reads read once.

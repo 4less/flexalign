@@ -28,6 +28,8 @@ flexmap = { git = "https://github.com/4less/flexmap.git", rev = "7d9a0e2" }
 bioreader = { git = "https://github.com/4less/bioreader.git", rev = "e48a9ff59fb802cbafd502d5f7fbaa0250a20024" }
 # Gapped alignment: the Rust port of WFA2-lib (replaces the C library through `libwfa2`).
 wfa2lib-rs = { git = "https://github.com/4less/wfa2lib-rs.git", rev = "9d67892ad787dd81e3fff94e87b43eb7eacd93a9", default-features = false }
+# Suffix arrays for the repeat BWT (`--repeat-bwt`): libsais, multi-threaded through OpenMP.
+libsais = "=0.2.0"
 clap = { version = "4.5.3", features = ["derive", "wrap_help"] }
 clap_derive = "4.5.3"
 flate2 = "1.0.28"

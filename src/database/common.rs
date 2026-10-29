@@ -300,6 +300,10 @@ pub trait FlexalignDatabase {
     /// index dropped, with the repeat index's positions of it whose flank is `flank`
     /// (`--repeat-index`; none by default).
     fn repeat_lookup_batch<'s>(&'s self, _queries: &[(u64, u32)], _max: usize, _f: &mut dyn FnMut(usize, crate::database::repeat::RepeatLookup<'s>)) {}
+    /// The repeat BWT (`--repeat-bwt`), if attached.
+    fn repeat_bwt(&self) -> Option<&crate::database::rbwt::RepeatBwt> {
+        None
+    }
     fn build(options: &Options) -> Self;
     fn save(&self, paths: &DBPaths, version: u32) -> Result<(), std::io::Error>;
     fn load(paths: &DBPaths, version: u32) -> Self;
@@ -333,6 +337,9 @@ impl<D: FlexalignDatabase> FlexalignDatabase for &D {
     }
     fn repeat_lookup_batch<'s>(&'s self, queries: &[(u64, u32)], max: usize, f: &mut dyn FnMut(usize, crate::database::repeat::RepeatLookup<'s>)) {
         (**self).repeat_lookup_batch(queries, max, f)
+    }
+    fn repeat_bwt(&self) -> Option<&crate::database::rbwt::RepeatBwt> {
+        (**self).repeat_bwt()
     }
     fn build(_options: &Options) -> Self {
         unimplemented!("&DB is a borrowed read-only view; build the owned database instead")

@@ -30,6 +30,9 @@ pub struct OutputBuffer {
     writer: Arc<Mutex<OutputTarget>>,
     pub buffer: Vec<u8>,
     pub threshold: usize,
+    /// While set, the buffer is not handed to the writer, so what was appended since a `mark` can
+    /// still be taken back (`truncate`).
+    pub hold: bool,
 }
 
 impl OutputBuffer {
@@ -37,6 +40,7 @@ impl OutputBuffer {
         OutputBuffer {
             writer,
             buffer: Vec::new(),
+            hold: false,
             threshold: threshold,
         }
     }
@@ -75,9 +79,26 @@ impl OutputBuffer {
         self.flush_if_full();
     }
 
+    /// Holds the buffer (see `hold`) and returns where it ends now.
+    pub fn mark(&mut self) -> usize {
+        self.hold = true;
+        self.buffer.len()
+    }
+
+    /// Takes back what was appended since `mark` returned `at`.
+    pub fn truncate(&mut self, at: usize) {
+        self.buffer.truncate(at);
+    }
+
+    /// Ends a `mark`: the buffer goes to the writer again once full.
+    pub fn release(&mut self) {
+        self.hold = false;
+        self.flush_if_full();
+    }
+
     #[inline]
     fn flush_if_full(&mut self) {
-        if self.buffer.len() > self.threshold {
+        if self.buffer.len() > self.threshold && !self.hold {
             let mut wr: std::sync::MutexGuard<'_, OutputTarget> = self.writer.lock().expect("Cannot lock writer");
             let _ = wr.write_all(&self.buffer);
             self.buffer.clear();

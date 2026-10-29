@@ -80,6 +80,10 @@ fn sharded_pairs(options: &Options) -> Vec<(String, String, String)> {
 
 pub fn run(args: Args) {
     let options = Options::from_args(args);
+    crate::align::common::MAPQ_PER_MISMATCH.store(options.args.mapq_per_mismatch, std::sync::atomic::Ordering::Relaxed);
+    crate::align::common::MAPQ_UNIQUE_SETTING.store(options.args.mapq_unique, std::sync::atomic::Ordering::Relaxed);
+    crate::align::modular_workflow::DISCORDANT_MAPQ_CAP.store(options.args.discordant_mapq_cap, std::sync::atomic::Ordering::Relaxed);
+    crate::align::common::UNPAIRED_PENALTY.store(options.args.unpaired_penalty.max(0) as u32, std::sync::atomic::Ordering::Relaxed);
 
     // Set before any database load -- the mapping happens below the option plumbing.
     {
@@ -169,6 +173,12 @@ pub fn run(args: Args) {
     let attach_repeat = |db: &mut DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>| {
         if options.args.repeat_index {
             db.attach_repeat_index(&db_paths, &options.reference, options.args.max_range_size, options.args.threads as usize);
+        }
+        if options.args.repeat_bwt {
+            db.attach_repeat_bwt(
+                &db_paths, &options.reference, options.args.max_range_size,
+                options.args.bwt_read_len, options.args.bwt_min_dropped, options.args.threads as usize,
+            );
         }
     };
     let db: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = match build {
@@ -262,6 +272,9 @@ fn run_sharded<
     const CELLS_PER_BODY: u64,
     const HEADER_THRESHOLD: usize,
 >(db_paths: &DBPaths, options: &Options, n_shards: usize) {
+    if options.args.repeat_bwt {
+        log::warn!("--repeat-bwt is not used by sharded runs yet: the repeat index alone seeds dropped cores");
+    }
     let pairs = sharded_pairs(options);
     if pairs.is_empty() {
         eprintln!("Sharded alignment is paired-end only: give -1 and -2.");

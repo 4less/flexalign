@@ -373,6 +373,8 @@ pub struct DB<
     references: RefStore,
     /// The positions of the cores the index dropped (`--repeat-index`).
     repeat: Option<Arc<RepeatIndex>>,
+    /// The repeat BWT (`--repeat-bwt`).
+    rbwt: Option<Arc<super::rbwt::RepeatBwt>>,
 }
 
 impl<
@@ -443,7 +445,7 @@ impl<
             } else {
                 HashMap::new()
             };
-            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references, repeat: None };
+            return Self { flexmap: FlexmapStore::Absent, rid_to_rname: Names::Table(names), rname_to_rid, references, repeat: None, rbwt: None };
         }
         let io_before = super::common::disk_read_bytes();
 
@@ -491,7 +493,7 @@ impl<
         eprintln!("  -> {read_gb:.1} GB read from disk (reference only; the {} index is mapped but untouched)",
                   paths.index_blob_file());
 
-        Self { flexmap, rid_to_rname: Names::Owned(rid_to_rname), rname_to_rid: HashMap::new(), references, repeat: None }
+        Self { flexmap, rid_to_rname: Names::Owned(rid_to_rname), rname_to_rid: HashMap::new(), references, repeat: None, rbwt: None }
     }
 }
 
@@ -529,6 +531,10 @@ impl<
         if let Some(r) = &self.repeat {
             r.lookup_batch(queries, max, f);
         }
+    }
+
+    fn repeat_bwt(&self) -> Option<&super::rbwt::RepeatBwt> {
+        self.rbwt.as_deref()
     }
 
     fn release_references(&self) {
@@ -569,7 +575,7 @@ impl<
             rid_to_rname: Names::Owned(rid_to_rname),
             rname_to_rid,
             references: RefStore::Owned(references),
-            repeat: None,
+            repeat: None, rbwt: None,
         }
     }
 
@@ -698,7 +704,7 @@ impl<
             rid_to_rname: Names::Owned(rid_to_rname),
             rname_to_rid,
             references,
-            repeat: None,
+            repeat: None, rbwt: None,
         }
     }
     
@@ -746,6 +752,23 @@ impl<
             duration.as_secs_f64(), repeat.key_count(), repeat.entries(), repeat.memory_bytes() as f64 / 1e9
         );
         self.repeat = Some(repeat);
+    }
+
+    /// Loads the repeat BWT of this index (`<index>.rbwt`), building it first when it is missing or
+    /// was built from another index or with other parameters (`--repeat-bwt`).
+    pub fn attach_repeat_bwt(&mut self, paths: &DBPaths, reference: &std::path::Path, cap: usize, read_len: u32, min_dropped: u32, threads: usize) {
+        let format = index_format();
+        let index_file = if format == IndexFormat::Blob { paths.index_blob_file() } else { paths.bundle_file(format) };
+        let (duration, (bwt, how)) = time(|| {
+            super::rbwt::RepeatBwt::load_or_build::<K, C, F, S, L>(&index_file, reference, || {
+                (1..).map_while(|i| self.get_rname(i).map(|n| (n.to_string(), i))).collect()
+            }, cap as u64, read_len, min_dropped, threads)
+        });
+        eprintln!(
+            "Repeat BWT {how} in {:.2}s: {} dropped cores, {:.3} Gbp of text, {:.2} GB",
+            duration.as_secs_f64(), bwt.dropped_keys(), bwt.text_len() as f64 / 1e9, bwt.memory_bytes() as f64 / 1e9
+        );
+        self.rbwt = Some(Arc::new(bwt));
     }
 
     /// The index, reference and names as separate files, as before bundles (and for the blob
@@ -902,7 +925,7 @@ impl<
             references.len(),
             names.len(),
         );
-        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references, repeat: None }
+        Self { flexmap, rid_to_rname: Names::Table(names), rname_to_rid, references, repeat: None, rbwt: None }
     }
 }
 

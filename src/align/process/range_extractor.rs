@@ -21,6 +21,9 @@ pub struct Range<'a, const F: usize> {
     /// From the repeat index: positions where the read's whole K-mer occurs, of a core the main
     /// index dropped. Every cell's flank equals the read's.
     pub repeat: bool,
+    /// From the repeat BWT (`--repeat-bwt`): extra candidates for cores the repeat index left
+    /// unresolved, walked whatever the `--ranges` budget and spending none of it.
+    pub bwt: bool,
 }
 
 #[derive(Clone)]
@@ -52,6 +55,17 @@ pub struct StdRangeExtractor<'a, const K: usize, const C: usize, const F: usize,
     /// A read's keys the index lacks, as (key, flank), and their index in `keys`; reused.
     missing: Vec<(u64, u32)>,
     missing_at: Vec<usize>,
+    /// `--bwt-max-locate` with `--repeat-bwt`, else 0 (no BWT).
+    bwt_max_locate: usize,
+    /// The repeat BWT's ranges of the last `bwt_extra`.
+    bwt_ranges: Vec<Range<'a, F>>,
+    /// The read's dropped cores (indices into `keys`), their K-mer starts, and the BWT's hits.
+    bwt_cores: Vec<usize>,
+    /// The read's keys the repeat index left unresolved (indices into `keys`).
+    unresolved_at: Vec<usize>,
+    bwt_qs: Vec<usize>,
+    bwt_hits: Vec<(u32, u64)>,
+    bwt_scratch: crate::database::rbwt::BwtScratch,
 }
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> RangeExtractor<K, F> for StdRangeExtractor<'a, K, C, F, D> {
@@ -100,6 +114,19 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> R
 
     fn last_unresolved(&self) -> usize {
         self.last_unresolved
+    }
+
+    fn bwt_eligible(&self) -> bool {
+        self.bwt_max_locate > 0 && self.db.repeat_bwt().is_some_and(|b| self.unresolved_at.len() >= b.min_dropped())
+    }
+
+    fn kmer_starts(&self, out: &mut Vec<usize>) {
+        out.extend(self.key_info.iter().map(|k| k.0));
+    }
+
+    fn bwt_extra(&mut self, rec: &RefFastqRecord) -> &[Range<'_, F>] {
+        self.bwt_lookup(rec);
+        &self.bwt_ranges
     }
 
     fn unique_hits_strided(&mut self, kmers: &[(usize, Kmer<K>)], stride: usize, max_positions: usize, out: &mut Vec<UniqueHit>) -> bool {
@@ -202,11 +229,13 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
         let (missing, missing_at) = (&mut self.missing, &mut self.missing_at);
         missing.clear();
         missing_at.clear();
+        let unresolved_at = &mut self.unresolved_at;
+        unresolved_at.clear();
         db.for_each_vrange(&self.keys, &mut |i, range| {
             if let Some(range) = range {
                 let (qpos, fmer) = (key_info[i].0, key_info[i].1.clone());
                 let range_size = range.len() as u32;
-                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: false });
+                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: false, bwt: false });
             } else if repeat_max > 0 {
                 missing.push((keys[i], key_info[i].1.0 as u32));
                 missing_at.push(i);
@@ -221,9 +250,12 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
                     RepeatLookup::Range(range) => {
                         let (qpos, fmer) = (key_info[missing_at[j]].0, key_info[missing_at[j]].1.clone());
                         let range_size = range.len() as u32;
-                        ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: true });
+                        ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0, repeat: true, bwt: false });
                     }
-                    _ => repeat_unresolved += 1,
+                    _ => {
+                        repeat_unresolved += 1;
+                        unresolved_at.push(missing_at[j]);
+                    }
                 }
             });
             self.repeat_cores += repeat_cores;
@@ -234,7 +266,7 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
 impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> StdRangeExtractor<'a, K, C, F, D> {
     pub fn new(db: &'a D) -> Self {
-        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new(), repeat_max: 0, repeat_cores: 0, repeat_unresolved: 0, last_unresolved: 0, missing: Vec::new(), missing_at: Vec::new() }
+        Self { ranges: Vec::new(), db, keys: Vec::new(), key_info: Vec::new(), order: Vec::new(), sorted: Vec::new(), prefetched: false, subset: Vec::new(), flex_scratch: Vec::new(), prefetch_keys: Vec::new(), repeat_max: 0, repeat_cores: 0, repeat_unresolved: 0, last_unresolved: 0, missing: Vec::new(), missing_at: Vec::new(), bwt_max_locate: 0, bwt_ranges: Vec::new(), bwt_cores: Vec::new(), unresolved_at: Vec::new(), bwt_qs: Vec::new(), bwt_hits: Vec::new(), bwt_scratch: Default::default() }
     }
 
     /// Asks the repeat index about the keys the main index lacks, keeping exact K-mer runs of at
@@ -242,6 +274,47 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
     pub fn with_repeat(mut self, max: usize) -> Self {
         self.repeat_max = max;
         self
+    }
+
+    /// Seeds dropped cores from the repeat BWT (`--repeat-bwt`): at most `max_locate` occurrences
+    /// a match; 0 leaves it off.
+    pub fn with_bwt(mut self, max_locate: usize) -> Self {
+        self.bwt_max_locate = if self.db.repeat_bwt().is_some() { max_locate } else { 0 };
+        self
+    }
+
+    /// The read's cores the repeat index left unresolved (their exact K-mer in more than
+    /// `--repeat-bucket-max` copies, or in none): with at least `--bwt-min-dropped` of them the read
+    /// is searched in the repeat BWT, and each such core whose K-mer it places gets a range of those
+    /// positions (every flank equals the read's, as a repeat-index run) in `bwt_ranges`. They stay
+    /// counted unresolved, so the MAPQ cap for unresolved repeats sees them as before.
+    fn bwt_lookup(&mut self, rec: &RefFastqRecord) {
+        self.bwt_ranges.clear();
+        if !self.bwt_eligible() {
+            return;
+        }
+        let Some(bwt) = self.db.repeat_bwt() else { return };
+        self.bwt_cores.clear();
+        self.bwt_cores.extend_from_slice(&self.unresolved_at);
+        self.bwt_qs.clear();
+        self.bwt_qs.extend(self.bwt_cores.iter().map(|&i| self.key_info[i].0));
+        self.bwt_hits.clear();
+        bwt.resolve(rec.seq(), K, &self.bwt_qs, self.bwt_max_locate, &mut self.bwt_scratch, &mut self.bwt_hits);
+        self.bwt_hits.sort_unstable();
+        let mut a = 0;
+        while a < self.bwt_hits.len() {
+            let c = self.bwt_hits[a].0;
+            let mut b = a;
+            while b < self.bwt_hits.len() && self.bwt_hits[b].0 == c {
+                b += 1;
+            }
+            let i = self.bwt_cores[c as usize];
+            let (qpos, fmer) = (self.key_info[i].0, self.key_info[i].1.clone());
+            let (header, cells) = crate::database::rbwt::range_slices(b - a, fmer.0 as u32, self.bwt_hits[a..b].iter().map(|h| h.1));
+            let vrange = AnyRange::Plain(flexmap::values::VRange::new(Some(header), cells));
+            self.bwt_ranges.push(Range { qpos, fmer, vrange, range_size: (b - a) as u32, core_min_phredq: 0, flex_min_phredq: 0, repeat: true, bwt: true });
+            a = b;
+        }
     }
 }
 

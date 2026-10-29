@@ -114,6 +114,13 @@ pub trait SeedRange<const K: usize, const C: usize, const F: usize> {
     fn best_flex_limit(&self, max_best_flex: usize) -> usize {
         max_best_flex
     }
+
+    /// Whether this range is outside the `--ranges` budget: walked however much of it is spent,
+    /// spending none (the repeat BWT's extra candidates, which must not crowd out the ranges the
+    /// budget would otherwise reach).
+    fn outside_budget(&self) -> bool {
+        false
+    }
 }
 
 /// Walks ranges in order, emitting seeds until the `--ranges` budget is spent.
@@ -140,6 +147,10 @@ where
     let mut headers_scanned = 0usize;
 
     for range in ranges {
+        let extra = range.outside_budget();
+        if retrieved_matches >= max_ranges && !extra {
+            continue;
+        }
         let verdict = range.emit_seeds(range.best_flex_limit(max_best_flex), flank_slack, dist_buf, seeds);
         // `resolve_flex` leaves one cached distance per scanned flank in `dist_buf`, so its length
         // is exactly this range's header-scan count (0 for headerless ranges and for the replay,
@@ -154,10 +165,8 @@ where
             // Emits seeds, spends no budget (§3.2). It can still be cut off by a range that
             // trips the budget before it.
             RangeVerdict::Headerless => {}
-            RangeVerdict::Headered => retrieved_matches += 1,
-        }
-        if retrieved_matches >= max_ranges {
-            break;
+            RangeVerdict::Headered if !extra => retrieved_matches += 1,
+            RangeVerdict::Headered => {}
         }
     }
 
@@ -220,7 +229,30 @@ impl<'a, const K: usize, const C: usize, const F: usize> SeedRange<K, C, F> for 
         if self.repeat { MAX_KEPT_TIES } else { max_best_flex }
     }
 
+    fn outside_budget(&self) -> bool {
+        self.bwt
+    }
+
     fn emit_seeds(
+        &self,
+        max_best_flex: usize,
+        flank_slack: u32,
+        dist_buf: &mut Vec<u8>,
+        seeds: &mut Vec<Seed>,
+    ) -> RangeVerdict {
+        let first = seeds.len();
+        let verdict = self.emit_seeds_inner::<K, C>(max_best_flex, flank_slack, dist_buf, seeds);
+        if self.bwt {
+            for s in &mut seeds[first..] {
+                s.flag |= crate::align::data_structures::common::SEED_FROM_BWT;
+            }
+        }
+        verdict
+    }
+}
+
+impl<'a, const F: usize> Range<'a, F> {
+    fn emit_seeds_inner<const K: usize, const C: usize>(
         &self,
         max_best_flex: usize,
         flank_slack: u32,

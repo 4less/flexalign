@@ -7,7 +7,7 @@ use itertools::Itertools;
 
 use crate::align::{common::{penalties, Align, AlignStage, AlignTrace, Heuristic, Status}, data_structures::common::ToString, errors::{AlignmentError, AlignmentResult}, process::anchor_extender::FixAnchorError, sam::Cigar};
 
-use super::common::{hamming, Seed};
+use super::common::{hamming, Seed, SEED_FROM_BWT};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -306,6 +306,7 @@ pub struct Anchor {
     pub orientation_set: bool,
     pub flagged_for_indel: bool,
     pub flag: u8, // 20
+    /// Seeds from the repeat BWT among `seed_count` (`SEED_FROM_BWT`).
     pub counter1: u16,
     pub counter2: u16, // 24
     pub seeds: Vec<AnchorSeed>, // 40
@@ -329,7 +330,7 @@ impl Anchor {
             orientation_set: false,
             flagged_for_indel: false,
             flag: 0,
-            counter1: 0,
+            counter1: (seed.flag & SEED_FROM_BWT) as u16,
             counter2: 0,
             score: 0,
             seeds: vec! [AnchorSeed{ qpos: seed.qpos, rpos: seed.rpos, length: seed.length as u32 }],
@@ -356,7 +357,7 @@ impl Anchor {
             addr_of_mut!((*p).orientation_set).write(false);
             addr_of_mut!((*p).flagged_for_indel).write(false);
             addr_of_mut!((*p).flag).write(0);
-            addr_of_mut!((*p).counter1).write(0);
+            addr_of_mut!((*p).counter1).write((seed.flag & SEED_FROM_BWT) as u16);
             addr_of_mut!((*p).counter2).write(0);
             addr_of_mut!((*p).score).write(0);
             addr_of_mut!((*p).seeds).write(vec![AnchorSeed { qpos: seed.qpos, rpos: seed.rpos, length: seed.length as u32 }]);
@@ -393,6 +394,7 @@ impl Anchor {
                     newa.set_forward(fwd, read_length);
                     if !newa.first_seed().has_overlap(&other.first_seed()) {
                         newa.seed_count += 1;
+                        newa.counter1 += other.counter1.min(1);
                         newa.seeds.push(other.first_seed().clone());
                         newa.seeds.sort_by_key(|s| s.qbegin());
                         return Some((newa, indel as i64));
@@ -442,6 +444,7 @@ impl Anchor {
                             }
                         }
                         newa.seed_count += newseeds.len() as u32;
+                        newa.counter1 += other.counter1;
                         newa.seeds.extend(newseeds);
                         newa.seeds.sort_by_key(|s| s.qbegin());
                         return Some((newa, indel as i64));
@@ -473,6 +476,7 @@ impl Anchor {
                             newseeds.iter_mut().for_each(|s| s.reverse(read_length));
                         }
                         newa.seed_count += newseeds.len() as u32;
+                        newa.counter1 += other.counter1;
                         newa.seeds.extend(newseeds);
                         newa.seeds.sort_by_key(|s| s.qbegin());
                         return Some((newa, indel as i64));
@@ -513,6 +517,7 @@ impl Anchor {
                         let newseeds = other.seeds.clone();
                         
                         newa.seed_count += newseeds.len() as u32;
+                        newa.counter1 += other.counter1;
                         newa.seeds.extend(newseeds);
                         newa.seeds.sort_by_key(|s| s.qbegin());
                         return Some((newa, indel as i64));
@@ -618,17 +623,35 @@ impl Anchor {
             if !self.flagged_for_indel {
                 let dropped = trace.stage_of(AlignStage::Prefilter, |t| &mut t.t_prefilter, || {
                     // Reuse the screen's measurement when we have it (see the doc comment above).
-                    if let Some(h) = screen_hamming {
-                        return h as i32 * penalties::MISMATCH > max_score;
-                    }
                     let s = self.seeds.first().unwrap();
                     let offset = s.rbegin() as i64 - s.qbegin() as i64; // reference index = query index + offset
                     let q_lo = if offset < 0 { (-offset) as usize } else { 0 };
                     let q_hi = min(query.len(), (reference.len() as i64 - offset).max(0) as usize);
                     if q_lo < q_hi {
-                        let qs = &query[q_lo..q_hi];
-                        let rs = &reference[(q_lo as i64 + offset) as usize..(q_hi as i64 + offset) as usize];
-                        return triple_accel::hamming(qs, rs) as i32 * penalties::MISMATCH > max_score;
+                        let whole = match screen_hamming {
+                            Some(h) => h as i32,
+                            None => {
+                                let qs = &query[q_lo..q_hi];
+                                let rs = &reference[(q_lo as i64 + offset) as usize..(q_hi as i64 + offset) as usize];
+                                triple_accel::hamming(qs, rs) as i32
+                            }
+                        };
+                        if whole * penalties::MISMATCH <= max_score {
+                            return false;
+                        }
+                        // Over budget on the whole diagonal -- but an indel in a stretch no seed
+                        // covers shifts everything past it off the diagonal (a 1-base deletion 16
+                        // bases from the end costs ~12 mismatches here, 15 aligned). Drop only
+                        // when the stretch the seeds span is itself over budget; else align.
+                        let a = self.seeds.iter().map(|s| s.qbegin()).min().unwrap();
+                        let b = self.seeds.iter().map(|s| s.qend()).max().unwrap();
+                        let (a, b) = (a.max(q_lo), b.min(q_hi));
+                        if a < b {
+                            let qs = &query[a..b];
+                            let rs = &reference[(a as i64 + offset) as usize..(b as i64 + offset) as usize];
+                            return triple_accel::hamming(qs, rs) as i32 * penalties::MISMATCH > max_score;
+                        }
+                        return true;
                     }
                     false
                 });
@@ -639,9 +662,39 @@ impl Anchor {
                 }
             }
 
-            self.smart_align(aligner, query, reference, free_ends, max_score, trace)
+            let status = self.smart_align(aligner, query, reference, free_ends, max_score, trace);
+            self.trim_terminal_deletions();
+            status
         } else {
-            self.whole_align(aligner, query, reference, free_ends*2, max_score)
+            let status = self.whole_align(aligner, query, reference, free_ends*2, max_score);
+            self.trim_terminal_deletions();
+            status
+        }
+    }
+
+    /// A deletion cannot open or close an alignment (SAM); the ends-free alignment of a flank can
+    /// leave one at either end, past any soft-clip: drop it and move the reference range with it.
+    /// (Here `I` is a gap in the query -- a SAM deletion -- and `D` one in the reference; see
+    /// `Cigar::to_sam_into`.)
+    fn trim_terminal_deletions(&mut self) {
+        let Some(c) = self.cigar.as_mut() else { return };
+        let ops = &mut c.0;
+        let s0 = ops.iter().take_while(|&&o| o == b'S').count();
+        let d0 = ops[s0..].iter().take_while(|&&o| o == b'I').count();
+        if d0 > 0 {
+            ops.drain(s0..s0 + d0);
+            if !self.reference_cigar_range.is_empty() {
+                self.reference_cigar_range.start += d0;
+            }
+        }
+        let n = ops.len();
+        let s1 = ops.iter().rev().take_while(|&&o| o == b'S').count();
+        let d1 = ops[..n - s1].iter().rev().take_while(|&&o| o == b'I').count();
+        if d1 > 0 {
+            ops.drain(n - s1 - d1..n - s1);
+            if !self.reference_cigar_range.is_empty() {
+                self.reference_cigar_range.end -= d1;
+            }
         }
     }
 
@@ -809,7 +862,10 @@ impl Anchor {
                 // anywhere in this anchor (`!flagged_for_indel`) -- the protal-style approximation.
                 // The latter is what skips WFA on the low-identity / wrong-target tail: a gapless cost
                 // over the remaining budget just drops the anchor here instead of aborting inside WFA.
-                if cost < penalties::GAP_OPENING + penalties::GAP_EXTENSION || !self.flagged_for_indel {
+                // Gapless is also taken when no indel was seen and it fits the budget; over the
+                // budget, WFA gets the flank: an indel there (no seed past it flags one) shifts the
+                // rest of the flank off the diagonal into mismatches the gapless cost counts.
+                if cost < penalties::GAP_OPENING + penalties::GAP_EXTENSION || (!self.flagged_for_indel && cost <= budget) {
                     if cost > budget {
                         return (std::i32::MIN, Status::Dropped, 0, 0);
                     }
@@ -915,7 +971,10 @@ impl Anchor {
                 let q = &query[rr.0.clone()];
                 let r = &reference[rr.1.clone()];
                 let cost = zip(q, r).filter(|(a, b)| a != b).count() as i32 * penalties::MISMATCH;
-                if cost < penalties::GAP_OPENING + penalties::GAP_EXTENSION || !self.flagged_for_indel {
+                // Gapless is also taken when no indel was seen and it fits the budget; over the
+                // budget, WFA gets the flank: an indel there (no seed past it flags one) shifts the
+                // rest of the flank off the diagonal into mismatches the gapless cost counts.
+                if cost < penalties::GAP_OPENING + penalties::GAP_EXTENSION || (!self.flagged_for_indel && cost <= budget) {
                     if cost > budget {
                         return (std::i32::MIN, Status::Dropped);
                     }
@@ -1536,6 +1595,7 @@ impl Anchor {
 
     pub fn add_seed(&mut self, seed: &Seed, read_length: u32) {
         self.seed_count += 1;
+        self.counter1 += (seed.flag & SEED_FROM_BWT) as u16;
 
         let s: &mut AnchorSeed = self.seeds.first_mut().unwrap();
 
