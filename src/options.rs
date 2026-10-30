@@ -397,6 +397,14 @@ pub struct Args {
     #[arg(long = "mapq-fit-penalty", default_value_t = 0.0)]
     pub mapq_fit_penalty: f64,
 
+    /// Write, for every --dump-every-th pair, its read-level stats and every aligned candidate pair
+    /// to this TSV (columns in its first lines): the data to fit MAPQ and effort decisions on.
+    #[arg(long = "dump-candidates", value_name = "FILE")]
+    pub dump_candidates: Option<String>,
+
+    #[arg(long = "dump-every", default_value_t = 1)]
+    pub dump_every: u64,
+
     /// Before the aligned candidates are ranked, rescue the partner next to each one-mate candidate
     /// that could still beat the best full pair, and rank it as a pair.
     #[arg(long = "complete-singles", action)]

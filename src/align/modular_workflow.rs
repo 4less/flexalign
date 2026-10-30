@@ -1548,6 +1548,13 @@ impl<
         // The fewest copies of any core a mate kept (0: none kept).
         let minmult = |ranges: &[crate::align::process::range_extractor::Range<F>]| ranges.iter().map(|r| r.vrange.len()).min().unwrap_or(0);
         let (minmult_fwd, minmult_rev) = (minmult(ranges_fwd), minmult(ranges_rev));
+        // --dump-candidates: each mate's ranges, their fewest copies, and those of at most 16 / 256.
+        let range_stats = |ranges: &[crate::align::process::range_extractor::Range<F>]| {
+            format!("{}\t{}\t{}\t{}", ranges.len(), minmult(ranges),
+                ranges.iter().filter(|r| r.vrange.len() <= 16).count(), ranges.iter().filter(|r| r.vrange.len() <= 256).count())
+        };
+        let dumping = dump_this(rec_fwd.head());
+        let ranges_dump = if dumping { Some((range_stats(ranges_fwd), range_stats(ranges_rev))) } else { None };
         // --mapq-copies: a pair whose mates' least repeated cores have many copies is placed among
         // copies seeding did not all reach. Its MAPQ ceiling falls with the log of both counts (a
         // mate with no core kept counts as --max-range-size copies). Human, cap 4096: a pair whose
@@ -1610,7 +1617,15 @@ impl<
                 String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').split('/').next().unwrap_or(""),
                 minmult_fwd, minmult_rev, ta.0, ta.1, tb.0, tb.1);
         }
+        if let Some((rf, rr)) = ranges_dump {
+            let (ta, tb) = (self.seed_extractor_fwd.last_ties(), self.seed_extractor_rev.last_ties());
+            DUMP_READ.with(|d| *d.borrow_mut() = format!(
+                "{rf}\t{}\t{}\t{}\t{}\t{rr}\t{}\t{}\t{}\t{}\t{}\t{}",
+                seed_stats(&seeds_fwd), ta.0, ta.1, COPIES_CAP.with(|u| u.get()),
+                seed_stats(&seeds_rev), tb.0, tb.1, difficult as u8, minmult_fwd.min(minmult_rev), minmult_fwd.max(minmult_rev)));
+        }
         self.align_from_seeds(rec_fwd, rec_rev, &seeds_fwd, &seeds_rev, stats);
+        DUMP_READ.with(|d| d.borrow_mut().clear());
         SEEDLESS.with(|u| u.set(0));
         ALIGN_TOP_Y.with(|u| u.set(0));
         COPIES_CAP.with(|u| u.set(60));
@@ -1651,6 +1666,7 @@ impl<
     ) {
         // A read (pair) starts: no reference slice of the previous one is used again.
         crate::database::refseq2::reset_scratch();
+        let dump_db = self.db;
         // seeds_fwd.iter().for_each(|s| {
         //     let qend = s.qpos + s.length as u32;
         //     if qend as usize > rec_fwd.seq().len() {
@@ -2883,6 +2899,10 @@ impl<
             }
         }
 
+        if dump_this(rec_fwd.head()) {
+            dump_candidates(dump_db, rec_fwd, extension_anchors, fwd_anchor, rev_anchor, pseudo_mapq);
+        }
+
         // A mate below the identity OR coverage threshold is treated exactly like a mate with no
         // anchor: nothing is emitted for it, and it does not appear as the other mate's pairing
         // partner either. The coverage floor rejects short local matches to the wrong reference that
@@ -3256,7 +3276,117 @@ fn prefetch_line(bytes: &[u8]) {
     }
 }
 
+/// --dump-candidates: one P line for the pair (read-level fields from `run_pair`, the final
+/// MAPQ, where its mates were written) and one C line per aligned candidate pair, best first.
+/// Columns: see DUMP_HEADER.
+fn dump_candidates<DB: FlexalignDatabase>(db: &DB, rec_fwd: &RefFastqRecord, cands: &[AnchorPair], fa: Option<&Anchor>, ra: Option<&Anchor>, mapq: u8) {
+    use std::fmt::Write as _;
+    let Some((file, _)) = DUMP.get() else { return };
+    let name = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+    let name = name.strip_suffix("/1").unwrap_or(&name).to_string();
+    let rname = |a: &Anchor| db.get_rname(a.reference as usize).unwrap_or("?").to_string();
+    let at = |a: Option<&Anchor>| a.filter(|a| !a.reference_cigar_range.is_empty())
+        .map_or("-".to_string(), |a| format!("{}:{}", rname(a), a.reference_cigar_range.start));
+    let mate = |a: &Option<Anchor>| -> String {
+        match a.as_ref() {
+            None => "-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-".to_string(),
+            // A candidate the window did not reach (or the aligner gave up on): its seeds only.
+            Some(a) if a.score <= -1_000_000 || a.cigar.is_none() => format!(
+                "{}\t{}\t-\t{}\t{}\t{}\t{}\t{}\t-\t-\t-\t-\t-\t-",
+                rname(a), a.seeds.first().map_or(0, |s| s.rpos), if a.forward { '+' } else { '-' },
+                a.seed_count, a.counter1, a.seeds.iter().map(|s| s.length).sum::<u32>(), a.mismatches),
+            Some(a) => {
+                let (mut m, mut x, mut i, mut d, mut s) = (0usize, 0usize, 0usize, 0usize, 0usize);
+                if let Some(c) = a.cigar.as_ref() {
+                    for &op in &c.0 {
+                        match op { b'M' | b'=' => m += 1, b'X' => x += 1, b'I' => i += 1, b'D' => d += 1, b'S' => s += 1, _ => {} }
+                    }
+                }
+                let ident = if m + x + i + d > 0 { m as f64 / (m + x + i + d) as f64 } else { 0.0 };
+                format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}",
+                    rname(a), a.reference_cigar_range.start, a.reference_cigar_range.end, if a.forward { '+' } else { '-' },
+                    a.seed_count, a.counter1, a.seeds.iter().map(|s| s.length).sum::<u32>(), a.mismatches,
+                    -(a.score as i64), m, x, i + d, s, ident)
+            }
+        }
+    };
+    let same = |a: &Option<Anchor>, b: Option<&Anchor>| match (a.as_ref(), b) {
+        (Some(a), Some(b)) => a.reference == b.reference && a.reference_cigar_range == b.reference_cigar_range,
+        (None, None) => true,
+        _ => false,
+    };
+    let read = DUMP_READ.with(|d| d.borrow().clone());
+    let mut out = String::new();
+    let _ = writeln!(out, "P\t{name}\t{mapq}\t{}\t{}\t{}\t{}", cands.len(), at(fa), at(ra), if read.is_empty() { "-" } else { &read });
+    for (k, p) in cands.iter().enumerate() {
+        if p.0.is_none() && p.1.is_none() {
+            continue;
+        }
+        let _ = writeln!(out, "C\t{name}\t{k}\t{}\t{}\t{}", (same(&p.0, fa) && same(&p.1, ra)) as u8, mate(&p.0), mate(&p.1));
+    }
+    use std::io::Write as _;
+    if let Some(w) = file.lock().unwrap().as_mut() {
+        let _ = w.write_all(out.as_bytes());
+    }
+}
+
+
+/// The first line of a --dump-candidates file: the columns of its P and C lines.
+pub const DUMP_HEADER: &str = "#P\tread\tmapq\tcandidates\twritten_fwd\twritten_rev\t\
+f_ranges\tf_min_copies\tf_ranges_le16\tf_ranges_le256\tf_seeds\tf_exact_seeds\tf_cores_seeded\tf_min_kept\tf_min_exact\tf_ranges_seeded\tf_ranges_tie_dropped\tcopies_cap\t\
+r_ranges\tr_min_copies\tr_ranges_le16\tr_ranges_le256\tr_seeds\tr_exact_seeds\tr_cores_seeded\tr_min_kept\tr_min_exact\tr_ranges_seeded\tr_ranges_tie_dropped\t\
+adaptive\tmin_copies_lo\tmin_copies_hi\n\
+#C\tread\trank\twritten\t\
+f_ref\tf_start\tf_end\tf_strand\tf_seeds\tf_seeds_not_index\tf_seed_bases\tf_flank_mm\tf_cost\tf_match\tf_mismatch\tf_indel\tf_clip\tf_identity\t\
+r_ref\tr_start\tr_end\tr_strand\tr_seeds\tr_seeds_not_index\tr_seed_bases\tr_flank_mm\tr_cost\tr_match\tr_mismatch\tr_indel\tr_clip\tr_identity\n";
+
+/// `--dump-candidates`: the file every dumped pair is written to, and every how many pairs one is.
+pub static DUMP: std::sync::OnceLock<(std::sync::Mutex<Option<Box<dyn std::io::Write + Send>>>, u64)> = std::sync::OnceLock::new();
+
+/// Ends the --dump-candidates file (a .gz one gets its trailer) when dropped: held for the run.
+pub struct DumpFinish;
+impl Drop for DumpFinish {
+    fn drop(&mut self) {
+        if let Some((w, _)) = DUMP.get() {
+            if let Some(mut w) = w.lock().unwrap().take() {
+                let _ = w.flush();
+            }
+        }
+    }
+}
+
+/// Whether the pair named `head` is dumped: one in --dump-every, by a hash of its name (the same
+/// pairs whatever the thread count).
+fn dump_this(head: &[u8]) -> bool {
+    let Some((_, every)) = DUMP.get() else { return false };
+    let name = head.split(|&b| b == b' ' || b == b'\t').next().unwrap_or(head);
+    let name = name.strip_suffix(b"/1").or_else(|| name.strip_suffix(b"/2")).unwrap_or(name);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in name {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    h % every.max(&1) == 0
+}
+
+/// A mate's seeds for --dump-candidates: count, those whose flanks match the read exactly, the
+/// read positions (cores) seeded, and over those cores the fewest seeds kept (the copies left after
+/// the flank filter) and the fewest exact-flank seeds of a core with any (0: none).
+fn seed_stats(seeds: &[Seed]) -> String {
+    let exact = seeds.iter().filter(|s| s.mismatch == 0).count();
+    let mut per: std::collections::HashMap<u32, (usize, usize)> = std::collections::HashMap::new();
+    for s in seeds {
+        let e = per.entry(s.qpos - if s.mismatch == 0 { 0 } else { 8 }).or_default();
+        e.0 += 1;
+        e.1 += (s.mismatch == 0) as usize;
+    }
+    let min_kept = per.values().map(|v| v.0).min().unwrap_or(0);
+    let min_exact = per.values().filter(|v| v.1 > 0).map(|v| v.1).min().unwrap_or(0);
+    format!("{}\t{}\t{}\t{}\t{}", seeds.len(), exact, per.len(), min_kept, min_exact)
+}
+
 thread_local! {
+    /// --dump-candidates: the read-level fields of the pair being aligned, set by `run_pair`.
+    static DUMP_READ: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
     /// Mates of the pair being aligned without a seed from the index (0..=2).
     static SEEDLESS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     /// `--adaptive`: the alignment window of the pair being aligned, when not --align-top-y (0).

@@ -85,6 +85,19 @@ pub fn run(args: Args) {
     crate::align::modular_workflow::DISCORDANT_MAPQ_CAP.store(options.args.discordant_mapq_cap, std::sync::atomic::Ordering::Relaxed);
     crate::align::modular_workflow::DISCORDANT_ONLY_MAPPED.store(options.args.discordant_only_mapped, std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_UNIQUE_SCALE.store((options.args.mapq_unique_scale as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    if let Some(path) = options.args.dump_candidates.as_ref() {
+        use std::io::Write as _;
+        let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path).expect("--dump-candidates file"));
+        // A .gz path is written compressed (fast level: the dump is large).
+        let mut w: Box<dyn std::io::Write + Send> = if path.ends_with(".gz") {
+            Box::new(flate2::write::GzEncoder::new(file, flate2::Compression::fast()))
+        } else {
+            Box::new(file)
+        };
+        w.write_all(crate::align::modular_workflow::DUMP_HEADER.as_bytes()).unwrap();
+        let _ = crate::align::modular_workflow::DUMP.set((std::sync::Mutex::new(Some(w)), options.args.dump_every.max(1)));
+    }
+    let _dump_finish = crate::align::modular_workflow::DumpFinish;
     crate::align::common::MAPQ_FIT_PENALTY.store((options.args.mapq_fit_penalty as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_MM_SCALE.store((options.args.mapq_mm_scale as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::UNPAIRED_PENALTY.store(options.args.unpaired_penalty.max(0) as u32, std::sync::atomic::Ordering::Relaxed);
