@@ -374,6 +374,17 @@ pub struct Args {
     #[arg(long = "discordant-mapq-cap", default_value_t = 255)]
     pub discordant_mapq_cap: u8,
 
+    /// With --discordant-mapq-cap: cap only a mate whose partner is mapped elsewhere, not one whose
+    /// partner is unmapped (on marker genes a partner often lies off the gene's end).
+    #[arg(long = "discordant-only-mapped", action)]
+    pub discordant_only_mapped: bool,
+
+    /// With --mapq-from-alignment --mapq-per-mismatch: scale the MAPQ of a mismatch of margin by
+    /// K / (K + the best pair's mismatches), so that a read far from every placement (another
+    /// strain) needs a wider margin. 0: off.
+    #[arg(long = "mapq-mm-scale", default_value_t = 0.0)]
+    pub mapq_mm_scale: f64,
+
     /// Before the aligned candidates are ranked, rescue the partner next to each one-mate candidate
     /// that could still beat the best full pair, and rank it as a pair.
     #[arg(long = "complete-singles", action)]

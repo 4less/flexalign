@@ -361,6 +361,21 @@ impl AnchorScore for StdAnchorScore {
 
 /// `--mapq-per-mismatch` (0: the relative margin) and `--mapq-unique`, set once at start-up.
 pub static MAPQ_PER_MISMATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `--mapq-mm-scale`, as f32 bits (0: off), set once at start-up.
+pub static MAPQ_MM_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The MAPQ a mismatch of margin is worth, for a best pair costing `best_cost`. With
+/// `--mapq-mm-scale K`, `per_mm * K / (K + the best pair's mismatches)`: a read that differs from
+/// its best placement by many mismatches (another strain than the reference) is no more likely to
+/// be there than at a runner-up one mismatch worse; a read matching its best placement exactly
+/// (from the reference itself) is.
+pub fn per_mismatch_mapq(per_mm: f64, best_cost: f64) -> f64 {
+    let k = f32::from_bits(MAPQ_MM_SCALE.load(std::sync::atomic::Ordering::Relaxed)) as f64;
+    if k <= 0.0 {
+        return per_mm;
+    }
+    per_mm * k / (k + (best_cost / penalties::MISMATCH as f64).max(0.0))
+}
 pub static MAPQ_UNIQUE_SETTING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(30);
 /// `--unpaired-penalty`, for the fast-hit path's mismatch-margin MAPQ.
 pub static UNPAIRED_PENALTY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(34);
@@ -466,7 +481,7 @@ impl StdPairedAnchorMAPQ {
             let per_mm = MAPQ_PER_MISMATCH.load(std::sync::atomic::Ordering::Relaxed);
             if per_mm > 0 {
                 let margin = ((c2 - c1) / penalties::MISMATCH as f64).max(0.0);
-                return (per_mm as f64 * margin).round().min(MAPQ_MAX) as u8;
+                return (per_mismatch_mapq(per_mm as f64, c1) * margin).round().min(MAPQ_MAX) as u8;
             }
             if c2 <= 0.0 {
                 return 0; // the runner-up is also a perfect alignment: no margin at all

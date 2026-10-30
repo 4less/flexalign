@@ -936,6 +936,8 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
 /// Writes one SAM record for `m`, using `mate` for the pairing columns.
 /// `--discordant-mapq-cap`, set once at start-up (255: off).
 pub static DISCORDANT_MAPQ_CAP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+/// `--discordant-only-mapped`: the cap only for a mate whose partner is written elsewhere.
+pub static DISCORDANT_ONLY_MAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn write_sam_record<SO: SAMOutput>(
     out: &mut SO,
@@ -1012,7 +1014,11 @@ fn write_sam_record<SO: SAMOutput>(
             && mm.anchor.reference_cigar_range.start.abs_diff(anchor.reference_cigar_range.start) < MAX_INSERT as usize
     });
     let cap = DISCORDANT_MAPQ_CAP.load(std::sync::atomic::Ordering::Relaxed);
-    let mapping_quality = if together { mapping_quality } else { mapping_quality.min(cap) };
+    // A partner not written at all may lie off the reference's end (a marker gene's): not evidence
+    // against this mate with --discordant-only-mapped.
+    let partner_elsewhere = mate.is_some_and(|mm| !mm.anchor.reference_cigar_range.is_empty());
+    let exempt = DISCORDANT_ONLY_MAPPED.load(std::sync::atomic::Ordering::Relaxed) && !partner_elsewhere;
+    let mapping_quality = if together || exempt { mapping_quality } else { mapping_quality.min(cap) };
 
     out.write(
         sam_qname(head),
@@ -2869,7 +2875,8 @@ impl<
                     self.options.args.mapq_unique as i64
                 } else {
                     // Whole mismatches only: a margin below one is a tie.
-                    (per_mm * ((alt_cost - best_cost).max(0) / mm_cost)).min(60)
+                    (crate::align::common::per_mismatch_mapq(per_mm as f64, best_cost as f64)
+                        * ((alt_cost - best_cost).max(0) / mm_cost) as f64).round().min(60.0) as i64
                 };
                 pseudo_mapq = (q as u8).min(mapq_ceiling).min(copies_cap);
             }
