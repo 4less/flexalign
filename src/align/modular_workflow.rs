@@ -2959,6 +2959,17 @@ impl<
             }
         }
 
+        // --mapq-per-mate: each mate's MAPQ from the competition for its own placement.
+        let (mate_q_fwd, mate_q_rev) = if self.options.args.mapq_per_mate && self.options.args.mapq_from_alignment {
+            let cap = mapq_ceiling.min(copies_cap);
+            let unpaired = self.options.args.unpaired_penalty.max(0) as i64;
+            let per_mm = match self.options.args.mapq_per_mismatch { 0 => 30, v => v } as f64;
+            let unique = self.options.args.mapq_unique as f64;
+            (mate_mapq(extension_anchors, 0, fwd_anchor, unpaired, per_mm, unique).map(|q| q.min(cap)),
+             mate_mapq(extension_anchors, 1, rev_anchor, unpaired, per_mm, unique).map(|q| q.min(cap)))
+        } else {
+            (None, None)
+        };
         if dump_this(rec_fwd.head()) {
             dump_candidates(dump_db, rec_fwd, extension_anchors, fwd_anchor, rev_anchor, pseudo_mapq);
         }
@@ -3147,7 +3158,7 @@ impl<
                     m,
                     rev_mate,
                     true,
-                    pseudo_mapq,
+                    mate_q_fwd.unwrap_or(pseudo_mapq),
                     self.options.args.lone_mate_mapq_penalty,
                     stats,
                 );
@@ -3226,7 +3237,7 @@ impl<
                     m,
                     fwd_mate,
                     false,
-                    pseudo_mapq,
+                    mate_q_rev.unwrap_or(pseudo_mapq),
                     self.options.args.lone_mate_mapq_penalty,
                     stats,
                 );
@@ -3509,6 +3520,41 @@ fn trace_mate<DB: FlexalignDatabase, const F: usize>(
     let at_locus = seeds.iter().filter(|s| s.rval == rid && ((s.rpos as i64) - *pos0 as i64).abs() <= len + 16).count();
     Some(format!("T\t{name}\t{mate}\t{n_kmers}\t{}\t{with_truth}\t{seeded}\t{flank_worse}\t{tie_cut}\t{budget}\t{other}\t{at_locus}\t{}\t{flex}\t{}\n", ranges.len(), if min_ties == usize::MAX { 0 } else { min_ties },
         cut_info.map_or("-\t-\t-\t-\t-\t-".to_string(), |c| format!("{}\t{}\t{}\t{}\t{}\t{}", c.0, c.1, c.2, c.3, c.4, c.5))))
+}
+
+/// `--mapq-per-mate`: the MAPQ of mate `side` placed at `placed`, from the candidate pairs: the best
+/// pair holding it there against the best pair placing it elsewhere (another reference, or more
+/// than 200 bp away), each pair costing both mates' alignments, an absent or unaligned mate the
+/// unpaired penalty. A runner-up that moves only the partner is no rival for this mate: a mate in
+/// unique sequence keeps its MAPQ when its partner, in a repeat, ties. The margin in mismatches
+/// goes through the same per-mismatch MAPQ, unique MAPQ and fit cap as the pair's. None when the
+/// mate is not placed or no aligned pair holds it (its pair MAPQ is kept).
+fn mate_mapq(cands: &[AnchorPair], side: usize, placed: Option<&Anchor>, unpaired: i64, per_mm: f64, unique: f64) -> Option<u8> {
+    let placed = placed?;
+    fn aligned(a: &Option<Anchor>) -> Option<&Anchor> {
+        a.as_ref().filter(|a| a.score > -1_000_000 && a.cigar.is_some())
+    }
+    let cost = |a: &Option<Anchor>| aligned(a).map_or(unpaired, |a| (-(a.score as i64)).max(0));
+    let (mut held, mut elsewhere) = (i64::MAX, i64::MAX);
+    for p in cands {
+        let (me, _) = if side == 0 { (&p.0, &p.1) } else { (&p.1, &p.0) };
+        let Some(m) = aligned(me) else { continue };
+        let c = cost(&p.0) + cost(&p.1);
+        let same = m.reference == placed.reference
+            && m.reference_cigar_range.start.abs_diff(placed.reference_cigar_range.start) <= 200;
+        if same { held = held.min(c) } else { elsewhere = elsewhere.min(c) }
+    }
+    if held == i64::MAX {
+        return None;
+    }
+    let best = held as f64;
+    let q = if elsewhere == i64::MAX {
+        crate::align::common::unique_mapq(unique, best)
+    } else {
+        let margin = ((elsewhere - held).max(0) as f64 / penalties::MISMATCH as f64).floor();
+        crate::align::common::per_mismatch_mapq(per_mm, best) * margin
+    };
+    Some(q.min(crate::align::common::fit_cap(best)).round().clamp(0.0, 60.0) as u8)
 }
 
 /// The fewest seeds kept for a seeded core (the copies left after the flank filter) and the fewest

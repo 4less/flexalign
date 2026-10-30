@@ -423,6 +423,12 @@ pub struct Args {
     #[arg(long = "mapq-fit-penalty", default_value_t = 0.0)]
     pub mapq_fit_penalty: f64,
 
+    /// With --mapq-from-alignment: each mate's MAPQ from the competition for its own placement (the
+    /// best pair placing it elsewhere) instead of the pair's runner-up, which may move only the
+    /// partner: a mate in unique sequence keeps its MAPQ when its partner, in a repeat, ties.
+    #[arg(long = "mapq-per-mate", action)]
+    pub mapq_per_mate: bool,
+
     /// Write, for every --dump-every-th pair, its read-level stats and every aligned candidate pair
     /// to this TSV (columns in its first lines): the data to fit MAPQ and effort decisions on.
     #[arg(long = "dump-candidates", value_name = "FILE")]
