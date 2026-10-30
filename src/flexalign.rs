@@ -106,6 +106,8 @@ pub fn run(args: Args) {
         }).collect();
         let _ = crate::align::modular_workflow::TRACE_TRUTH.set(map);
     }
+    crate::align::process::seed_extractor::TIE_FUNNEL_MAX_SEEDED.store(options.args.tie_funnel, std::sync::atomic::Ordering::Relaxed);
+    crate::align::process::seed_extractor::TIE_FUNNEL_KEEP.store(options.args.tie_funnel_keep.max(1), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_FIT_PENALTY.store((options.args.mapq_fit_penalty as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_MM_SCALE.store((options.args.mapq_mm_scale as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::UNPAIRED_PENALTY.store(options.args.unpaired_penalty.max(0) as u32, std::sync::atomic::Ordering::Relaxed);

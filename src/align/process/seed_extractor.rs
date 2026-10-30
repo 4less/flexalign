@@ -285,7 +285,85 @@ pub struct StdSeedExtractor<const K: usize, const C: usize, const F: usize> {
     last_ties: (usize, usize),
 }
 
+/// `--tie-funnel N`: for a mate with at most N cores seeded, the cores dropped for too many flank
+/// ties vote (0: off); `--tie-funnel-keep`: the most read starts the vote may seed. Set at start-up.
+pub static TIE_FUNNEL_MAX_SEEDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static TIE_FUNNEL_KEEP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
 impl<const K: usize, const C: usize, const F: usize> StdSeedExtractor<K, C, F> {
+    /// The tie funnel. A core dropped for more best-flank ties than `flex` has copies all matching
+    /// the read over 31 bases (98 % of the true loci lost this way on human: every flank base
+    /// equal), so the k-mer cannot tell them apart -- but the read's other dropped cores can. Each
+    /// tied copy votes for where the read would start on the reference (rpos - qpos forward,
+    /// rpos + qpos on the other strand; one vote per core), and the starts the most cores agree on
+    /// (at least two) are seeded from those copies, when there are at most `keep` of them. A start
+    /// several cores agree on is a copy matching the read across all of them; when more than `keep`
+    /// starts tie, the read is the same across its copies and nothing is added.
+    fn tie_funnel(&mut self, ranges: &[Range<F>], flex: usize, keep: usize) {
+        // (reference, strand, read start, core's read position, range, cell, flank distance)
+        let mut votes: Vec<(u64, u8, i64, u32, u32, u32, u8)> = Vec::new();
+        for (ri, r) in ranges.iter().enumerate() {
+            if !r.vrange.has_header() {
+                continue;
+            }
+            let min = flank_distances(&r.vrange, r.fmer.0 as u32, &mut self.flex_scratch);
+            let at_min = self.flex_scratch.iter().filter(|&&d| d as u32 == min).count();
+            if at_min <= flex {
+                continue; // seeded (or not tied): the normal walk handled it
+            }
+            for (i, &d) in self.flex_scratch.iter().enumerate() {
+                if d as u32 != min {
+                    continue;
+                }
+                let (value, rpos) = r.vrange.value(i);
+                let q = r.qpos as i64;
+                votes.push((value, 0, rpos as i64 - q, r.qpos as u32, ri as u32, i as u32, d));
+                votes.push((value, 1, rpos as i64 + q, r.qpos as u32, ri as u32, i as u32, d));
+            }
+        }
+        if votes.is_empty() {
+            return;
+        }
+        votes.sort_unstable();
+        // Support of each start: its distinct cores.
+        let mut starts: Vec<(usize, usize, usize)> = Vec::new(); // (support, from, to) into votes
+        let mut a = 0;
+        while a < votes.len() {
+            let mut b = a;
+            let mut support = 0;
+            let mut last_q = u32::MAX;
+            while b < votes.len() && (votes[b].0, votes[b].1, votes[b].2) == (votes[a].0, votes[a].1, votes[a].2) {
+                if votes[b].3 != last_q {
+                    support += 1;
+                    last_q = votes[b].3;
+                }
+                b += 1;
+            }
+            starts.push((support, a, b));
+            a = b;
+        }
+        let best = starts.iter().map(|s| s.0).max().unwrap_or(0);
+        if best < 2 {
+            return;
+        }
+        let winners: Vec<&(usize, usize, usize)> = starts.iter().filter(|s| s.0 == best).collect();
+        if winners.len() > keep {
+            return;
+        }
+        let mut emitted: Vec<(u32, u32)> = Vec::new();
+        for &&(_, from, to) in &winners {
+            for v in &votes[from..to] {
+                if emitted.contains(&(v.4, v.5)) {
+                    continue;
+                }
+                emitted.push((v.4, v.5));
+                let r = &ranges[v.4 as usize];
+                let (value, rpos) = r.vrange.value(v.5 as usize);
+                self.seeds.push(Seed::from_flexmer::<K, C, F>(r.qpos, rpos, value, v.6 as u32));
+            }
+        }
+    }
+
     pub fn new(max_best_flex: usize, max_range_size: usize, min_ranges: usize, max_ranges: usize, mask_flank_mult: usize, flank_slack: u32) -> Self {
         Self {
             seeds: Vec::new(),
@@ -358,6 +436,14 @@ impl<const K: usize, const C: usize, const F: usize> SeedExtractor<F> for StdSee
             // eprintln!("{} -> {} (Still discarded: {})", old_ranges, ranges, discarded_max_flex_count);
         }
         
+        // --tie-funnel: what the dropped cores agree on.
+        let funnel_max_seeded = TIE_FUNNEL_MAX_SEEDED.load(std::sync::atomic::Ordering::Relaxed);
+        if funnel_max_seeded > 0 && self.last_ties.1 > 0 && self.last_ties.0 <= funnel_max_seeded {
+            let keep = TIE_FUNNEL_KEEP.load(std::sync::atomic::Ordering::Relaxed);
+            let flex = self.max_best_flex.min(cap);
+            self.tie_funnel(ranges, flex, keep);
+        }
+
         // stats.time_range_header += duration;
         stats.seeds += self.seeds.len();
 

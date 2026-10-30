@@ -435,6 +435,15 @@ pub struct Args {
     #[arg(long = "mapq-per-mate", action)]
     pub mapq_per_mate: bool,
 
+    /// For a mate with at most this many cores seeded: the cores dropped for too many flank ties
+    /// vote with their tied copies for where the read starts; the starts most of them agree on
+    /// (at most --tie-funnel-keep) are seeded. 0: off.
+    #[arg(long = "tie-funnel", default_value_t = 0)]
+    pub tie_funnel: usize,
+
+    #[arg(long = "tie-funnel-keep", default_value_t = 16)]
+    pub tie_funnel_keep: usize,
+
     /// Write, for every --dump-every-th pair, its read-level stats and every aligned candidate pair
     /// to this TSV (columns in its first lines): the data to fit MAPQ and effort decisions on.
     #[arg(long = "dump-candidates", value_name = "FILE")]
