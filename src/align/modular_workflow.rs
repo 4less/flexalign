@@ -898,9 +898,16 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
         for (k, c) in c2s.iter().enumerate() {
             if k != j { alt = alt.min(c.mm as i64 * mmc + m1.mm as i64 * mmc + unpaired); }
         }
-        if alt != i64::MAX {
-            mapq = (per_mm * ((alt - best_cost).max(0) / mmc)).min(60) as u8;
-        }
+        // As the full path takes it (`StdPairedAnchorMAPQ::mapq_from` and the rescue's runner-up
+        // search): the margin through --mapq-mm-scale, no runner-up through --mapq-unique-scale, and
+        // the --mapq-fit-penalty cap -- so a pair gets the same MAPQ whichever path places it (and a
+        // sharded run, which has no fast path, the same as an unsharded one).
+        let q = if alt != i64::MAX {
+            crate::align::common::per_mismatch_mapq(per_mm as f64, best_cost as f64) * ((alt - best_cost).max(0) / mmc) as f64
+        } else {
+            crate::align::common::unique_mapq(mapq as f64, best_cost as f64)
+        };
+        mapq = q.min(crate::align::common::fit_cap(best_cost as f64)).round().clamp(0.0, 60.0) as u8;
     }
     if dump_this(rec_fwd.head()) {
         // --dump-candidates: an F line per fast-placed pair. alt_pair: the fewest mismatches of
@@ -1588,13 +1595,6 @@ impl<
         // mate with no core kept counts as --max-range-size copies). Human, cap 4096: a pair whose
         // best mate has a core of at most 16 copies is wrong 0.3-4 % of the time, one whose best
         // has more than 256 about 20 %.
-        if self.options.args.mapq_copies > 0 {
-            let full = self.options.args.max_range_size.max(1);
-            let l = |x: usize| ((if x == 0 { full } else { x }) as f64).log2();
-            let (lo, hi) = (l(minmult_fwd).min(l(minmult_rev)), l(minmult_fwd).max(l(minmult_rev)));
-            let q = self.options.args.mapq_copies as f64 - self.options.args.mapq_copies_lo * lo - self.options.args.mapq_copies_hi * hi;
-            COPIES_CAP.with(|u| u.set(q.clamp(0.0, 60.0) as u8));
-        }
         let default_flex = self.seed_extractor_fwd.max_best_flex();
         if difficult {
             stats.adaptive_pairs += 1;
@@ -1648,17 +1648,7 @@ impl<
         // copy whose flanks match the read exactly makes the mate unique (human: 0.07 % of such
         // mates misplaced, against 2 % for a least repeated core of 2-16 copies); else the fewest
         // copies kept for a core.
-        if self.options.args.mapq_copies > 0 && self.options.args.mapq_copies_flank {
-            let full = self.options.args.max_range_size.max(1);
-            let copies = |seeds: &[Seed]| {
-                let (kept, exact) = flank_copies(seeds);
-                if exact == 1 { 1 } else if kept == 0 { full } else { kept }
-            };
-            let l = |x: usize| (x as f64).log2();
-            let (a, b) = (l(copies(&seeds_fwd)), l(copies(&seeds_rev)));
-            let q = self.options.args.mapq_copies as f64 - self.options.args.mapq_copies_lo * a.min(b) - self.options.args.mapq_copies_hi * a.max(b);
-            COPIES_CAP.with(|u| u.set(q.clamp(0.0, 60.0) as u8));
-        }
+        set_copies_cap(&self.options.args, minmult_fwd, minmult_rev, &seeds_fwd, &seeds_rev);
         stats.seeds += seeds_fwd.len() + seeds_rev.len();
 
         // Seedless: no seed at all -- or, with --seedless-multiplicity N, none from a core of at
@@ -3555,6 +3545,33 @@ fn mate_mapq(cands: &[AnchorPair], side: usize, placed: Option<&Anchor>, unpaire
         crate::align::common::per_mismatch_mapq(per_mm, best) * margin
     };
     Some(q.min(crate::align::common::fit_cap(best)).round().clamp(0.0, 60.0) as u8)
+}
+
+/// `--mapq-copies`: sets the MAPQ ceiling of the pair `align_from_seeds` aligns next on this thread,
+/// from each mate's fewest core copies (`min_copies_*`, 0: no core kept, counted as
+/// --max-range-size) or, with --mapq-copies-flank, its copies after the flank filter (from its seeds).
+/// A pair whose mates' least repeated cores have many copies is placed among copies seeding did not
+/// all reach: the ceiling falls with the log of both counts. The unsharded path and the sharded
+/// rejoin both set it here; `clear_copies_cap` lifts it after the pair.
+pub fn set_copies_cap(args: &crate::options::Args, min_copies_fwd: usize, min_copies_rev: usize, seeds_fwd: &[Seed], seeds_rev: &[Seed]) {
+    if args.mapq_copies == 0 {
+        return;
+    }
+    let full = args.max_range_size.max(1);
+    let copies = |min_copies: usize, seeds: &[Seed]| {
+        if args.mapq_copies_flank {
+            let (kept, exact) = flank_copies(seeds);
+            if exact == 1 { 1 } else if kept == 0 { full } else { kept }
+        } else if min_copies == 0 { full } else { min_copies }
+    };
+    let (a, b) = ((copies(min_copies_fwd, seeds_fwd) as f64).log2(), (copies(min_copies_rev, seeds_rev) as f64).log2());
+    let q = args.mapq_copies as f64 - args.mapq_copies_lo * a.min(b) - args.mapq_copies_hi * a.max(b);
+    COPIES_CAP.with(|u| u.set(q.clamp(0.0, 60.0) as u8));
+}
+
+/// Lifts the `set_copies_cap` ceiling once its pair is written.
+pub fn clear_copies_cap() {
+    COPIES_CAP.with(|u| u.set(60));
 }
 
 /// The fewest seeds kept for a seeded core (the copies left after the flank filter) and the fewest

@@ -104,6 +104,12 @@ impl<const K: usize, const C: usize, const F: usize> ReplaySeedExtractor<K, C, F
         }
     }
 
+    /// The fewest positions of a gathered range (a core's copies; 0: none gathered), as the unsharded
+    /// path takes its fewest core copies for --mapq-copies.
+    pub fn min_copies(&self) -> usize {
+        self.ranges.iter().map(|r| r.n_positions as usize).min().unwrap_or(0)
+    }
+
     /// The gathered mate's cores the repeat index could not resolve, over all shards.
     pub fn unresolved(&self) -> usize {
         self.unresolved

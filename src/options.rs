@@ -55,20 +55,26 @@ pub struct Args {
     #[arg(long = "mask-flank-mult", default_value_t = 0)]
     pub mask_flank_mult: usize,
 
+    /// Effort preset: as --fast with at most 256 copies of a core kept (--max-range-size 256; the index
+    /// is built with it) and no extra effort for repetitive pairs (--adaptive off): the settings the
+    /// sharded runs were built for. Options given explicitly win over a preset.
+    #[arg(long = "ultra-fast", action, conflicts_with_all = ["fast", "sensitive", "very_sensitive"])]
+    pub ultra_fast: bool,
+
     /// Effort preset: fewer candidates extended (-z 16). Options given explicitly win over a preset.
-    #[arg(long = "fast", action, conflicts_with_all = ["sensitive", "very_sensitive"])]
+    #[arg(long = "fast", action, conflicts_with_all = ["ultra_fast", "sensitive", "very_sensitive"])]
     pub fast: bool,
 
     /// Effort preset: -z 128, and for repetitive pairs (--adaptive, on with this preset) a flank-tie
     /// limit of 512 and 32 candidates aligned. Human: wrong placements at MAPQ >= 1 -27 % for 2x
     /// run time; marker genes: unchanged.
-    #[arg(long = "sensitive", action, conflicts_with_all = ["fast", "very_sensitive"])]
+    #[arg(long = "sensitive", action, conflicts_with_all = ["ultra_fast", "fast", "very_sensitive"])]
     pub sensitive: bool,
 
     /// Effort preset: as --sensitive with a flank-tie limit of 2048 for repetitive pairs and 8
     /// candidates aligned for every pair. Human: wrong placements at MAPQ >= 1 -63 % (minibwa's
     /// precision) for 20x run time.
-    #[arg(long = "very-sensitive", action, conflicts_with_all = ["fast", "sensitive"])]
+    #[arg(long = "very-sensitive", action, conflicts_with_all = ["ultra_fast", "fast", "sensitive"])]
     pub very_sensitive: bool,
 
     /// Extend at most this many anchor pairs (the top Z after the post-pairing sort).
@@ -580,6 +586,12 @@ impl Args {
     /// were not given on the command line (`matches` tells which were).
     pub fn apply_preset(&mut self, matches: &clap::ArgMatches) {
         let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        if self.ultra_fast {
+            if !given("extend_top_z") { self.extend_top_z = 16; }
+            if !given("max_range_size") { self.max_range_size = 256; }
+            if !given("adaptive") { self.adaptive = false; }
+            return;
+        }
         let (z, flex, top_y, y, adaptive) = if self.fast {
             (Some(16), None, None, None, false)
         } else if self.sensitive {

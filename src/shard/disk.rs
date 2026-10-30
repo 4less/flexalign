@@ -318,9 +318,13 @@ pub fn run_disk_rejoin_align<
         let groups = batch_map.get(&(id.idx_in_batch as u32)).unwrap_or(&empty);
         replay_fwd.gather(groups, 0);
         replay_rev.gather(groups, 1);
+        let (copies_fwd, copies_rev) = (replay_fwd.min_copies(), replay_rev.min_copies());
         let seeds_fwd = replay_fwd.generate(&mut sort_time);
         let seeds_rev = replay_rev.generate(&mut sort_time);
+        // --mapq-copies, as the unsharded path sets it.
+        crate::align::modular_workflow::set_copies_cap(&options.args, copies_fwd, copies_rev, seeds_fwd, seeds_rev);
         modular_pe.align_from_seeds(rec_fwd, rec_rev, seeds_fwd, seeds_rev, stats);
+        crate::align::modular_workflow::clear_copies_cap();
     };
 
     Ok(
