@@ -528,8 +528,9 @@ impl<
     fn build(options: &crate::options::Options) -> Self {
         let db_paths = DBPaths::new(&options.reference);
 
-        let result = flexmap::build::default_build::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(
-            &options.reference, options.args.max_range_size
+        // On every thread (-t); the index is identical to the one-thread build's.
+        let result = flexmap::build::default_build_par::<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>(
+            &options.reference, options.args.max_range_size, options.args.threads.max(1) as usize
         );
 
         let (flexmap, rname_to_rid, rid_to_rname) = match result {
