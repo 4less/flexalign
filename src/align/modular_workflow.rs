@@ -838,16 +838,19 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
     if !listed {
         return miss(FastMiss::FewVotes, stats);
     }
-    // The pairable combination with the fewest mismatches; most votes (score) on a tie.
+    // The pairable combination with the fewest mismatches; most votes (score) on a tie. With
+    // --insert-score, a combination's insert counts as part of its mismatches (its cost / MISMATCH).
     let (c1s, c2s) = (&scratch.cands_fwd, &scratch.cands_rev);
-    let mut best: Option<(usize, usize, usize, i64)> = None; // (i, j, mm, score)
+    let span = |a: &FastCand, b: &FastCand| (a.end.max(b.end) - a.start.min(b.start)) as i64;
+    let ins_mm = |a: &FastCand, b: &FastCand| crate::align::common::insert_cost(span(a, b));
+    let mut best: Option<(usize, usize, usize, i64)> = None; // (i, j, cost, score)
     let mut runner_up: i64 = 0;
     for (i, a) in c1s.iter().enumerate() {
         for (j, b) in c2s.iter().enumerate() {
             if !fast_pairable(a, b, MAX_INSERT) {
                 continue;
             }
-            let (mm, score) = (a.mm + b.mm, a.score + b.score);
+            let (mm, score) = ((a.mm + b.mm) * penalties::MISMATCH as usize + ins_mm(a, b) as usize, a.score + b.score);
             match best {
                 Some((_, _, bmm, bscore)) if (mm, -score) >= (bmm, -bscore) => runner_up = runner_up.max(score),
                 Some((_, _, _, bscore)) => { runner_up = runner_up.max(bscore); best = Some((i, j, mm, score)); }
@@ -861,6 +864,13 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
     };
     let (m1, m2) = (c1s[i], c2s[j]);
     if !write {
+        // --insert-score: the probe collects the inserts of pairs placed with no other pairing.
+        if crate::align::common::INSERT_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+            let alone = c1s.iter().enumerate().all(|(a_i, a)| c2s.iter().enumerate().all(|(b_i, b)| (a_i, b_i) == (i, j) || !fast_pairable(a, b, MAX_INSERT)));
+            if alone {
+                crate::align::common::INSERT_SAMPLES.lock().unwrap().push(span(&m1, &m2) as u32);
+            }
+        }
         return true; // the probe only asks whether the pair would have been placed
     }
     // A lone candidate elsewhere competes too, as a single-sided anchor pair would.
@@ -883,12 +893,12 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
     if per_mm > 0 {
         let mmc = penalties::MISMATCH as i64;
         let unpaired = crate::align::common::UNPAIRED_PENALTY.load(std::sync::atomic::Ordering::Relaxed) as i64;
-        let best_cost = (m1.mm + m2.mm) as i64 * mmc;
+        let best_cost = (m1.mm + m2.mm) as i64 * mmc + ins_mm(&m1, &m2);
         let mut alt = i64::MAX;
         for (a_i, a) in c1s.iter().enumerate() {
             for (b_i, b) in c2s.iter().enumerate() {
                 if (a_i, b_i) != (i, j) && fast_pairable(a, b, MAX_INSERT) {
-                    alt = alt.min((a.mm + b.mm) as i64 * mmc);
+                    alt = alt.min((a.mm + b.mm) as i64 * mmc + ins_mm(a, b));
                 }
             }
         }
@@ -2575,6 +2585,8 @@ impl<
                 let cost = |u: Option<&Anchor>| u.map_or(unpaired_penalty, |a| -a.score) as i64;
                 match (usable(a1), usable(a2)) {
                     (None, None) => i64::MAX,
+                    // --insert-score: how likely the pair's insert is, as part of its cost.
+                    (Some(x), Some(y)) => cost(Some(x)) + cost(Some(y)) + crate::align::common::pair_insert_cost(x, y),
                     (u1, u2) => cost(u1) + cost(u2),
                 }
             });
@@ -2925,7 +2937,7 @@ impl<
                         continue;
                     }
                     let c = match other.as_ref() {
-                        Some(o) if o.score > -1_000_000 => cost(a) + cost(o),
+                        Some(o) if o.score > -1_000_000 => cost(a) + cost(o) + crate::align::common::pair_insert_cost(a, o),
                         _ => {
                             if tried == 8 {
                                 continue;
@@ -3529,7 +3541,10 @@ fn mate_mapq(cands: &[AnchorPair], side: usize, placed: Option<&Anchor>, unpaire
     for p in cands {
         let (me, _) = if side == 0 { (&p.0, &p.1) } else { (&p.1, &p.0) };
         let Some(m) = aligned(me) else { continue };
-        let c = cost(&p.0) + cost(&p.1);
+        let c = cost(&p.0) + cost(&p.1) + match (aligned(&p.0), aligned(&p.1)) {
+            (Some(x), Some(y)) => crate::align::common::pair_insert_cost(x, y),
+            _ => 0,
+        };
         let same = m.reference == placed.reference
             && m.reference_cigar_range.start.abs_diff(placed.reference_cigar_range.start) <= 200;
         if same { held = held.min(c) } else { elsewhere = elsewhere.min(c) }

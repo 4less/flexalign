@@ -438,6 +438,20 @@ pub struct Args {
     /// For a mate with at most this many cores seeded: the cores dropped for too many flank ties
     /// vote with their tied copies for where the read starts; the starts most of them agree on
     /// (at most --tie-funnel-keep) are seeded. 0: off.
+    /// Score each candidate pair's insert size: minus the log-probability of an insert that far from
+    /// the run's mean (measured on the first pairs placed without alternative), as part of the
+    /// pair's cost in the ranking and the MAPQ, as minibwa scores pairs.
+    #[arg(long = "insert-score", action)]
+    pub insert_score: bool,
+
+    /// With --insert-score: the insert-size mean and standard deviation to use instead of measuring
+    /// them (a run without the probe, such as a sharded one, or a read subset).
+    #[arg(long = "insert-mean", default_value_t = 0.0)]
+    pub insert_mean: f64,
+
+    #[arg(long = "insert-sd", default_value_t = 0.0)]
+    pub insert_sd: f64,
+
     #[arg(long = "tie-funnel", default_value_t = 0)]
     pub tie_funnel: usize,
 

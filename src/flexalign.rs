@@ -106,6 +106,10 @@ pub fn run(args: Args) {
         }).collect();
         let _ = crate::align::modular_workflow::TRACE_TRUTH.set(map);
     }
+    if options.args.insert_score && options.args.insert_mean > 0.0 && options.args.insert_sd > 0.0 {
+        let _ = crate::align::common::INSERT_STATS.set((options.args.insert_mean, options.args.insert_sd));
+        eprintln!("Insert size: mean {:.1}, standard deviation {:.1} (given)", options.args.insert_mean, options.args.insert_sd);
+    }
     crate::align::process::seed_extractor::TIE_FUNNEL_MAX_SEEDED.store(options.args.tie_funnel, std::sync::atomic::Ordering::Relaxed);
     crate::align::process::seed_extractor::TIE_FUNNEL_KEEP.store(options.args.tie_funnel_keep.max(1), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_FIT_PENALTY.store((options.args.mapq_fit_penalty as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);

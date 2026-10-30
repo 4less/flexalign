@@ -338,7 +338,10 @@ pub fn process_fastq_wrapper_modular<
                 // workers start, and switch it off for the run when too few succeed. One decision
                 // for the whole run, from the same pairs every time, so the output is the same
                 // run to run (a per-worker probe depended on thread scheduling).
-                if options.args.fast_hit_on() {
+                // --insert-score: the probe's pairs placed with no alternative give the insert sizes.
+                let measure = options.args.insert_score && crate::align::common::INSERT_STATS.get().is_none();
+                crate::align::common::INSERT_COLLECT.store(measure, std::sync::atomic::Ordering::Relaxed);
+                if options.args.fast_hit_on() || measure {
                     let probe_started = std::time::Instant::now();
                     let mut probe_stats = Stats::default();
                     let (mut tried, mut hit) = (0usize, 0usize);
@@ -363,7 +366,14 @@ pub fn process_fastq_wrapper_modular<
                         }
                     }
                     let off = tried > 0 && hit * 5 < tried * modular_workflow::FAST_HIT_MIN_FIFTHS;
-                    modular_workflow::set_fast_hit_enabled(!off);
+                    modular_workflow::set_fast_hit_enabled(!off && options.args.fast_hit_on());
+                    if measure {
+                        crate::align::common::INSERT_COLLECT.store(false, std::sync::atomic::Ordering::Relaxed);
+                        match crate::align::common::set_insert_stats() {
+                            Some((mean, sd)) => eprintln!("Insert size: mean {mean:.1}, standard deviation {sd:.1} (from {} probe pairs)", crate::align::common::INSERT_SAMPLES.lock().unwrap().len()),
+                            None => eprintln!("Insert size: too few unique probe pairs, --insert-score off for this run"),
+                        }
+                    }
                     eprintln!("Fast-hit probe: {} of the first {} pairs placed -> {} ({:.1?})", hit, tried, if off { "off for this run" } else { "on" }, probe_started.elapsed());
                 }
 

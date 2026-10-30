@@ -365,6 +365,64 @@ pub static MAPQ_PER_MISMATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::
 pub static MAPQ_MM_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// `--mapq-unique-scale`, as f32 bits (0: off), set once at start-up.
 pub static MAPQ_UNIQUE_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `--insert-score`: the insert sizes of the probe's pairs placed with no alternative, collected
+/// while `INSERT_COLLECT` is set, and the statistics made of them (mean, standard deviation).
+pub static INSERT_COLLECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static INSERT_SAMPLES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+pub static INSERT_STATS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+
+/// Sets the insert-size statistics from the collected samples, as minibwa's `mb_pestat` does: the
+/// quartiles bound the outliers (2 interquartile ranges out), and the rest give the mean and
+/// standard deviation. Returns them, or None for fewer than 50 samples (insert scoring stays off).
+pub fn set_insert_stats() -> Option<(f64, f64)> {
+    let mut v = INSERT_SAMPLES.lock().unwrap().clone();
+    if v.len() < 50 {
+        return None;
+    }
+    v.sort_unstable();
+    let q = |f: f64| v[((v.len() - 1) as f64 * f).round() as usize] as f64;
+    let (p25, p75) = (q(0.25), q(0.75));
+    let (lo, hi) = (p25 - 2.0 * (p75 - p25), p75 + 2.0 * (p75 - p25));
+    let kept: Vec<f64> = v.iter().map(|&x| x as f64).filter(|&x| x >= lo && x <= hi).collect();
+    let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+    let sd = (kept.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / kept.len() as f64).sqrt().max(1.0);
+    let _ = INSERT_STATS.set((mean, sd));
+    INSERT_STATS.get().copied()
+}
+
+/// ln(erfc(x)) for x >= 0 (Numerical Recipes' erfcc, relative error under 1.2e-7, in log space so
+/// it holds far into the tail).
+fn ln_erfc(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806
+        + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+    t.ln() + poly
+}
+
+/// `--insert-score`: what an insert of `insert` bases costs a pair, in alignment-cost units (a
+/// mismatch costs penalties::MISMATCH): minus the log-probability of a normal insert that far from
+/// the run's mean, as minibwa's pair score has it (0.721 per natural log at its match score of 1,
+/// whose mismatch costs 5; here a mismatch costs MISMATCH). 0 at the mean, about half a mismatch at
+/// 2 standard deviations, about 3 at 6. 0 without statistics.
+pub fn insert_cost(insert: i64) -> i64 {
+    let Some(&(mean, sd)) = INSERT_STATS.get() else { return 0 };
+    let z = ((insert as f64 - mean) / sd).abs();
+    let w = 0.721 * penalties::MISMATCH as f64 / 5.0;
+    (-w * ln_erfc(z / std::f64::consts::SQRT_2)).round() as i64
+}
+
+/// The insert of two placed mates (the span from the leftmost start to the rightmost end), and its
+/// `insert_cost`; 0 when they are on different references.
+pub fn pair_insert_cost(a: &crate::align::data_structures::anchor::Anchor, b: &crate::align::data_structures::anchor::Anchor) -> i64 {
+    if a.reference != b.reference || a.reference_cigar_range.is_empty() || b.reference_cigar_range.is_empty() {
+        return 0;
+    }
+    let lo = a.reference_cigar_range.start.min(b.reference_cigar_range.start);
+    let hi = a.reference_cigar_range.end.max(b.reference_cigar_range.end);
+    insert_cost((hi - lo) as i64)
+}
+
 /// `--mapq-fit-penalty`, as f32 bits (0: off), set once at start-up.
 pub static MAPQ_FIT_PENALTY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -497,6 +555,7 @@ impl StdPairedAnchorMAPQ {
                     .iter()
                     .map(|a| a.as_ref().map_or(unpaired_penalty as i64, |a| (-a.score as i64).max(0)))
                     .sum::<i64>()
+                    + match (&p.0, &p.1) { (Some(a), Some(b)) => pair_insert_cost(a, b), _ => 0 }
             };
             let c1 = cost(&anchors[0]) as f64;
             let Some(runner_up) = runner_up else {
