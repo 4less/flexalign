@@ -1601,6 +1601,21 @@ impl<
         }
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
+        // --mapq-copies-flank: the copy counts of the cap after the flank filter. A core with one
+        // copy whose flanks match the read exactly makes the mate unique (human: 0.07 % of such
+        // mates misplaced, against 2 % for a least repeated core of 2-16 copies); else the fewest
+        // copies kept for a core.
+        if self.options.args.mapq_copies > 0 && self.options.args.mapq_copies_flank {
+            let full = self.options.args.max_range_size.max(1);
+            let copies = |seeds: &[Seed]| {
+                let (kept, exact) = flank_copies(seeds);
+                if exact == 1 { 1 } else if kept == 0 { full } else { kept }
+            };
+            let l = |x: usize| (x as f64).log2();
+            let (a, b) = (l(copies(&seeds_fwd)), l(copies(&seeds_rev)));
+            let q = self.options.args.mapq_copies as f64 - self.options.args.mapq_copies_lo * a.min(b) - self.options.args.mapq_copies_hi * a.max(b);
+            COPIES_CAP.with(|u| u.set(q.clamp(0.0, 60.0) as u8));
+        }
         stats.seeds += seeds_fwd.len() + seeds_rev.len();
 
         // Seedless: no seed at all -- or, with --seedless-multiplicity N, none from a core of at
@@ -2270,8 +2285,9 @@ impl<
                                 // median 9bp from minibwa's position. Per candidate, not cached: the
                                 // alignable window depends on where this anchor sits.
                                 let alignable = alignable_len(a, query.len(), reference.len()) as i32;
+                                let floor = supported_min_ani(a, min_ani, &self.options.args);
                                 min_score_1 = Some(tighten_budget(
-                                    ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs(),
+                                    ani_abort_score(floor, penalties::MISMATCH, alignable).abs(),
                                     // This pair can only win by costing less than the best pair; its
                                     // other mate costs at least 0, or the penalty when it is absent.
                                     best_pair_cost
@@ -2364,8 +2380,9 @@ impl<
                                 // median 9bp from minibwa's position. Per candidate, not cached: the
                                 // alignable window depends on where this anchor sits.
                                 let alignable = alignable_len(a, query.len(), reference.len()) as i32;
+                                let floor = supported_min_ani(a, min_ani, &self.options.args);
                                 min_score_2 = Some(tighten_budget(
-                                    ani_abort_score(min_ani, penalties::MISMATCH, alignable).abs(),
+                                    ani_abort_score(floor, penalties::MISMATCH, alignable).abs(),
                                     // Mate 1 of this pair is already priced (ranked as the penalty
                                     // when absent or dropped), so what is left of the best pair's
                                     // cost is all mate 2 may spend.
@@ -2794,7 +2811,7 @@ impl<
             let min_aligned_bases = self.options.args.min_query_coverage;
             let require_e2e = !self.options.args.allow_partial;
             let placed_ok = |m: &MateOut| {
-                m.ani >= min_ani && m.aligned_bases >= min_aligned_bases && (!require_e2e || m.end_to_end)
+                m.ani >= anchor_min_ani(m.anchor, min_ani, &self.options.args) && m.aligned_bases >= min_aligned_bases && (!require_e2e || m.end_to_end)
             };
             let (placed, mate_seq) = match (fwd_out.as_ref(), rev_out.as_ref()) {
                 (Some(m), None) if placed_ok(m) => {
@@ -2921,7 +2938,7 @@ impl<
         // alone accepts 10-base edge matches (measured 53.90% precision).
         let require_e2e = !self.options.args.allow_partial;
         let ok = |m: &MateOut| {
-            m.ani >= min_ani
+            m.ani >= anchor_min_ani(m.anchor, min_ani, &self.options.args)
                 && m.aligned_bases >= min_aligned_bases
                 && (!require_e2e || m.end_to_end)
         };
@@ -2939,7 +2956,7 @@ impl<
         let min_mate_bases = self.options.args.min_query_coverage_mate;
         let ok_backed = |m: &MateOut, partner_ok: bool| {
             partner_ok
-                && m.ani >= min_ani
+                && m.ani >= anchor_min_ani(m.anchor, min_ani, &self.options.args)
                 && m.aligned_bases >= min_mate_bases
                 && (!require_e2e || m.end_to_end)
         };
@@ -3366,6 +3383,44 @@ fn dump_this(head: &[u8]) -> bool {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h % every.max(&1) == 0
+}
+
+/// The fewest seeds kept for a seeded core (the copies left after the flank filter) and the fewest
+/// exact-flank seeds of a core with any (0: none), over a mate's seeds.
+fn flank_copies(seeds: &[Seed]) -> (usize, usize) {
+    // (k-mer start, exact): a core-only seed starts F/2 bases into its k-mer. Sorted, one run a core.
+    let mut keys: Vec<(u32, bool)> = seeds.iter().map(|s| (s.qpos - if s.mismatch == 0 { 0 } else { 8 }, s.mismatch == 0)).collect();
+    keys.sort_unstable_by_key(|k| k.0);
+    let (mut min_kept, mut min_exact) = (usize::MAX, usize::MAX);
+    for run in keys.chunk_by(|a, b| a.0 == b.0) {
+        min_kept = min_kept.min(run.len());
+        let exact = run.iter().filter(|k| k.1).count();
+        if exact > 0 {
+            min_exact = min_exact.min(exact);
+        }
+    }
+    (if min_kept == usize::MAX { 0 } else { min_kept }, if min_exact == usize::MAX { 0 } else { min_exact })
+}
+
+/// `--min-ani-supported`: the identity floor of a candidate about to be aligned. One whose seeds cover
+/// at least --min-ani-supported-bases read bases (more than one full k-mer) is held to the lower
+/// floor and marked (`counter2`), so the output gate (`anchor_min_ani`) agrees with its budget.
+/// Measured on other-strain reads against a marker DB: 94 % of the right placements below 0.95
+/// identity had over 31 seed bases on their top candidate, against 1 % of the chance hits of reads
+/// from outside every marker -- so the wider budget is spent on almost no off-target read.
+fn supported_min_ani(a: &mut Anchor, min_ani: f64, args: &crate::options::Args) -> f64 {
+    let low = args.min_ani_supported;
+    if low > 0.0 && low < min_ani && a.seeds.iter().map(|s| s.length).sum::<u32>() >= args.min_ani_supported_bases {
+        a.counter2 = 1;
+        low
+    } else {
+        min_ani
+    }
+}
+
+/// The identity floor an aligned anchor is held to at output: as `supported_min_ani` budgeted it.
+fn anchor_min_ani(a: &Anchor, min_ani: f64, args: &crate::options::Args) -> f64 {
+    if a.counter2 == 1 && args.min_ani_supported > 0.0 { args.min_ani_supported.min(min_ani) } else { min_ani }
 }
 
 /// A mate's seeds for --dump-candidates: count, those whose flanks match the read exactly, the

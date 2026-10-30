@@ -106,6 +106,15 @@ pub struct Args {
     #[arg(long = "min-ani", default_value_t = 0.95)]
     pub min_ani: f64,
 
+    /// A lower identity floor for a candidate whose seeds cover at least --min-ani-supported-bases
+    /// read bases: a read of another strain than the reference's, well seeded, is aligned and kept
+    /// down to this identity, while chance hits keep --min-ani's budget (and run time). 0: off.
+    #[arg(long = "min-ani-supported", default_value_t = 0.0)]
+    pub min_ani_supported: f64,
+
+    #[arg(long = "min-ani-supported-bases", default_value_t = 32)]
+    pub min_ani_supported_bases: u32,
+
     /// MAPQ subtracted from a mate whose partner did not align to the same reference. Such lone
     /// mates are far less often right than paired ones of the same MAPQ (on protal-mini, 63-83% vs
     /// 93-96% at MAPQ 20-39), so without it a MAPQ cutoff drops good pairs before bad lone mates.
@@ -450,6 +459,11 @@ pub struct Args {
 
     #[arg(long = "mapq-copies-hi", default_value_t = 3.0)]
     pub mapq_copies_hi: f64,
+
+    /// With --mapq-copies: count a mate's copies after the flank filter (1 when a core has one copy
+    /// whose flanks match the read exactly) instead of its least repeated core's copies.
+    #[arg(long = "mapq-copies-flank", action)]
+    pub mapq_copies_flank: bool,
 
     /// With --adaptive: a mate whose every core was dropped for too many flank ties is seeded
     /// again keeping up to this many ties per core (0: off).
