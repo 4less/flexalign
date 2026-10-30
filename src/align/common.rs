@@ -363,6 +363,33 @@ impl AnchorScore for StdAnchorScore {
 pub static MAPQ_PER_MISMATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// `--mapq-mm-scale`, as f32 bits (0: off), set once at start-up.
 pub static MAPQ_MM_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `--mapq-unique-scale`, as f32 bits (0: off), set once at start-up.
+pub static MAPQ_UNIQUE_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `--mapq-fit-penalty`, as f32 bits (0: off), set once at start-up.
+pub static MAPQ_FIT_PENALTY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The highest MAPQ a best pair costing `best_cost` may have: with `--mapq-fit-penalty a`, 60 less
+/// `a` per mismatch of the best pair. However far the runner-up, a read that fits its placement
+/// poorly may belong where the reference has nothing (a species a marker DB lacks).
+pub fn fit_cap(best_cost: f64) -> f64 {
+    let a = f32::from_bits(MAPQ_FIT_PENALTY.load(std::sync::atomic::Ordering::Relaxed)) as f64;
+    if a <= 0.0 {
+        return 60.0;
+    }
+    (60.0 - a * (best_cost / penalties::MISMATCH as f64).max(0.0)).max(0.0)
+}
+
+/// The MAPQ of a pair with no runner-up, for a best pair costing `best_cost`. With
+/// `--mapq-unique-scale K`, `unique * K / (K + the best pair's mismatches)`: no other candidate was
+/// found, but a read several mismatches from its only placement may belong somewhere the reference
+/// lacks (a species not in a marker DB).
+pub fn unique_mapq(unique: f64, best_cost: f64) -> f64 {
+    let k = f32::from_bits(MAPQ_UNIQUE_SCALE.load(std::sync::atomic::Ordering::Relaxed)) as f64;
+    if k <= 0.0 {
+        return unique;
+    }
+    unique * k / (k + (best_cost / penalties::MISMATCH as f64).max(0.0))
+}
 
 /// The MAPQ a mismatch of margin is worth, for a best pair costing `best_cost`. With
 /// `--mapq-mm-scale K`, `per_mm * K / (K + the best pair's mismatches)`: a read that differs from
@@ -465,9 +492,6 @@ impl StdPairedAnchorMAPQ {
             // convention to anchor scores -- see `approx_ani`, which negates them into a cost. So
             // the margin is over costs (lower is better), not scores: a best with a small cost
             // against a second with a large one is a confident read, and equal costs are a tie.
-            let Some(runner_up) = runner_up else {
-                return mapq_unique;
-            };
             let cost = |p: &AnchorPair| {
                 [&p.0, &p.1]
                     .iter()
@@ -475,13 +499,16 @@ impl StdPairedAnchorMAPQ {
                     .sum::<i64>()
             };
             let c1 = cost(&anchors[0]) as f64;
+            let Some(runner_up) = runner_up else {
+                return unique_mapq(mapq_unique as f64, c1).min(fit_cap(c1)).round() as u8;
+            };
             let c2 = cost(runner_up) as f64;
             // `--mapq-per-mismatch`: the margin in mismatches' worth of cost, at so much MAPQ each
             // (BWA's shape: one mismatch between best and runner-up is about 30).
             let per_mm = MAPQ_PER_MISMATCH.load(std::sync::atomic::Ordering::Relaxed);
             if per_mm > 0 {
                 let margin = ((c2 - c1) / penalties::MISMATCH as f64).max(0.0);
-                return (per_mismatch_mapq(per_mm as f64, c1) * margin).round().min(MAPQ_MAX) as u8;
+                return (per_mismatch_mapq(per_mm as f64, c1) * margin).min(fit_cap(c1)).round().min(MAPQ_MAX) as u8;
             }
             if c2 <= 0.0 {
                 return 0; // the runner-up is also a perfect alignment: no margin at all

@@ -2872,12 +2872,13 @@ impl<
                 }
                 let per_mm = match self.options.args.mapq_per_mismatch { 0 => 30, v => v } as i64;
                 let q = if alt_cost == i64::MAX {
-                    self.options.args.mapq_unique as i64
+                    crate::align::common::unique_mapq(self.options.args.mapq_unique as f64, best_cost as f64).round() as i64
                 } else {
                     // Whole mismatches only: a margin below one is a tie.
                     (crate::align::common::per_mismatch_mapq(per_mm as f64, best_cost as f64)
                         * ((alt_cost - best_cost).max(0) / mm_cost) as f64).round().min(60.0) as i64
                 };
+                let q = (q as f64).min(crate::align::common::fit_cap(best_cost as f64)).round() as i64;
                 pseudo_mapq = (q as u8).min(mapq_ceiling).min(copies_cap);
             }
         }

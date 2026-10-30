@@ -385,6 +385,18 @@ pub struct Args {
     #[arg(long = "mapq-mm-scale", default_value_t = 0.0)]
     pub mapq_mm_scale: f64,
 
+    /// With --mapq-from-alignment: scale the MAPQ of a pair with no runner-up (--mapq-unique) by
+    /// K / (K + the best pair's mismatches): a read far from its only placement may come from
+    /// somewhere the reference lacks. 0: off.
+    #[arg(long = "mapq-unique-scale", default_value_t = 0.0)]
+    pub mapq_unique_scale: f64,
+
+    /// With --mapq-from-alignment: MAPQ at most 60 less this per mismatch of the best pair, however
+    /// wide its margin: a read that fits its placement poorly may come from where the reference has
+    /// nothing. 0: off.
+    #[arg(long = "mapq-fit-penalty", default_value_t = 0.0)]
+    pub mapq_fit_penalty: f64,
+
     /// Before the aligned candidates are ranked, rescue the partner next to each one-mate candidate
     /// that could still beat the best full pair, and rank it as a pair.
     #[arg(long = "complete-singles", action)]

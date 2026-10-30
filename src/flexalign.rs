@@ -84,6 +84,8 @@ pub fn run(args: Args) {
     crate::align::common::MAPQ_UNIQUE_SETTING.store(options.args.mapq_unique, std::sync::atomic::Ordering::Relaxed);
     crate::align::modular_workflow::DISCORDANT_MAPQ_CAP.store(options.args.discordant_mapq_cap, std::sync::atomic::Ordering::Relaxed);
     crate::align::modular_workflow::DISCORDANT_ONLY_MAPPED.store(options.args.discordant_only_mapped, std::sync::atomic::Ordering::Relaxed);
+    crate::align::common::MAPQ_UNIQUE_SCALE.store((options.args.mapq_unique_scale as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    crate::align::common::MAPQ_FIT_PENALTY.store((options.args.mapq_fit_penalty as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_MM_SCALE.store((options.args.mapq_mm_scale as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::UNPAIRED_PENALTY.store(options.args.unpaired_penalty.max(0) as u32, std::sync::atomic::Ordering::Relaxed);
 
