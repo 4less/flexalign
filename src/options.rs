@@ -1,6 +1,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use clap::Parser;
+use clap::parser::ValueSource;
 
 use crate::utils::infer_output_prefix;
 
@@ -53,6 +54,22 @@ pub struct Args {
     /// by the min-ranges recovery pass, so masked ranges stay masked. 0 disables it (default).
     #[arg(long = "mask-flank-mult", default_value_t = 0)]
     pub mask_flank_mult: usize,
+
+    /// Effort preset: fewer candidates extended (-z 16). Options given explicitly win over a preset.
+    #[arg(long = "fast", action, conflicts_with_all = ["sensitive", "very_sensitive"])]
+    pub fast: bool,
+
+    /// Effort preset: -z 128, and for repetitive pairs (--adaptive, on with this preset) a flank-tie
+    /// limit of 512 and 32 candidates aligned. Human: wrong placements at MAPQ >= 1 -27 % for 2x
+    /// run time; marker genes: unchanged.
+    #[arg(long = "sensitive", action, conflicts_with_all = ["fast", "very_sensitive"])]
+    pub sensitive: bool,
+
+    /// Effort preset: as --sensitive with a flank-tie limit of 2048 for repetitive pairs and 8
+    /// candidates aligned for every pair. Human: wrong placements at MAPQ >= 1 -63 % (minibwa's
+    /// precision) for 20x run time.
+    #[arg(long = "very-sensitive", action, conflicts_with_all = ["fast", "sensitive"])]
+    pub very_sensitive: bool,
 
     /// Extend at most this many anchor pairs (the top Z after the post-pairing sort).
     ///
@@ -548,6 +565,31 @@ impl Args {
 
     pub fn emit_sam(&self) -> bool {
         !self.paf && !self.single_end()
+    }
+}
+
+
+impl Args {
+    /// Applies --fast / --sensitive / --very-sensitive: each sets the options of its effort level that
+    /// were not given on the command line (`matches` tells which were).
+    pub fn apply_preset(&mut self, matches: &clap::ArgMatches) {
+        let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        let (z, flex, top_y, y, adaptive) = if self.fast {
+            (Some(16), None, None, None, false)
+        } else if self.sensitive {
+            (Some(128), Some(512), Some(32), None, true)
+        } else if self.very_sensitive {
+            (Some(128), Some(2048), Some(32), Some(8), true)
+        } else {
+            return;
+        };
+        if let (Some(v), false) = (z, given("extend_top_z")) { self.extend_top_z = v; }
+        if let (Some(v), false) = (flex, given("adaptive_flex")) { self.adaptive_flex = v; }
+        if let (Some(v), false) = (top_y, given("adaptive_top_y")) { self.adaptive_top_y = v; }
+        if let (Some(v), false) = (y, given("align_top_y")) { self.align_top_y = v; }
+        if adaptive {
+            self.adaptive = true;
+        }
     }
 }
 

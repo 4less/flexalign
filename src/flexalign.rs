@@ -98,6 +98,14 @@ pub fn run(args: Args) {
         let _ = crate::align::modular_workflow::DUMP.set((std::sync::Mutex::new(Some(w)), options.args.dump_every.max(1)));
     }
     let _dump_finish = crate::align::modular_workflow::DumpFinish;
+    if let Some(path) = std::env::var_os("FA_TRACE_TRUTH") {
+        let text = std::fs::read_to_string(&path).expect("FA_TRACE_TRUTH file");
+        let map = text.lines().filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() >= 4).then(|| (format!("{}\t{}", f[0], f[1]), (f[2].to_string(), f[3].parse().unwrap_or(0))))
+        }).collect();
+        let _ = crate::align::modular_workflow::TRACE_TRUTH.set(map);
+    }
     crate::align::common::MAPQ_FIT_PENALTY.store((options.args.mapq_fit_penalty as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::MAPQ_MM_SCALE.store((options.args.mapq_mm_scale as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
     crate::align::common::UNPAIRED_PENALTY.store(options.args.unpaired_penalty.max(0) as u32, std::sync::atomic::Ordering::Relaxed);

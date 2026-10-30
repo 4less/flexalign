@@ -49,7 +49,9 @@ fn main() {
     // otherwise the resulting sam files will be broken.
     SHOULD_COLORIZE.set_override(true);
 
-    let args: Args = Args::parse();
+    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let mut args: Args = <Args as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    args.apply_preset(&matches);
     flexalign::database::flexmap::INDEX_MMAP.store(args.index_mmap, std::sync::atomic::Ordering::Relaxed);
     flexalign::flexalign::set_stage_timing(
         args.time_log.is_some() || args.debug || std::env::var_os("FLEXALIGN_TIMING").is_some(),

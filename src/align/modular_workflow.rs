@@ -902,6 +902,32 @@ fn fast_hit_pair<const K: usize, const F: usize, RE: RangeExtractor<K, F>, SO: S
             mapq = (per_mm * ((alt - best_cost).max(0) / mmc)).min(60) as u8;
         }
     }
+    if dump_this(rec_fwd.head()) {
+        // --dump-candidates: an F line per fast-placed pair. alt_pair: the fewest mismatches of
+        // another pairable combination; alt_lone: of a lone candidate plus the placed partner's.
+        let mut alt_pair = usize::MAX;
+        for (a_i, a) in c1s.iter().enumerate() {
+            for (b_i, b) in c2s.iter().enumerate() {
+                if (a_i, b_i) != (i, j) && fast_pairable(a, b, MAX_INSERT) {
+                    alt_pair = alt_pair.min(a.mm + b.mm);
+                }
+            }
+        }
+        let mut alt_lone = usize::MAX;
+        for (k, c) in c1s.iter().enumerate() { if k != i { alt_lone = alt_lone.min(c.mm + m2.mm); } }
+        for (k, c) in c2s.iter().enumerate() { if k != j { alt_lone = alt_lone.min(c.mm + m1.mm); } }
+        let opt = |x: usize| if x == usize::MAX { "-".to_string() } else { x.to_string() };
+        let name = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+        let name = name.strip_suffix("/1").unwrap_or(&name).to_string();
+        let line = format!("F\t{name}\t{mapq}\t{ref_name}:{}\t{ref_name}:{}\t{}\t{}\t{}\t{}\t{score}\t{runner_up}\t{}\t{}\n",
+            m1.start, m2.start, m1.mm, m2.mm, c1s.len(), c2s.len(), opt(alt_pair), opt(alt_lone));
+        if let Some((w, _)) = DUMP.get() {
+            use std::io::Write as _;
+            if let Some(w) = w.lock().unwrap().as_mut() {
+                let _ = w.write_all(line.as_bytes());
+            }
+        }
+    }
     let leftmost = m1.start.min(m2.start);
     let rightmost = m1.end.max(m2.end);
     let span = (rightmost - leftmost) as i64;
@@ -1296,9 +1322,11 @@ impl<
         // the second mate's extraction hides the first's misses: one read's keys are too few for
         // the lookup's own fetch-ahead to cover them.
         let (duration, kmers_fwd) = stage_time(|| self.kmer_extractor_fwd.generate(rec_fwd, stats));
+        let n_kmers_fwd = kmers_fwd.len();
         stats.time_get_kmers += duration;
         self.range_extractor_fwd.prefetch(kmers_fwd);
         let (duration, kmers_rev) = stage_time(|| self.kmer_extractor_rev.generate(rec_rev, stats));
+        let n_kmers_rev = kmers_rev.len();
         stats.time_get_kmers += duration;
         self.range_extractor_rev.prefetch(kmers_rev);
 
@@ -1601,6 +1629,21 @@ impl<
         }
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
+        if let Some(truth) = TRACE_TRUTH.get() {
+            let flex = if difficult { self.options.args.adaptive_flex } else { self.options.args.max_best_flex };
+            let lines = [
+                trace_mate(self.db, truth, rec_fwd, "1", n_kmers_fwd, self.range_extractor_fwd.retrieve(), &seeds_fwd, flex, self.options.args.ranges),
+                trace_mate(self.db, truth, rec_rev, "2", n_kmers_rev, self.range_extractor_rev.retrieve(), &seeds_rev, flex, self.options.args.ranges),
+            ];
+            if let Some((w, _)) = DUMP.get() {
+                use std::io::Write as _;
+                if let Some(w) = w.lock().unwrap().as_mut() {
+                    for l in lines.into_iter().flatten() {
+                        let _ = w.write_all(l.as_bytes());
+                    }
+                }
+            }
+        }
         // --mapq-copies-flank: the copy counts of the cap after the flank filter. A core with one
         // copy whose flanks match the read exactly makes the mate unique (human: 0.07 % of such
         // mates misplaced, against 2 % for a least repeated core of 2-16 copies); else the fewest
@@ -3353,6 +3396,8 @@ pub const DUMP_HEADER: &str = "#P\tread\tmapq\tcandidates\twritten_fwd\twritten_
 f_ranges\tf_min_copies\tf_ranges_le16\tf_ranges_le256\tf_seeds\tf_exact_seeds\tf_cores_seeded\tf_min_kept\tf_min_exact\tf_ranges_seeded\tf_ranges_tie_dropped\tcopies_cap\t\
 r_ranges\tr_min_copies\tr_ranges_le16\tr_ranges_le256\tr_seeds\tr_exact_seeds\tr_cores_seeded\tr_min_kept\tr_min_exact\tr_ranges_seeded\tr_ranges_tie_dropped\t\
 adaptive\tmin_copies_lo\tmin_copies_hi\n\
+#T\tread\tmate\tkmers\tranges\tranges_with_truth\tseeded\tflank_worse\ttie_cut\tbudget\tother\tseeds_at_truth\tmin_ties_cut\ttie_limit\tcut_flank_dist\tcut_truth_read_mm\tcut_best_read_mm\tcut_within0\tcut_within2\tcut_within5\n\
+#F\tread\tmapq\twritten_fwd\twritten_rev\tf_mm\tr_mm\tf_cands\tr_cands\tvotes\trunner_up_votes\talt_pair_mm\talt_lone_mm\n\
 #C\tread\trank\twritten\t\
 f_ref\tf_start\tf_end\tf_strand\tf_seeds\tf_seeds_not_index\tf_seed_bases\tf_flank_mm\tf_cost\tf_match\tf_mismatch\tf_indel\tf_clip\tf_identity\t\
 r_ref\tr_start\tr_end\tr_strand\tr_seeds\tr_seeds_not_index\tr_seed_bases\tr_flank_mm\tr_cost\tr_match\tr_mismatch\tr_indel\tr_clip\tr_identity\n";
@@ -3383,6 +3428,87 @@ fn dump_this(head: &[u8]) -> bool {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h % every.max(&1) == 0
+}
+
+/// `FA_TRACE_TRUTH=<file>` ("read\tmate\tcontig\tpos0" lines): the true placement of the reads to
+/// trace; with --dump-candidates each traced mate gets a T line (`trace_mate`).
+pub static TRACE_TRUTH: std::sync::OnceLock<std::collections::HashMap<String, (String, u64)>> = std::sync::OnceLock::new();
+
+/// A T line: what became of the true locus at seeding. Of the mate's k-mers, how many found a range
+/// (the rest are missing from the index: absent, or more copies than the cap); of the ranges, how
+/// many contain the true copy, and of those how many seeded it, lost it to a copy with a better
+/// flank, cut it at the flank-tie limit (`flex`), or were not walked (seed budget `max_ranges`
+/// spent); and how many seeds landed at the true locus.
+fn trace_mate<DB: FlexalignDatabase, const F: usize>(
+    db: &DB, truth: &std::collections::HashMap<String, (String, u64)>, rec: &RefFastqRecord, mate: &str,
+    n_kmers: usize, ranges: &[crate::align::process::range_extractor::Range<F>], seeds: &[Seed], flex: usize, max_ranges: usize,
+) -> Option<String> {
+    let name = String::from_utf8_lossy(rec.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+    let name = name.strip_suffix("/1").or_else(|| name.strip_suffix("/2")).unwrap_or(&name).to_string();
+    let (contig, pos0) = truth.get(&format!("{name}\t{mate}"))?;
+    // The loaded index may not keep a name -> id table: build one from its id -> name table, once.
+    static RID_OF: std::sync::OnceLock<std::collections::HashMap<String, u64>> = std::sync::OnceLock::new();
+    let rid_of = RID_OF.get_or_init(|| (0..).map_while(|i| db.get_rname(i).map(|n| (n.to_string(), i as u64))).collect());
+    let rid = *rid_of.get(contig)?;
+    let (len, k) = (rec.seq().len() as i64, 31i64);
+    let near = |rpos: u64, qpos: usize| {
+        let (r, p, q) = (rpos as i64, *pos0 as i64, qpos as i64);
+        (r - (p + q)).abs() <= 8 || (r - (p + len - q - k)).abs() <= 8
+    };
+    let (mut with_truth, mut seeded, mut flank_worse, mut tie_cut, mut budget, mut other) = (0, 0, 0, 0, 0, 0);
+    let mut headered_before = 0usize;
+    let mut buf = Vec::new();
+    // Over the ranges cut at the tie limit that hold the true copy: the fewest best-flank ties.
+    let mut min_ties = usize::MAX;
+    // The first such range: its best flank distance, and the whole read against each tied copy
+    // (gap-free mismatches, the better strand): the true copy's, the best tied copy's, and how many
+    // tied copies come within 0 / 2 / 5 mismatches of that best.
+    let mut cut_info: Option<(u32, usize, usize, usize, usize, usize)> = None;
+    let fwd_seq = rec.seq().to_vec();
+    let rc_seq: Vec<u8> = fwd_seq.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
+    let read_mm = |rval: u64, rpos: u64, qpos: usize| -> usize {
+        let Some(r) = db.get_reference(rval as usize) else { return usize::MAX };
+        let mut best = usize::MAX;
+        for (seq, start) in [(&fwd_seq, rpos as i64 - qpos as i64), (&rc_seq, rpos as i64 - (len - qpos as i64 - k))] {
+            if start < 0 || start as usize + seq.len() > r.len() { continue }
+            let w = &r[start as usize..start as usize + seq.len()];
+            best = best.min(seq.iter().zip(w.iter()).filter(|(a, b)| a != b).count());
+        }
+        best
+    };
+    for r in ranges {
+        let n = r.vrange.len();
+        let idx = (0..n).find(|&j| { let (v, p) = r.vrange.value(j); v == rid && near(p, r.qpos) });
+        if let Some(j) = idx {
+            with_truth += 1;
+            let got = seeds.iter().any(|s| s.rval == rid && (s.qpos as usize == r.qpos || s.qpos as usize == r.qpos + F / 2) && near(s.rpos - if s.mismatch == 0 { 0 } else { (F / 2) as u64 }, r.qpos));
+            if got {
+                seeded += 1;
+            } else if r.vrange.has_header() {
+                let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut buf);
+                let d = buf.get(j).copied().unwrap_or(0) as u32;
+                let at_min = buf.iter().filter(|&&x| x as u32 == min).count();
+                if d <= min && at_min > flex && cut_info.is_none() {
+                    let mms: Vec<usize> = buf.iter().enumerate().filter(|(_, &x)| x as u32 == min)
+                        .map(|(i, _)| { let (v, p) = r.vrange.value(i); read_mm(v, p, r.qpos) }).collect();
+                    let (tv, tp) = r.vrange.value(j);
+                    let truth_mm = read_mm(tv, tp, r.qpos);
+                    let best = mms.iter().copied().min().unwrap_or(usize::MAX);
+                    let within = |e: usize| mms.iter().filter(|&&m| m <= best.saturating_add(e)).count();
+                    cut_info = Some((min, truth_mm, best, within(0), within(2), within(5)));
+                }
+                if d > min { flank_worse += 1 } else if at_min > flex { tie_cut += 1; min_ties = min_ties.min(at_min) } else if headered_before >= max_ranges { budget += 1 } else { other += 1 }
+            } else {
+                other += 1;
+            }
+        }
+        if r.vrange.has_header() {
+            headered_before += 1;
+        }
+    }
+    let at_locus = seeds.iter().filter(|s| s.rval == rid && ((s.rpos as i64) - *pos0 as i64).abs() <= len + 16).count();
+    Some(format!("T\t{name}\t{mate}\t{n_kmers}\t{}\t{with_truth}\t{seeded}\t{flank_worse}\t{tie_cut}\t{budget}\t{other}\t{at_locus}\t{}\t{flex}\t{}\n", ranges.len(), if min_ties == usize::MAX { 0 } else { min_ties },
+        cut_info.map_or("-\t-\t-\t-\t-\t-".to_string(), |c| format!("{}\t{}\t{}\t{}\t{}\t{}", c.0, c.1, c.2, c.3, c.4, c.5))))
 }
 
 /// The fewest seeds kept for a seeded core (the copies left after the flank filter) and the fewest
