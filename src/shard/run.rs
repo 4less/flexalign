@@ -69,6 +69,36 @@ fn open_reads(path: &str) -> Box<dyn Read + Send> {
     }
 }
 
+/// A reader that ends after `left` lines of `inner` (whole FASTQ records when a multiple of 4).
+struct FirstLines<R: Read> {
+    inner: R,
+    left: usize,
+}
+
+impl<R: Read> Read for FirstLines<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf)?;
+        for (i, &b) in buf[..n].iter().enumerate() {
+            if b == b'\n' {
+                self.left -= 1;
+                if self.left == 0 {
+                    return Ok(i + 1);
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// `--insert-score` in a sharded run, which has no fast-hit probe: the join runs once on the first
+/// `INSERT_PROBE_PAIRS` pairs of the first sample, its output discarded, collecting the inserts of the
+/// pairs it places with both mates on one reference at MAPQ >= 30; their statistics then score
+/// every pair of the real join. The same pairs every run, so the same statistics.
+const INSERT_PROBE_PAIRS: usize = 2048;
+
 /// Align every `(reads_1, reads_2, output)` triple against the `n_shards` slicing of `paths`.
 ///
 /// Slices the index first if that slicing does not exist yet -- the only step that loads the full
@@ -181,6 +211,41 @@ pub fn run_sharded<
     // the reference only, mapping the index without reading it.
     eprintln!("Loading reference for the align half (no index) ...");
     let full: DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD> = DB::load_reference_only(paths);
+
+    if options.args.insert_score && crate::align::common::INSERT_STATS.get().is_none() {
+        if let Some(s) = samples.first() {
+            let t = Instant::now();
+            crate::align::common::INSERT_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed);
+            let sink = Arc::new(Mutex::new(OutputTarget::File(File::create("/dev/null").expect("/dev/null"))));
+            let ev: Vec<String> = (0..ranges.len()).map(|i| evidence[i][0].clone()).collect();
+            // The first pairs, written to small files next to the output (the reader wants whole files).
+            let head = |path: &str, mate: &str| -> String {
+                let out = format!("{}.insert_probe_R{mate}.fq", s.out);
+                let mut text = Vec::new();
+                FirstLines { inner: open_reads(path), left: 4 * INSERT_PROBE_PAIRS }.read_to_end(&mut text).expect("reads");
+                std::fs::write(&out, &text).unwrap_or_else(|e| panic!("write {out}: {e}"));
+                out
+            };
+            let (p1, p2) = (head(&s.r1, "1"), head(&s.r2, "2"));
+            let limited = |path: &str| -> Box<dyn Read + Send> { open_reads(path) };
+            let _ = run_disk_rejoin_align::<
+                K, C, F, S, L,
+                DB<K, C, F, S, L, CELLS_PER_BODY, HEADER_THRESHOLD>,
+                Box<dyn Read + Send>,
+            >(
+                limited(&p1), limited(&p2), &full, options, OutputBuffer::new(sink, BUFFER_SIZE), &ev,
+                options.args.ranges, READ_BATCH_BYTES, threads,
+            );
+            crate::align::common::INSERT_COLLECT.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::remove_file(&p1);
+            let _ = std::fs::remove_file(&p2);
+            match crate::align::common::set_insert_stats() {
+                Some((mean, sd)) => eprintln!("Insert size: mean {mean:.1}, standard deviation {sd:.1} (from {} pairs of the first {INSERT_PROBE_PAIRS}, {:.2}s)",
+                    crate::align::common::INSERT_SAMPLES.lock().unwrap().len(), t.elapsed().as_secs_f64()),
+                None => eprintln!("Insert size: too few confidently placed pairs among the first {INSERT_PROBE_PAIRS}, --insert-score off for this run"),
+            }
+        }
+    }
 
     let t_align = Instant::now();
     let mut total_alignments = 0usize;

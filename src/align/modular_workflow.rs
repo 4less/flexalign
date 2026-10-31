@@ -2972,6 +2972,17 @@ impl<
         } else {
             (None, None)
         };
+        // --insert-score in a sharded run: the measuring join collects confidently placed pairs' inserts.
+        if crate::align::common::INSERT_COLLECT.load(std::sync::atomic::Ordering::Relaxed) && pseudo_mapq >= 30 {
+            if let (Some(a), Some(b)) = (fwd_anchor, rev_anchor) {
+                if a.reference == b.reference && !a.reference_cigar_range.is_empty() && !b.reference_cigar_range.is_empty() {
+                    let span = a.reference_cigar_range.end.max(b.reference_cigar_range.end) - a.reference_cigar_range.start.min(b.reference_cigar_range.start);
+                    if span <= MAX_INSERT as usize {
+                        crate::align::common::INSERT_SAMPLES.lock().unwrap().push(span as u32);
+                    }
+                }
+            }
+        }
         if dump_this(rec_fwd.head()) {
             dump_candidates(dump_db, rec_fwd, extension_anchors, fwd_anchor, rev_anchor, pseudo_mapq);
         }
