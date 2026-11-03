@@ -1324,6 +1324,7 @@ impl<
         // A read (pair) starts: no reference slice of the previous one is used again.
         crate::database::refseq2::reset_scratch();
         stats.reads_processed += 2;
+        let _pair_timer = fm_time::PairTimer::start();
 
         log::trace!("\n####################################################################\n#### New pair \n####################################################################");
 
@@ -1773,11 +1774,14 @@ impl<
             }
             if q[0] || q[1] {
                 stats.fm_pairs += 1;
+                fm_time::mark_fm_pair();
+                let _fm_block = fm_time::Span::new(&fm_time::FM_BLOCK_NS);
                 let rcs: [Vec<u8>; 2] = [0, 1].map(|s| recs[s].seq().iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect());
                 let mut cand: [Vec<(usize, i64, bool)>; 2] = [Vec::new(), Vec::new()];
                 for side in 0..2 {
                     if q[side] {
-                        cand[side] = fm_candidates(fm, recs[side].seq(), &rcs[side], args.fm_step.max(1), args.fm_max_hits, &mut stats.fm_located, &mut stats.fm_lf_steps);
+                        let _search = fm_time::Span::new(&fm_time::SEARCH_NS);
+                    cand[side] = fm_candidates(fm, recs[side].seq(), &rcs[side], args.fm_step.max(1), args.fm_max_hits, &mut stats.fm_located, &mut stats.fm_lf_steps);
                     }
                 }
                 // Pair filter on positions only: a candidate needs one of the partner's (its FM
@@ -1805,6 +1809,7 @@ impl<
                     }
                 }
                 // Whole-read mismatches, packed.
+                let _hamming = fm_time::Span::new(&fm_time::HAMMING_NS);
                 let mut scored: [Vec<(usize, usize, i64, bool)>; 2] = [Vec::new(), Vec::new()];
                 for side in 0..2 {
                     if !q[side] {
@@ -1829,6 +1834,7 @@ impl<
                     stats.fm_compared += cand[side].len();
                     scored[side].retain(|x| x.0 <= best.saturating_add(3));
                 }
+                drop(_hamming);
                 // Pairs: opposite strands, same reference, within the pairing window; a mate the
                 // path did not place counts as 0 (its own seeds place it). Distinct pairs by locus.
                 let mut pairs: Vec<(usize, i64, usize, usize, i64, usize, i64)> = Vec::new(); // (cost, dev, id, st0, st1)
@@ -4318,6 +4324,7 @@ fn fm_candidates(set: &crate::database::fmd::FmdSet, seq: &[u8], rc: &[u8], step
                     }
                     seen.push((lo, hi));
                     *located += (hi - lo) as usize;
+                    let _locate = fm_time::Span::new(&fm_time::LOCATE_NS);
                     for row in lo..hi {
                         let (tp, st) = fm.locate(row);
                         *lf_steps += st as usize;
@@ -4351,7 +4358,79 @@ fn fm_candidates(set: &crate::database::fmd::FmdSet, seq: &[u8], rc: &[u8], step
 
 /// `FA_FM_TRACE=<path>`: one line per pair whose MAPQ the FM path judged: name, best, n_best,
 /// second (-1 none), n_near, on_best, mates on the path (bit 1 first, bit 2 second), MAPQ before, after.
+/// `FA_FM_TIME` set: wall time per pair, split into pairs that took the FM path and the rest, and
+/// the FM path's own parts (printed at the end of the run; summed over threads).
+pub mod fm_time {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static FM_PAIR_NS: AtomicU64 = AtomicU64::new(0);
+    pub static OTHER_PAIR_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FM_PAIRS: AtomicU64 = AtomicU64::new(0);
+    pub static OTHER_PAIRS: AtomicU64 = AtomicU64::new(0);
+    pub static FM_BLOCK_NS: AtomicU64 = AtomicU64::new(0);
+    pub static SEARCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LOCATE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static HAMMING_NS: AtomicU64 = AtomicU64::new(0);
+    thread_local! { static IS_FM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FA_FM_TIME").is_some())
+    }
+    pub fn mark_fm_pair() {
+        IS_FM.with(|c| c.set(true));
+    }
+    pub struct PairTimer(Option<std::time::Instant>);
+    impl PairTimer {
+        pub fn start() -> Self {
+            if !on() {
+                return PairTimer(None);
+            }
+            IS_FM.with(|c| c.set(false));
+            PairTimer(Some(std::time::Instant::now()))
+        }
+    }
+    impl Drop for PairTimer {
+        fn drop(&mut self) {
+            if let Some(t) = self.0 {
+                let ns = t.elapsed().as_nanos() as u64;
+                if IS_FM.with(|c| c.get()) {
+                    FM_PAIR_NS.fetch_add(ns, Relaxed);
+                    FM_PAIRS.fetch_add(1, Relaxed);
+                } else {
+                    OTHER_PAIR_NS.fetch_add(ns, Relaxed);
+                    OTHER_PAIRS.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+    pub struct Span<'a>(Option<(std::time::Instant, &'a AtomicU64)>);
+    impl<'a> Span<'a> {
+        pub fn new(c: &'a AtomicU64) -> Self {
+            Span(on().then(|| (std::time::Instant::now(), c)))
+        }
+    }
+    impl Drop for Span<'_> {
+        fn drop(&mut self) {
+            if let Some((t, c)) = self.0 {
+                c.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+    }
+    pub fn report() {
+        if !on() {
+            return;
+        }
+        let s = |a: &AtomicU64| a.load(Relaxed) as f64 / 1e9;
+        let (fp, op) = (FM_PAIRS.load(Relaxed), OTHER_PAIRS.load(Relaxed));
+        eprintln!("[fm-time] pairs: FM path {fp} ({:.1} %), other {op}", 100.0 * fp as f64 / (fp + op).max(1) as f64);
+        eprintln!("[fm-time] thread-seconds in run_pair: FM pairs {:.1} ({:.1} us/pair), other pairs {:.1} ({:.1} us/pair)",
+            s(&FM_PAIR_NS), 1e6 * s(&FM_PAIR_NS) / fp.max(1) as f64, s(&OTHER_PAIR_NS), 1e6 * s(&OTHER_PAIR_NS) / op.max(1) as f64);
+        eprintln!("[fm-time] FM block {:.1} s: search+locate {:.1} (locate {:.1}), Hamming {:.1}",
+            s(&FM_BLOCK_NS), s(&SEARCH_NS), s(&LOCATE_NS), s(&HAMMING_NS));
+    }
+}
+
 pub fn fm_trace_flush() {
+    fm_time::report();
     if let Some(w) = fm_trace() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
