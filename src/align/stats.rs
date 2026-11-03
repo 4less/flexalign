@@ -134,6 +134,32 @@ pub struct Stats {
     /// `--adaptive`: pairs given the larger flank-tie limit and alignment window.
     pub adaptive_pairs: usize,
     pub adaptive_tied: usize,
+    /// FA_TIE_STATS: mates whose every core was cut at the flank-tie limit; the sum and buckets of
+    /// the fewest tied copies among each one's cut cores.
+    pub all_cut_mates: usize,
+    /// --tie-read: mates tried, tied copies compared with the read, mates seeded, mates left
+    /// with more than --tie-read copies at the fewest mismatches.
+    pub tie_read_mates: usize,
+    pub screen_pairs: usize,
+    pub screen_reranked: usize,
+    pub screen_window_grown: usize,
+    pub tie_mapq_checked: usize,
+    pub tie_mapq_zeroed: usize,
+    pub tie_read_aborted: usize,
+    pub tie_read_pairs_ranked: usize,
+    pub tie_read_pairs_resolved: usize,
+    pub tie_read_pair_before: usize,
+    pub tie_read_pair_after: usize,
+    pub tie_read_copies: usize,
+    pub tie_read_seeded: usize,
+    pub tie_read_ambiguous: usize,
+    pub all_cut_copies: usize,
+    pub all_cut_le64: usize,
+    pub all_cut_le128: usize,
+    pub all_cut_le512: usize,
+    pub all_cut_le2048: usize,
+    pub all_cut_le4096: usize,
+    pub all_cut_gt4096: usize,
     /// Why a rescue did not happen or was refused. `skipped_weak` is the anchored side failing the
     /// quality gate (its position is not worth trusting); `rejected_ambiguous` is the scan finding a
     /// partner that matched about equally well elsewhere in the window, i.e. a repeat.
@@ -312,6 +338,28 @@ impl Stats {
             ("overhang_rescue_found",       self.overhang_rescue_found as f64, "count"),
             ("adaptive_pairs",              self.adaptive_pairs as f64, "count"),
             ("adaptive_tied",               self.adaptive_tied as f64, "count"),
+            ("all_cut_mates", self.all_cut_mates as f64, "count"),
+            ("tie_read_mates", self.tie_read_mates as f64, "count"),
+            ("screen_pairs", self.screen_pairs as f64, "count"),
+            ("screen_reranked", self.screen_reranked as f64, "count"),
+            ("screen_window_grown", self.screen_window_grown as f64, "count"),
+            ("tie_mapq_checked", self.tie_mapq_checked as f64, "count"),
+            ("tie_mapq_zeroed", self.tie_mapq_zeroed as f64, "count"),
+            ("tie_read_aborted", self.tie_read_aborted as f64, "count"),
+            ("tie_read_pairs_ranked", self.tie_read_pairs_ranked as f64, "count"),
+            ("tie_read_pairs_resolved", self.tie_read_pairs_resolved as f64, "count"),
+            ("tie_read_pair_before", self.tie_read_pair_before as f64, "count"),
+            ("tie_read_pair_after", self.tie_read_pair_after as f64, "count"),
+            ("tie_read_copies", self.tie_read_copies as f64, "count"),
+            ("tie_read_seeded", self.tie_read_seeded as f64, "count"),
+            ("tie_read_ambiguous", self.tie_read_ambiguous as f64, "count"),
+            ("all_cut_copies", self.all_cut_copies as f64, "count"),
+            ("all_cut_le64", self.all_cut_le64 as f64, "count"),
+            ("all_cut_le128", self.all_cut_le128 as f64, "count"),
+            ("all_cut_le512", self.all_cut_le512 as f64, "count"),
+            ("all_cut_le2048", self.all_cut_le2048 as f64, "count"),
+            ("all_cut_le4096", self.all_cut_le4096 as f64, "count"),
+            ("all_cut_gt4096", self.all_cut_gt4096 as f64, "count"),
             ("rescue_skipped_weak",         self.rescue_skipped_weak as f64, "count"),
             ("rescue_rejected_ambiguous",   self.rescue_rejected_ambiguous as f64, "count"),
             ("rescue_indel_suspected",      self.rescue_indel_suspected as f64, "count"),
@@ -465,6 +513,28 @@ impl Merge for Stats {
         self.overhang_rescue_found += other.overhang_rescue_found;
         self.adaptive_pairs += other.adaptive_pairs;
         self.adaptive_tied += other.adaptive_tied;
+        self.all_cut_mates += other.all_cut_mates;
+        self.tie_read_mates += other.tie_read_mates;
+        self.screen_pairs += other.screen_pairs;
+        self.screen_reranked += other.screen_reranked;
+        self.screen_window_grown += other.screen_window_grown;
+        self.tie_mapq_checked += other.tie_mapq_checked;
+        self.tie_mapq_zeroed += other.tie_mapq_zeroed;
+        self.tie_read_aborted += other.tie_read_aborted;
+        self.tie_read_pairs_ranked += other.tie_read_pairs_ranked;
+        self.tie_read_pairs_resolved += other.tie_read_pairs_resolved;
+        self.tie_read_pair_before += other.tie_read_pair_before;
+        self.tie_read_pair_after += other.tie_read_pair_after;
+        self.tie_read_copies += other.tie_read_copies;
+        self.tie_read_seeded += other.tie_read_seeded;
+        self.tie_read_ambiguous += other.tie_read_ambiguous;
+        self.all_cut_copies += other.all_cut_copies;
+        self.all_cut_le64 += other.all_cut_le64;
+        self.all_cut_le128 += other.all_cut_le128;
+        self.all_cut_le512 += other.all_cut_le512;
+        self.all_cut_le2048 += other.all_cut_le2048;
+        self.all_cut_le4096 += other.all_cut_le4096;
+        self.all_cut_gt4096 += other.all_cut_gt4096;
         self.rescue_skipped_weak += other.rescue_skipped_weak;
         self.rescue_rejected_ambiguous += other.rescue_rejected_ambiguous;
         self.rescue_indel_suspected += other.rescue_indel_suspected;
@@ -494,6 +564,22 @@ impl Display for Stats {
     /// GOLDSTD_EVAL build. Otherwise those counters are all zero and only clutter the log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t = self.threads.max(1) as u32;
+        if self.screen_pairs > 0 || self.tie_mapq_checked > 0 {
+            writeln!(f, "SCREEN pairs screened: {}, re-ranked: {}, window grown for ties: {}; TIE_MAPQ mates checked: {}, pairs set to MAPQ 0: {}",
+                self.screen_pairs, self.screen_reranked, self.screen_window_grown, self.tie_mapq_checked, self.tie_mapq_zeroed)?;
+        }
+        if self.tie_read_mates > 0 {
+            writeln!(f, "TIE_READ mates tried: {}, tied copies compared: {}, seeded: {}, still ambiguous: {}, pair filter copies {} -> {}",
+                self.tie_read_mates, self.tie_read_copies, self.tie_read_seeded, self.tie_read_ambiguous,
+                self.tie_read_pair_before, self.tie_read_pair_after)?;
+            writeln!(f, "TIE_READ aborted early: {}, pairs ranked by insert: {}, resolved: {}",
+                self.tie_read_aborted, self.tie_read_pairs_ranked, self.tie_read_pairs_resolved)?;
+        }
+        if self.all_cut_mates > 0 {
+            writeln!(f, "FA_TIE_STATS mates with every core cut at the tie limit: {} (fewest tied copies, sum {}; <=64 {}, <=128 {}, <=512 {}, <=2048 {}, <=4096 {}, >4096 {})",
+                self.all_cut_mates, self.all_cut_copies, self.all_cut_le64, self.all_cut_le128, self.all_cut_le512,
+                self.all_cut_le2048, self.all_cut_le4096, self.all_cut_gt4096)?;
+        }
         if crate::flexalign::STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed) || crate::STAGE_TRACE {
             write!(f,
                 "\
@@ -736,6 +822,28 @@ impl Default for Stats {
             overhang_rescue_found: 0,
             adaptive_pairs: 0,
             adaptive_tied: 0,
+            all_cut_mates: 0,
+            tie_read_mates: 0,
+            screen_pairs: 0,
+            screen_reranked: 0,
+            screen_window_grown: 0,
+            tie_mapq_checked: 0,
+            tie_mapq_zeroed: 0,
+            tie_read_aborted: 0,
+            tie_read_pairs_ranked: 0,
+            tie_read_pairs_resolved: 0,
+            tie_read_pair_before: 0,
+            tie_read_pair_after: 0,
+            tie_read_copies: 0,
+            tie_read_seeded: 0,
+            tie_read_ambiguous: 0,
+            all_cut_copies: 0,
+            all_cut_le64: 0,
+            all_cut_le128: 0,
+            all_cut_le512: 0,
+            all_cut_le2048: 0,
+            all_cut_le4096: 0,
+            all_cut_gt4096: 0,
             rescue_skipped_weak: 0,
             rescue_rejected_ambiguous: 0,
             rescue_indel_suspected: 0,

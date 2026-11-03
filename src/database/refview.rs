@@ -66,6 +66,40 @@ impl<'a> RefView<'a> {
         }
     }
 
+    /// Mismatches of `ascii` (the read) against bases `[from, from + ascii.len())`, stopping past
+    /// `bound`; `packed` is the same read at 2 bits a base (see `RefSeq2::mismatches_packed`), used
+    /// on a packed sequence so nothing is decoded.
+    #[inline]
+    pub fn mismatches(&self, from: usize, ascii: &[u8], packed: &[u64], bound: usize) -> usize {
+        if let RefView::Packed { store, id, .. } = *self {
+            if let Some(m) = store.mismatches_packed(id, from, packed, ascii.len(), bound) {
+                // FA_TIE_CHECK: the decoded comparison must agree (both at or under the bound and
+                // equal, or both over it), ignoring windows with bases outside ACGT.
+                static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *CHECK.get_or_init(|| std::env::var_os("FA_TIE_CHECK").is_some()) {
+                    let w = self.window(from..from + ascii.len());
+                    if w.iter().all(|b| b"ACGT".contains(b)) && ascii.iter().all(|b| b"ACGT".contains(b)) {
+                        let full = ascii.iter().zip(w).filter(|(a, b)| a != b).count();
+                        let ok = if m <= bound { full == m } else { full > bound };
+                        assert!(ok, "packed mismatches {m} vs decoded {full} (bound {bound}) at {id}:{from}");
+                    }
+                }
+                return m;
+            }
+        }
+        let w = self.window(from..from + ascii.len());
+        let mut c = 0;
+        for (a, b) in ascii.iter().zip(w) {
+            if a != b {
+                c += 1;
+                if c > bound {
+                    break;
+                }
+            }
+        }
+        c
+    }
+
     /// Base `i`.
     #[inline]
     pub fn at(&self, i: usize) -> u8 {

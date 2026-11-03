@@ -1633,6 +1633,165 @@ impl<
                 }
             }
         }
+        let keep = self.options.args.tie_read;
+        if keep > 0 {
+            let flex = if difficult { self.options.args.adaptive_flex } else { default_flex };
+            let (max_seeded, max_copies) = (self.options.args.tie_read_max_seeded, self.options.args.tie_read_max_copies);
+            // Each mate's least-tied cut core, when it qualifies.
+            let mut picks = [None, None];
+            let seeded_of = [self.seed_extractor_fwd.last_ties().0, self.seed_extractor_rev.last_ties().0];
+            for (side, (se, ranges)) in [(&self.seed_extractor_fwd, ranges_fwd), (&self.seed_extractor_rev, ranges_rev)].into_iter().enumerate() {
+                let (seeded, tied) = se.last_ties();
+                // --tie-read-skip-seeded-partner: a mate whose partner has more cores seeded than
+                // this is left to the rescue next to its partner.
+                let partner_ok = self.options.args.tie_read_skip_seeded_partner.map_or(true, |m| seeded_of[1 - side] <= m);
+                if tied > 0 && seeded <= max_seeded && partner_ok {
+                    stats.tie_read_mates += 1;
+                    picks[side] = tie_read_pick::<F>(ranges, flex, max_copies);
+                }
+            }
+            // --tie-read-pair: with both mates picked, keep the copies with a copy of the other
+            // mate's core on the same reference within the pairing window (no reference read).
+            if self.options.args.tie_read_pair {
+                if let (Some(a), Some(b)) = (&picks[0], &picks[1]) {
+                    let pos = |ranges: &[crate::align::process::range_extractor::Range<F>], p: &(usize, u32, Vec<usize>)| -> Vec<(u64, u64)> {
+                        let mut v: Vec<(u64, u64)> = p.2.iter().map(|&i| ranges[p.0].vrange.value(i)).collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    let (pa, pb) = (pos(ranges_fwd, a), pos(ranges_rev, b));
+                    let near = |sorted: &[(u64, u64)], (v, p): (u64, u64)| {
+                        let lo = sorted.partition_point(|&x| x < (v, p.saturating_sub(MAX_INSERT as u64)));
+                        sorted.get(lo).is_some_and(|&(w, q)| w == v && q <= p + MAX_INSERT as u64)
+                    };
+                    let before = a.2.len() + b.2.len();
+                    let ka: Vec<usize> = a.2.iter().copied().filter(|&i| near(&pb, ranges_fwd[a.0].vrange.value(i))).collect();
+                    let kb: Vec<usize> = b.2.iter().copied().filter(|&i| near(&pa, ranges_rev[b.0].vrange.value(i))).collect();
+                    stats.tie_read_pair_before += before;
+                    stats.tie_read_pair_after += ka.len() + kb.len();
+                    picks = [Some((a.0, a.1, ka)), Some((b.0, b.1, kb))];
+                }
+            }
+            // Compare each picked mate. A mate whose partner was picked too keeps its full list of
+            // best copies for the pairing below; otherwise it gives up once more than `keep`
+            // copies match with no mismatch.
+            let pairing = self.options.args.tie_read_pair && picks[0].is_some() && picks[1].is_some();
+            let mut found: [Option<(usize, u32, usize, Vec<(usize, bool, i64)>)>; 2] = [None, None];
+            for (side, pick) in picks.into_iter().enumerate() {
+                let Some((ri, min, tied)) = pick else { continue };
+                if tied.is_empty() {
+                    continue;
+                }
+                let (ranges, rec) = if side == 0 { (ranges_fwd, rec_fwd) } else { (ranges_rev, rec_rev) };
+                let abort = if pairing { usize::MAX } else { keep };
+                if let Some((best, cells)) = tie_read_compare::<D, C, F>(self.db, rec.seq(), &ranges[ri], &tied, abort, stats) {
+                    found[side] = Some((ri, min, best, cells));
+                }
+            }
+            // --tie-read-pair: the two mates' best copies paired (same reference, within the pairing
+            // window); the pairs whose insert is closest to the measured mean are kept.
+            let mut chosen: [Option<Vec<usize>>; 2] = [None, None];
+            if pairing {
+                if let (Some(a), Some(b)) = (&found[0], &found[1]) {
+                    let mean = crate::align::common::INSERT_STATS.get().map(|s| s.0);
+                    let (la, lb) = (rec_fwd.seq().len() as i64, rec_rev.seq().len() as i64);
+                    // Mate 2's copies by (reference, read start): (ref, start, forward, cell).
+                    let mut pb: Vec<(u64, i64, bool, usize)> = b.3.iter().map(|&(i, f, at)| (ranges_rev[b.0].vrange.value(i).0, at, f, i)).collect();
+                    pb.sort_unstable();
+                    let mut pairs: Vec<(i64, usize, usize)> = Vec::new();
+                    for &(i, fa, sa) in &a.3 {
+                        let v = ranges_fwd[a.0].vrange.value(i).0;
+                        let lo = pb.partition_point(|x| (x.0, x.1) < (v, sa - MAX_INSERT));
+                        for x in &pb[lo..] {
+                            if x.0 != v || x.1 > sa + MAX_INSERT {
+                                break;
+                            }
+                            // A proper pair: opposite strands. The fragment spans both reads.
+                            if x.2 == fa {
+                                continue;
+                            }
+                            let ins = (sa + la).max(x.1 + lb) - sa.min(x.1);
+                            let dev = mean.map_or(0, |m| (ins as f64 - m).abs() as i64);
+                            pairs.push((dev, i, x.3));
+                        }
+                    }
+                    if let Some(&(lo_dev, _, _)) = pairs.iter().min_by_key(|x| x.0) {
+                        // Within 25 bp of the best deviation counts as as good.
+                        let good: Vec<&(i64, usize, usize)> = pairs.iter().filter(|x| x.0 <= lo_dev + 25).collect();
+                        stats.tie_read_pairs_ranked += 1;
+                        if good.len() <= keep {
+                            let mut ca: Vec<usize> = good.iter().map(|x| x.1).collect();
+                            let mut cb: Vec<usize> = good.iter().map(|x| x.2).collect();
+                            ca.sort_unstable();
+                            ca.dedup();
+                            cb.sort_unstable();
+                            cb.dedup();
+                            chosen = [Some(ca), Some(cb)];
+                            stats.tie_read_pairs_resolved += 1;
+                        }
+                    }
+                }
+            }
+            for side in 0..2 {
+                let Some((ri, min, _, cells)) = &found[side] else { continue };
+                let cells = match &chosen[side] {
+                    Some(c) => c.clone(),
+                    None if cells.len() <= keep => cells.iter().map(|c| c.0).collect(),
+                    None => {
+                        stats.tie_read_ambiguous += 1;
+                        continue;
+                    }
+                };
+                let (se, ranges) = if side == 0 { (&mut self.seed_extractor_fwd, ranges_fwd) } else { (&mut self.seed_extractor_rev, ranges_rev) };
+                let mut extra = Vec::new();
+                tie_read_seeds::<C, F>(&ranges[*ri], *min, &cells, &mut extra);
+                let mut seeds = se.take_seeds();
+                seeds.extend(extra);
+                crate::align::common::sort_short_by_key(&mut seeds, |s: &Seed| (s.rval, s.rpos));
+                se.put_seeds(seeds);
+                stats.tie_read_seeded += 1;
+            }
+        }
+        if self.options.args.tie_mapq {
+            let flex = if difficult { self.options.args.adaptive_flex } else { default_flex };
+            let max_copies = self.options.args.tie_read_max_copies;
+            let picks = [(&self.seed_extractor_fwd, ranges_fwd), (&self.seed_extractor_rev, ranges_rev)].map(|(se, ranges)| {
+                if se.last_ties().1 > 0 { tie_read_pick::<F>(ranges, flex, max_copies) } else { None }
+            });
+            TIE_PICKS.with(|t| *t.borrow_mut() = picks);
+        }
+        if tie_stats() {
+            let flex = if difficult { self.options.args.adaptive_flex } else { default_flex };
+            for fwd in [true, false] {
+                let (se, ranges) = if fwd { (&self.seed_extractor_fwd, ranges_fwd) } else { (&self.seed_extractor_rev, ranges_rev) };
+                let (seeded, tied) = se.last_ties();
+                if seeded == 0 && tied > 0 {
+                    // The fewest tied copies over the mate's cut cores: what a whole-read test of
+                    // one core would have to compare.
+                    let mut buf = Vec::new();
+                    let mut fewest = usize::MAX;
+                    for r in ranges.iter().filter(|r| r.vrange.has_header()) {
+                        let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut buf);
+                        let at_min = buf.iter().filter(|&&x| x as u32 == min).count();
+                        if at_min > flex {
+                            fewest = fewest.min(at_min);
+                        }
+                    }
+                    if fewest != usize::MAX {
+                        stats.all_cut_mates += 1;
+                        stats.all_cut_copies += fewest;
+                        match fewest {
+                            0..=64 => stats.all_cut_le64 += 1,
+                            65..=128 => stats.all_cut_le128 += 1,
+                            129..=512 => stats.all_cut_le512 += 1,
+                            513..=2048 => stats.all_cut_le2048 += 1,
+                            2049..=4096 => stats.all_cut_le4096 += 1,
+                            _ => stats.all_cut_gt4096 += 1,
+                        }
+                    }
+                }
+            }
+        }
         if difficult {
             self.seed_extractor_fwd.set_max_best_flex(default_flex);
             self.seed_extractor_rev.set_max_best_flex(default_flex);
@@ -1941,6 +2100,30 @@ impl<
         while extend_top_z < tie_cap && pair_anchor_score(&anchors[extend_top_z]) == boundary_score {
             extend_top_z += 1;
         }
+        // FA_TRACE_TRUTH with --dump-candidates: an R line per traced pair, the rank in the whole
+        // sorted candidate list of the first candidate holding each mate's true locus (-1: none),
+        // the list's length and how many were extended.
+        if let (Some(truth), Some((w, _))) = (TRACE_TRUTH.get(), DUMP.get()) {
+            static RID_OF_R: std::sync::OnceLock<std::collections::HashMap<String, u64>> = std::sync::OnceLock::new();
+            let rid_of = RID_OF_R.get_or_init(|| (0..).map_while(|i| self.db.get_rname(i).map(|n| (n.to_string(), i as u64))).collect());
+            let name = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+            let name = name.strip_suffix("/1").unwrap_or(&name).to_string();
+            let rank = |mate: &str, side: usize| -> i64 {
+                let Some((contig, pos0)) = truth.get(&format!("{name}\t{mate}")) else { return -2 };
+                let Some(&rid) = rid_of.get(contig) else { return -2 };
+                anchors.iter().position(|AnchorPair(a1, a2)| {
+                    let a = if side == 0 { a1 } else { a2 };
+                    a.as_ref().is_some_and(|a| a.reference == rid && a.seeds.iter().any(|sd| (sd.rpos as i64 - *pos0 as i64).abs() <= 300))
+                }).map_or(-1, |i| i as i64)
+            };
+            if truth.contains_key(&format!("{name}\t1")) {
+                let line = format!("R\t{name}\t{}\t{}\t{}\t{}\n", rank("1", 0), rank("2", 1), anchors.len(), extend_top_z);
+                use std::io::Write as _;
+                if let Some(w) = w.lock().unwrap().as_mut() {
+                    let _ = w.write_all(line.as_bytes());
+                }
+            }
+        }
         debug_assert!(
             anchors.windows(2).all(|w| pair_anchor_score(&w[0]) >= pair_anchor_score(&w[1])),
             "anchors must reach the extension cut sorted by the extractor's key; the tie run walks \
@@ -2010,6 +2193,59 @@ impl<
                 a2.as_ref().is_some_and(|a| a.reference as usize == true_rid)
             });
             stats.funnel_true_in_screen_mates += holds_truth_mates(&anchors[0..screen_z]);
+        }
+        // --screen-z N: the top N candidate pairs (not only the -z window) scored by gap-free
+        // whole-read mismatches of both mates in the packed 2-bit form, re-ranked by that (stable:
+        // equal ones keep the extractor's order), and every pair tied with the best brought into
+        // the extension window (at most --screen-tie-cap), so a better copy past -z is extended and
+        // an equally good one is seen by the MAPQ.
+        let screen_n = self.options.args.screen_z;
+        if screen_n > extend_top_z && anchors.len() > extend_top_z {
+            let n = min(screen_n, anchors.len());
+            let (f1, r1, f2, r2) = (rec_fwd.seq(), self.rec_fwd_revc.seq(), rec_rev.seq(), self.rec_rev_revc.seq());
+            let (pf1, pr1, pf2, pr2) = (pack2(f1), pack2(r1), pack2(f2), pack2(r2));
+            let db = self.db;
+            // What a candidate missing a mate is charged, in mismatches: not more than a wrong pair
+            // with both mates plausibly placed would cost, so a one-mate candidate (a partner off a
+            // short marker gene) is not ranked behind it.
+            let miss = self.options.args.screen_miss;
+            // (pair cost, the better present mate's mismatches)
+            let cost2 = |AnchorPair(a1, a2): &AnchorPair| -> (usize, usize) {
+                let c1 = a1.as_ref().map(|a| anchor_read_mm(db, a, f1, &pf1, r1, &pr1, 60).0.min(60));
+                let c2 = a2.as_ref().map(|a| anchor_read_mm(db, a, f2, &pf2, r2, &pr2, 60).0.min(60));
+                (c1.unwrap_or(miss) + c2.unwrap_or(miss), c1.unwrap_or(usize::MAX).min(c2.unwrap_or(usize::MAX)))
+            };
+            // Re-ranked only when the best pair is a real match (at most --screen-max-mm): for a
+            // read that matches nowhere well, gap-free mismatches say little and the extractor's
+            // order is kept; such a read also ties everywhere, which must not grow the window.
+            let both: Vec<(usize, usize)> = anchors[..n].iter().map(|p| cost2(p)).collect();
+            let costs: Vec<usize> = both.iter().map(|c| c.0).collect();
+            let best = costs.iter().copied().min().unwrap_or(usize::MAX);
+            // A real match: some mate of some candidate within --screen-max-mm mismatches.
+            let real = both.iter().map(|c| c.1).min().unwrap_or(usize::MAX) <= self.options.args.screen_max_mm;
+            stats.screen_pairs += 1;
+            if real {
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by_key(|&i| costs[i]);
+                // Apply the permutation in place (stable: equal costs keep their order).
+                let mut pos: Vec<usize> = (0..n).collect();
+                let mut at: Vec<usize> = (0..n).collect();
+                for (dst, &src) in order.iter().enumerate() {
+                    let cur = pos[src];
+                    anchors.swap(dst, cur);
+                    let moved = at[dst];
+                    pos[moved] = cur;
+                    at[cur] = moved;
+                    pos[src] = dst;
+                    at[dst] = src;
+                }
+                stats.screen_reranked += 1;
+            }
+            let ties = costs.iter().filter(|&&c| c == best).count();
+            if ties > extend_top_z && real {
+                stats.screen_window_grown += 1;
+                extend_top_z = ties.min(self.options.args.screen_tie_cap.max(extend_top_z));
+            }
         }
         let pair_bonus = self.options.args.proper_pair_bonus;
         let mut time_extend = std::time::Duration::ZERO;
@@ -2961,6 +3197,58 @@ impl<
             }
         }
 
+        // --tie-mapq: a placed mate whose least-tied cut core holds another copy the read matches
+        // gap-free at least as well as where it was placed, and whose partner cannot tell the two
+        // apart (no partner copy as good within the pairing window of that copy... the partner itself
+        // tied the same way, or no partner), makes the pair MAPQ 0: the copies are a tie.
+        if self.options.args.tie_mapq && pseudo_mapq > 0 {
+            let picks = TIE_PICKS.with(|t| t.borrow().clone());
+            let placed = [fwd_anchor, rev_anchor];
+            let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
+            let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
+            // Each placed mate: where it lies (reference, read start) and the other copies as good.
+            let mut eq: [Option<Vec<(u64, i64)>>; 2] = [None, None];
+            let mut at: [Option<(u64, i64)>; 2] = [None, None];
+            for side in 0..2 {
+                let Some(a) = placed[side] else { continue };
+                let Some(c) = a.cigar.as_ref() else { continue };
+                let lead = c.0.iter().take_while(|&&o| o == b'S').count() as i64;
+                let start = a.reference_cigar_range.start as i64 - lead;
+                at[side] = Some((a.reference, start));
+                let Some((ri, _, tied)) = &picks[side] else { continue };
+                let Some(rv) = self.db.get_reference(a.reference as usize) else { continue };
+                let (fwd, rc) = reads[side];
+                let seq = if a.forward { fwd } else { rc };
+                if start < 0 || (start as usize + seq.len()) > rv.len() {
+                    continue;
+                }
+                let chosen = rv.mismatches(start as usize, seq, &pack2(seq), usize::MAX);
+                stats.tie_mapq_checked += 1;
+                let others: Vec<(u64, i64)> = tie_copies_upto::<D, C, F>(self.db, fwd, &ranges[side][*ri], tied, chosen)
+                    .into_iter().filter(|&(v, st)| !(v == a.reference && (st - start).abs() <= 150)).collect();
+                eq[side] = Some(others);
+            }
+            let near = |x: &(u64, i64), ys: &[(u64, i64)]| ys.iter().any(|y| y.0 == x.0 && (y.1 - x.1).abs() <= MAX_INSERT);
+            let ambiguous = (0..2).any(|side| {
+                let Some(mine) = &eq[side] else { return false };
+                if mine.is_empty() {
+                    return false;
+                }
+                match (&at[1 - side], &eq[1 - side]) {
+                    // No partner placed: the mate alone decides, and it ties.
+                    (None, _) => true,
+                    // The partner is placed and unique (no cut core): it tells the copies apart.
+                    (Some(_), None) => false,
+                    // The partner ties too: ambiguous when its other copies pair with this mate's.
+                    (Some(_), Some(theirs)) => mine.iter().any(|x| near(x, theirs)),
+                }
+            });
+            if ambiguous {
+                pseudo_mapq = 0;
+                stats.tie_mapq_zeroed += 1;
+            }
+        }
+
         // --mapq-per-mate: each mate's MAPQ from the competition for its own placement.
         let (mate_q_fwd, mate_q_rev) = if self.options.args.mapq_per_mate && self.options.args.mapq_from_alignment {
             let cap = mapq_ceiling.min(copies_cap);
@@ -3420,7 +3708,8 @@ pub const DUMP_HEADER: &str = "#P\tread\tmapq\tcandidates\twritten_fwd\twritten_
 f_ranges\tf_min_copies\tf_ranges_le16\tf_ranges_le256\tf_seeds\tf_exact_seeds\tf_cores_seeded\tf_min_kept\tf_min_exact\tf_ranges_seeded\tf_ranges_tie_dropped\tcopies_cap\t\
 r_ranges\tr_min_copies\tr_ranges_le16\tr_ranges_le256\tr_seeds\tr_exact_seeds\tr_cores_seeded\tr_min_kept\tr_min_exact\tr_ranges_seeded\tr_ranges_tie_dropped\t\
 adaptive\tmin_copies_lo\tmin_copies_hi\n\
-#T\tread\tmate\tkmers\tranges\tranges_with_truth\tseeded\tflank_worse\ttie_cut\tbudget\tother\tseeds_at_truth\tmin_ties_cut\ttie_limit\tcut_flank_dist\tcut_truth_read_mm\tcut_best_read_mm\tcut_within0\tcut_within2\tcut_within5\n\
+#T\tread\tmate\tkmers\tranges\tranges_with_truth\tseeded\tflank_worse\ttie_cut\tbudget\tother\tseeds_at_truth\tmin_ties_cut\ttie_limit\tcut_flank_dist\tcut_truth_read_mm\tcut_best_read_mm\tcut_within0\tcut_within2\tcut_within5\tcut_ties\tw63_best_mm\tw63_n_best\tw63_truth_best\tw95_best_mm\tw95_n_best\tw95_truth_best\n\
+#R\tread\trank_truth_mate1\trank_truth_mate2\tcandidates\textended\n\
 #F\tread\tmapq\twritten_fwd\twritten_rev\tf_mm\tr_mm\tf_cands\tr_cands\tvotes\trunner_up_votes\talt_pair_mm\talt_lone_mm\n\
 #C\tread\trank\twritten\t\
 f_ref\tf_start\tf_end\tf_strand\tf_seeds\tf_seeds_not_index\tf_seed_bases\tf_flank_mm\tf_cost\tf_match\tf_mismatch\tf_indel\tf_clip\tf_identity\t\
@@ -3452,6 +3741,229 @@ fn dump_this(head: &[u8]) -> bool {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h % every.max(&1) == 0
+}
+
+/// `--tie-read`: of the mate's cores cut at the flank-tie limit (more than `flex` copies tied at
+/// the best flank), the one with the fewest tied copies (at most `max_copies`); each tied copy is
+/// compared with the whole read, gap-free on both strands, a copy given up as soon as it is worse
+/// than the best so far, the reference prefetched a few copies ahead. When at most `keep` copies
+/// share the fewest mismatches they become seeds, as the core would have made them without the
+/// limit (`out`); returns whether it did.
+fn tie_read_pick<const F: usize>(
+    ranges: &[crate::align::process::range_extractor::Range<F>], flex: usize, max_copies: usize,
+) -> Option<(usize, u32, Vec<usize>)> {
+    let mut buf = Vec::new();
+    let mut pick: Option<(usize, u32, usize)> = None;
+    for (ri, r) in ranges.iter().enumerate() {
+        if !r.vrange.has_header() {
+            continue;
+        }
+        let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut buf);
+        let at_min = buf.iter().filter(|&&x| x as u32 == min).count();
+        if at_min > flex && at_min <= max_copies && pick.map_or(true, |p| at_min < p.2) {
+            pick = Some((ri, min, at_min));
+        }
+    }
+    let (ri, min, _) = pick?;
+    let r = &ranges[ri];
+    crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut buf);
+    let tied: Vec<usize> = buf.iter().enumerate().filter(|(_, &x)| x as u32 == min).map(|(i, _)| i).collect();
+    Some((ri, min, tied))
+}
+
+/// `--tie-read`, the comparison: the `tied` cells of range `r` against the whole read, gap-free on
+/// both strands, in the packed 2-bit form (no decoding), a copy given up once worse than the best so
+/// far, the reference prefetched a few copies ahead. Returns the fewest mismatches and the cells
+/// that have them. With `abort_over` set, stops as soon as more than that many copies match with
+/// 0 mismatches (the result can only be ambiguous then) and returns None.
+fn tie_read_compare<D: FlexalignDatabase, const C: usize, const F: usize>(
+    db: &D, seq: &[u8], r: &crate::align::process::range_extractor::Range<F>, tied: &[usize],
+    abort_over: usize, stats: &mut Stats,
+) -> Option<(usize, Vec<(usize, bool, i64)>)> {
+    let len = seq.len() as i64;
+    // In ModularPE, C is the whole k-mer (31) and F its flank (16): the core is C - F.
+    let k = C as i64;
+    let rc: Vec<u8> = seq.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
+    let pack = |s: &[u8]| -> Vec<u64> {
+        let mut v = vec![0u64; (s.len() + 31) / 32];
+        for (i, &b) in s.iter().enumerate() {
+            let c = match b { b'C' => 1u64, b'G' => 2, b'T' => 3, _ => 0 };
+            v[i / 32] |= c << (2 * (i % 32));
+        }
+        v
+    };
+    let (pf, pr) = (pack(seq), pack(&rc));
+    let starts = |p: u64| [p as i64 - r.qpos as i64, p as i64 - (len - r.qpos as i64 - k)];
+    const AHEAD: usize = 8;
+    let prefetch = |i: usize| {
+        let (v, p) = r.vrange.value(i);
+        if let Some(rv) = db.get_reference(v as usize) {
+            for st in starts(p) {
+                if st >= 0 && ((st + len) as usize) <= rv.len() {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::x86_64::_mm_prefetch(rv.prefetch(st as usize) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+                }
+            }
+        }
+    };
+    for &i in tied.iter().take(AHEAD) {
+        prefetch(i);
+    }
+    let mut best = usize::MAX;
+    // (cell, forward, the read's first reference base) of the copies with the fewest mismatches.
+    let mut at_best: Vec<(usize, bool, i64)> = Vec::new();
+    let mut compared = 0usize;
+    for (n, &i) in tied.iter().enumerate() {
+        if let Some(&j) = tied.get(n + AHEAD) {
+            prefetch(j);
+        }
+        compared += 1;
+        let (v, p) = r.vrange.value(i);
+        let Some(rv) = db.get_reference(v as usize) else { continue };
+        let mut m = usize::MAX;
+        let (mut fwd, mut at) = (true, 0i64);
+        for (forward, s, pk, st) in [(true, seq, &pf, starts(p)[0]), (false, &rc[..], &pr, starts(p)[1])] {
+            if st < 0 || ((st + len) as usize) > rv.len() {
+                continue;
+            }
+            let c = rv.mismatches(st as usize, s, pk, best.min(m));
+            if c < m {
+                (m, fwd, at) = (c, forward, st);
+            }
+        }
+        if m == usize::MAX || m > best {
+            continue;
+        }
+        if m < best {
+            best = m;
+            at_best.clear();
+        }
+        at_best.push((i, fwd, at));
+        if best == 0 && at_best.len() > abort_over {
+            stats.tie_read_copies += compared;
+            stats.tie_read_aborted += 1;
+            return None;
+        }
+    }
+    stats.tie_read_copies += compared;
+    (!at_best.is_empty()).then_some((best, at_best))
+}
+
+/// `--tie-read`: the seeds the cut core `r` (flank distance `min`) would have made for `cells`.
+fn tie_read_seeds<const C: usize, const F: usize>(r: &crate::align::process::range_extractor::Range<F>, min: u32, cells: &[usize], out: &mut Vec<Seed>) {
+    for &i in cells {
+        let (v, p) = r.vrange.value(i);
+        // As Seed::from_flexmer with K = C, core C - F.
+        out.push(Seed {
+            qpos: if min == 0 { r.qpos as u32 } else { r.qpos as u32 + (F as u32 / 2) },
+            rpos: if min == 0 { p } else { p + (F as u64 / 2) },
+            rval: v,
+            mismatch: min as u8,
+            length: if min == 0 { C as u8 } else { (C - F) as u8 },
+            flag: 0,
+        });
+    }
+}
+
+/// A read at 2 bits a base, 32 to a word, the first in the low bits (A 0 C 1 G 2 T 3, others A).
+fn pack2(s: &[u8]) -> Vec<u64> {
+    let mut v = vec![0u64; (s.len() + 31) / 32];
+    for (i, &b) in s.iter().enumerate() {
+        let c = match b { b'C' => 1u64, b'G' => 2, b'T' => 3, _ => 0 };
+        v[i / 32] |= c << (2 * (i % 32));
+    }
+    v
+}
+
+/// Gap-free mismatches of a mate laid down from candidate anchor `a` (its first seed), over the
+/// whole read, in the packed form; both strands when the anchor's orientation is not yet known.
+/// Returns (mismatches, the read's first reference base, forward); usize::MAX when off the reference.
+fn anchor_read_mm<D: FlexalignDatabase>(db: &D, a: &Anchor, fwd: &[u8], pf: &[u64], rc: &[u8], pr: &[u64], bound: usize) -> (usize, i64, bool) {
+    let none = (usize::MAX, 0, true);
+    let Some(sd) = a.seeds.first() else { return none };
+    let Some(rv) = db.get_reference(a.reference as usize) else { return none };
+    let len = fwd.len() as i64;
+    let (q, r, l) = (sd.qpos as i64, sd.rpos as i64, sd.length as i64);
+    let mut opts = [(a.forward, r - q), (false, i64::MIN)];
+    if !a.orientation_set {
+        opts = [(true, r - q), (false, r - (len - q - l))];
+    }
+    let mut best = none;
+    let rlen = rv.len() as i64;
+    for (forward, st) in opts {
+        if st == i64::MIN {
+            continue;
+        }
+        let (seq, pk) = if forward { (fwd, pf) } else { (rc, pr) };
+        let m = if st >= 0 && st + len <= rlen {
+            rv.mismatches(st as usize, seq, pk, bound.min(best.0))
+        } else {
+            // The read runs off the reference (a short marker gene): its overlapping bases only,
+            // scaled to the read's length, when at least half of it overlaps.
+            let (a, b) = (st.max(0), (st + len).min(rlen));
+            if b - a < len / 2 {
+                continue;
+            }
+            let w = rv.window(a as usize..b as usize);
+            let q = &seq[(a - st) as usize..(b - st) as usize];
+            let mm = q.iter().zip(w).filter(|(x, y)| x != y).count();
+            (mm * len as usize + (b - a) as usize / 2) / (b - a) as usize
+        };
+        if m < best.0 {
+            best = (m, st, forward);
+        }
+    }
+    best
+}
+
+/// --tie-mapq: of the `tied` cells of range `r`, the copies the read (`seq`, both strands) matches
+/// gap-free with at most `bound` mismatches, as (reference, the read's first base), at most `cap`
+/// of them looked at.
+fn tie_copies_upto<D: FlexalignDatabase, const C: usize, const F: usize>(
+    db: &D, seq: &[u8], r: &crate::align::process::range_extractor::Range<F>, tied: &[usize], bound: usize,
+) -> Vec<(u64, i64)> {
+    let len = seq.len() as i64;
+    let k = C as i64;
+    let rc: Vec<u8> = seq.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
+    let (pf, pr) = (pack2(seq), pack2(&rc));
+    let mut out = Vec::new();
+    for (n, &i) in tied.iter().enumerate() {
+        if let Some(&j) = tied.get(n + 8) {
+            let (v, p) = r.vrange.value(j);
+            if let Some(rv) = db.get_reference(v as usize) {
+                let st = p as i64 - r.qpos as i64;
+                if st >= 0 && ((st + len) as usize) <= rv.len() {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe { core::arch::x86_64::_mm_prefetch(rv.prefetch(st as usize) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+                }
+            }
+        }
+        let (v, p) = r.vrange.value(i);
+        let Some(rv) = db.get_reference(v as usize) else { continue };
+        for (s, pk, st) in [(seq, &pf, p as i64 - r.qpos as i64), (&rc[..], &pr, p as i64 - (len - r.qpos as i64 - k))] {
+            if st < 0 || ((st + len) as usize) > rv.len() {
+                continue;
+            }
+            if rv.mismatches(st as usize, s, pk, bound) <= bound {
+                out.push((v, st));
+                break;
+            }
+        }
+    }
+    out
+}
+
+thread_local! {
+    /// --tie-mapq: each mate's least-tied cut core (range index, flank distance, tied cells), set
+    /// by `run_pair` before the pair is aligned.
+    static TIE_PICKS: std::cell::RefCell<[Option<(usize, u32, Vec<usize>)>; 2]> = const { std::cell::RefCell::new([None, None]) };
+}
+
+/// `FA_TIE_STATS` set: count the mates whose every core was cut at the flank-tie limit, with the
+/// fewest tied copies among their cut cores (stats `all_cut_*`).
+fn tie_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FA_TIE_STATS").is_some())
 }
 
 /// `FA_TRACE_TRUTH=<file>` ("read\tmate\tcontig\tpos0" lines): the true placement of the reads to
@@ -3488,6 +4000,12 @@ fn trace_mate<DB: FlexalignDatabase, const F: usize>(
     // (gap-free mismatches, the better strand): the true copy's, the best tied copy's, and how many
     // tied copies come within 0 / 2 / 5 mismatches of that best.
     let mut cut_info: Option<(u32, usize, usize, usize, usize, usize)> = None;
+    // FA_TIE_STATS measurement: of the cut ranges holding the true copy, the one with the fewest
+    // tied copies (`cut_ties`); over a 63- and a 95-base read window around its k-mer, the fewest
+    // mismatches among its tied copies, how many tied copies have that many, and whether the true
+    // copy is one of them.
+    let mut cut_ties = usize::MAX;
+    let mut win: [(usize, usize, u8); 2] = [(usize::MAX, 0, 0); 2];
     let fwd_seq = rec.seq().to_vec();
     let rc_seq: Vec<u8> = fwd_seq.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
     let read_mm = |rval: u64, rpos: u64, qpos: usize| -> usize {
@@ -3497,6 +4015,20 @@ fn trace_mate<DB: FlexalignDatabase, const F: usize>(
             if start < 0 || start as usize + seq.len() > r.len() { continue }
             let w = &r[start as usize..start as usize + seq.len()];
             best = best.min(seq.iter().zip(w.iter()).filter(|(a, b)| a != b).count());
+        }
+        best
+    };
+    // The same, over `w` read bases holding the k-mer at `qpos` (shifted left at the read's end).
+    let window_mm = |rval: u64, rpos: u64, qpos: usize, w: usize| -> usize {
+        let Some(r) = db.get_reference(rval as usize) else { return usize::MAX };
+        let mut best = usize::MAX;
+        let l = len as usize;
+        let w = w.min(l);
+        for (seq, start, kpos) in [(&fwd_seq, rpos as i64 - qpos as i64, qpos), (&rc_seq, rpos as i64 - (len - qpos as i64 - k), l - qpos - k as usize)] {
+            if start < 0 || start as usize + seq.len() > r.len() { continue }
+            let ws = kpos.min(l - w);
+            let refw = &r[start as usize + ws..start as usize + ws + w];
+            best = best.min(seq[ws..ws + w].iter().zip(refw.iter()).filter(|(a, b)| a != b).count());
         }
         best
     };
@@ -3512,7 +4044,16 @@ fn trace_mate<DB: FlexalignDatabase, const F: usize>(
                 let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut buf);
                 let d = buf.get(j).copied().unwrap_or(0) as u32;
                 let at_min = buf.iter().filter(|&&x| x as u32 == min).count();
-                if d <= min && at_min > flex && cut_info.is_none() {
+                if d <= min && at_min > flex && at_min < cut_ties {
+                    cut_ties = at_min;
+                    let tied: Vec<usize> = buf.iter().enumerate().filter(|(_, &x)| x as u32 == min).map(|(i, _)| i).collect();
+                    for (slot, w) in [(0usize, 63usize), (1, 95)] {
+                        let mm: Vec<usize> = tied.iter().map(|&i| { let (v, p) = r.vrange.value(i); window_mm(v, p, r.qpos, w) }).collect();
+                        let best = mm.iter().copied().min().unwrap_or(usize::MAX);
+                        let (tv, tp) = r.vrange.value(j);
+                        let truth = window_mm(tv, tp, r.qpos, w);
+                        win[slot] = (best, mm.iter().filter(|&&m| m == best).count(), (truth == best) as u8);
+                    }
                     let mms: Vec<usize> = buf.iter().enumerate().filter(|(_, &x)| x as u32 == min)
                         .map(|(i, _)| { let (v, p) = r.vrange.value(i); read_mm(v, p, r.qpos) }).collect();
                     let (tv, tp) = r.vrange.value(j);
@@ -3532,7 +4073,9 @@ fn trace_mate<DB: FlexalignDatabase, const F: usize>(
     }
     let at_locus = seeds.iter().filter(|s| s.rval == rid && ((s.rpos as i64) - *pos0 as i64).abs() <= len + 16).count();
     Some(format!("T\t{name}\t{mate}\t{n_kmers}\t{}\t{with_truth}\t{seeded}\t{flank_worse}\t{tie_cut}\t{budget}\t{other}\t{at_locus}\t{}\t{flex}\t{}\n", ranges.len(), if min_ties == usize::MAX { 0 } else { min_ties },
-        cut_info.map_or("-\t-\t-\t-\t-\t-".to_string(), |c| format!("{}\t{}\t{}\t{}\t{}\t{}", c.0, c.1, c.2, c.3, c.4, c.5))))
+        cut_info.map_or("-\t-\t-\t-\t-\t-".to_string(), |c| format!("{}\t{}\t{}\t{}\t{}\t{}", c.0, c.1, c.2, c.3, c.4, c.5)))
+        .replacen('\n', &if cut_ties == usize::MAX { "\t-\t-\t-\t-\t-\t-\t-\n".to_string() } else {
+            format!("\t{cut_ties}\t{}\t{}\t{}\t{}\t{}\t{}\n", win[0].0, win[0].1, win[0].2, win[1].0, win[1].1, win[1].2) }, 1))
 }
 
 /// `--mapq-per-mate`: the MAPQ of mate `side` placed at `placed`, from the candidate pairs: the best

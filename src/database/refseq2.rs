@@ -255,6 +255,41 @@ impl RefSeq2 {
         unsafe { self.packed.add(((*self.starts.add(id) + i as u64) / 4) as usize) }
     }
 
+    /// Mismatches between bases `[from, from + n)` of sequence `id` and `query` (2 bits a base, 32
+    /// to a word, the first in the low bits, A 0 C 1 G 2 T 3), compared 32 bases at a time in the
+    /// packed form: no decoding. Stops once past `bound` (returning a count above it). Bases outside
+    /// ACGT are packed as A and compared as A. None when the window runs past the packed bases'
+    /// last 16 bytes (the caller decodes then).
+    #[inline]
+    pub fn mismatches_packed(&self, id: usize, from: usize, query: &[u64], n: usize, bound: usize) -> Option<usize> {
+        let start = unsafe { *self.starts.add(id) } + from as u64;
+        let total = unsafe { *self.starts.add(self.n) } / 4;
+        let byte = (start / 4) as usize;
+        if (byte + (n + 3) / 4 + 16) as u64 > total {
+            return None;
+        }
+        let shift = 2 * (start % 4) as u32;
+        let mut mm = 0usize;
+        let mut left = n;
+        for (w, &q) in query.iter().enumerate() {
+            if left == 0 {
+                break;
+            }
+            // SAFETY: checked above that 16 bytes past the window's end are packed bases.
+            let r = (unsafe { (self.packed.add(byte + 8 * w) as *const u128).read_unaligned() } >> shift) as u64;
+            let mut x = r ^ q;
+            if left < 32 {
+                x &= (1u64 << (2 * left)) - 1;
+            }
+            mm += ((x | (x >> 1)) & 0x5555_5555_5555_5555).count_ones() as usize;
+            if mm > bound {
+                return Some(mm);
+            }
+            left = left.saturating_sub(32);
+        }
+        Some(mm)
+    }
+
     /// Decodes sequence `id` into `out` (exactly its length).
     pub fn decode(&self, id: usize, out: &mut [u8]) {
         self.decode_range(id, 0, self.seq_len(id), out);

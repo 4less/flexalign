@@ -522,6 +522,59 @@ pub struct Args {
     #[arg(long = "adaptive-ties", default_value_t = 0)]
     pub adaptive_ties: usize,
 
+    /// A mate whose cores were cut at the flank-tie limit (all of them, or all but
+    /// --tie-read-max-seeded): the tied copies of its least-tied cut core are compared with the
+    /// whole read (gap-free, both strands), and when at most this many share the fewest mismatches
+    /// they are seeded. The copies agree on the 31-mer; the rest of the read tells them apart.
+    /// 0: off.
+    #[arg(long = "tie-read", default_value_t = 0)]
+    pub tie_read: usize,
+
+    /// --tie-read: also for a mate with at most this many cores seeded (its other cores cut).
+    #[arg(long = "tie-read-max-seeded", default_value_t = 0)]
+    pub tie_read_max_seeded: usize,
+
+    /// --tie-read: a core with more tied copies than this is not compared (too costly).
+    #[arg(long = "tie-read-max-copies", default_value_t = 4096)]
+    pub tie_read_max_copies: usize,
+
+    /// --tie-read: when both mates are compared, first keep only the tied copies that have a tied
+    /// copy of the other mate's core on the same reference within the pairing window; after the
+    /// comparison, pair the two mates' best copies and keep the pairs whose insert is closest to
+    /// the measured mean (within 25 bp of the closest).
+    #[arg(long = "tie-read-pair", action)]
+    pub tie_read_pair: bool,
+
+    /// Score the top this many candidate pairs (not only the -z window) by gap-free whole-read
+    /// mismatches of both mates, packed, re-rank them by that, and extend every pair tied with the
+    /// best (at most --screen-tie-cap). 0: off.
+    #[arg(long = "screen-z", default_value_t = 0)]
+    pub screen_z: usize,
+
+    /// --screen-z: the most pairs the window grows to for ties with the best.
+    #[arg(long = "screen-tie-cap", default_value_t = 32)]
+    pub screen_tie_cap: usize,
+
+    /// --screen-z: candidates are re-ranked, and the window grows for ties, only when some mate of
+    /// some candidate matches with at most this many mismatches (a read that matches nowhere well
+    /// keeps the extractor's order).
+    #[arg(long = "screen-max-mm", default_value_t = 5)]
+    pub screen_max_mm: usize,
+
+    /// --screen-z: the mismatches a candidate missing one mate is charged for it.
+    #[arg(long = "screen-miss", default_value_t = 30)]
+    pub screen_miss: usize,
+
+    /// MAPQ 0 for a pair whose placed mate has another copy, among the tied copies of its least-tied
+    /// cut core, that the read matches at least as well, unless the partner tells them apart.
+    #[arg(long = "tie-mapq", action)]
+    pub tie_mapq: bool,
+
+    /// --tie-read: leave a mate to the rescue next to its partner when the partner has more than
+    /// this many cores seeded.
+    #[arg(long = "tie-read-skip-seeded-partner")]
+    pub tie_read_skip_seeded_partner: Option<usize>,
+
     /// MAPQ of a pair with no runner-up at another place.
     #[arg(long = "mapq-unique", default_value_t = 30)]
     pub mapq_unique: u32,
