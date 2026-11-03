@@ -79,5 +79,6 @@ fn main() {
     run(args);
     let duration = started.elapsed();
 
+    flexalign::align::modular_workflow::fm_trace_flush();
     log::info!("Flexalign took {:?}", duration);
 }

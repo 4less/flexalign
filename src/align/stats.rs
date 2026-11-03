@@ -140,6 +140,13 @@ pub struct Stats {
     /// --tie-read: mates tried, tied copies compared with the read, mates seeded, mates left
     /// with more than --tie-read copies at the fewest mismatches.
     pub tie_read_mates: usize,
+    pub fm_pairs: usize,
+    pub fm_compared: usize,
+    pub fm_located: usize,
+    pub fm_lf_steps: usize,
+    pub fm_seeded: usize,
+    pub fm_ambiguous: usize,
+    pub fm_mapq_lowered: usize,
     pub screen_pairs: usize,
     pub screen_reranked: usize,
     pub screen_window_grown: usize,
@@ -340,6 +347,13 @@ impl Stats {
             ("adaptive_tied",               self.adaptive_tied as f64, "count"),
             ("all_cut_mates", self.all_cut_mates as f64, "count"),
             ("tie_read_mates", self.tie_read_mates as f64, "count"),
+            ("fm_pairs", self.fm_pairs as f64, "count"),
+            ("fm_compared", self.fm_compared as f64, "count"),
+            ("fm_located", self.fm_located as f64, "count"),
+            ("fm_lf_steps", self.fm_lf_steps as f64, "count"),
+            ("fm_seeded", self.fm_seeded as f64, "count"),
+            ("fm_ambiguous", self.fm_ambiguous as f64, "count"),
+            ("fm_mapq_lowered", self.fm_mapq_lowered as f64, "count"),
             ("screen_pairs", self.screen_pairs as f64, "count"),
             ("screen_reranked", self.screen_reranked as f64, "count"),
             ("screen_window_grown", self.screen_window_grown as f64, "count"),
@@ -515,6 +529,13 @@ impl Merge for Stats {
         self.adaptive_tied += other.adaptive_tied;
         self.all_cut_mates += other.all_cut_mates;
         self.tie_read_mates += other.tie_read_mates;
+        self.fm_pairs += other.fm_pairs;
+        self.fm_compared += other.fm_compared;
+        self.fm_located += other.fm_located;
+        self.fm_lf_steps += other.fm_lf_steps;
+        self.fm_seeded += other.fm_seeded;
+        self.fm_ambiguous += other.fm_ambiguous;
+        self.fm_mapq_lowered += other.fm_mapq_lowered;
         self.screen_pairs += other.screen_pairs;
         self.screen_reranked += other.screen_reranked;
         self.screen_window_grown += other.screen_window_grown;
@@ -564,6 +585,10 @@ impl Display for Stats {
     /// GOLDSTD_EVAL build. Otherwise those counters are all zero and only clutter the log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t = self.threads.max(1) as u32;
+        if self.fm_pairs > 0 {
+            writeln!(f, "FM pairs: {}, rows located: {} ({} BWT steps), copies compared: {}, mates seeded: {}, ambiguous (> --fm-keep): {}, MAPQ lowered: {}",
+                self.fm_pairs, self.fm_located, self.fm_lf_steps, self.fm_compared, self.fm_seeded, self.fm_ambiguous, self.fm_mapq_lowered)?;
+        }
         if self.screen_pairs > 0 || self.tie_mapq_checked > 0 {
             writeln!(f, "SCREEN pairs screened: {}, re-ranked: {}, window grown for ties: {}; TIE_MAPQ mates checked: {}, pairs set to MAPQ 0: {}",
                 self.screen_pairs, self.screen_reranked, self.screen_window_grown, self.tie_mapq_checked, self.tie_mapq_zeroed)?;
@@ -824,6 +849,13 @@ impl Default for Stats {
             adaptive_tied: 0,
             all_cut_mates: 0,
             tie_read_mates: 0,
+            fm_pairs: 0,
+            fm_compared: 0,
+            fm_located: 0,
+            fm_lf_steps: 0,
+            fm_seeded: 0,
+            fm_ambiguous: 0,
+            fm_mapq_lowered: 0,
             screen_pairs: 0,
             screen_reranked: 0,
             screen_window_grown: 0,

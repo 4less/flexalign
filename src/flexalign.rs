@@ -220,6 +220,31 @@ pub fn run(args: Args) {
         },
     };
 
+    // --fm-build / --fm: the whole-genome FM-index next to the index.
+    let fm_path = format!("{}.fmd", options.args.reference);
+    if options.args.fm_build {
+        let started = Instant::now();
+        let mut id = 0usize;
+        let mut refs = std::iter::from_fn(|| {
+            let rv = db.get_reference(id)?;
+            let seq = rv.window(0..rv.len()).to_vec();
+            crate::database::refseq2::reset_scratch();
+            id += 1;
+            Some(seq)
+        });
+        let fm = crate::database::fmd::FmdSet::build(&mut refs, options.args.fm_piece);
+        fm.save(&fm_path).expect("writing the FM-index");
+        eprintln!("[fm] {} written in {:.0} s", fm_path, started.elapsed().as_secs_f64());
+        return;
+    }
+    if options.args.fm {
+        let started = Instant::now();
+        let fm = crate::database::fmd::FmdSet::load(&fm_path)
+            .unwrap_or_else(|e| panic!("--fm needs {fm_path} (build it with --fm-build): {e}"));
+        eprintln!("[fm] {} loaded in {:.1} s ({} pieces)", fm_path, started.elapsed().as_secs_f64(), fm.pieces.len());
+        let _ = crate::database::fmd::FMD.set(fm);
+    }
+
     // Sharding asked for on an index that had to be built first: now that its bundle is written,
     // compute the bounds (--shard-slice) or run on the shards (--shards).
     let shards = options.args.shards.filter(|&n| !options.args.no_shards && n > 1);

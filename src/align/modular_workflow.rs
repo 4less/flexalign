@@ -1752,6 +1752,166 @@ impl<
                 stats.tie_read_seeded += 1;
             }
         }
+        FM_INFO.with(|f| *f.borrow_mut() = None);
+        if let (true, Some(fm)) = (self.options.args.fm, crate::database::fmd::FMD.get()) {
+            let args = &self.options.args;
+            let n_kmers = [n_kmers_fwd, n_kmers_rev];
+            let ranges = [ranges_fwd, ranges_rev];
+            let ses = [&self.seed_extractor_fwd, &self.seed_extractor_rev];
+            let recs = [rec_fwd, rec_rev];
+            // A mate the index cannot resolve: few cores seeded, and cores cut at the tie limit or
+            // most k-mers missing from the index (cores over the copy cap).
+            let qualifies = |side: usize| {
+                let (seeded, tied) = ses[side].last_ties();
+                fm_force() || (seeded <= args.fm_max_seeded && (tied > 0 || ranges[side].len() * 2 < n_kmers[side]))
+            };
+            let mut q = [qualifies(0), qualifies(1)];
+            // The pair competes as a pair: a mate on the path takes its partner along (alone, it
+            // would compete only next to the partner's placement, which may be the paralog).
+            if q[0] || q[1] {
+                q = [true, true];
+            }
+            if q[0] || q[1] {
+                stats.fm_pairs += 1;
+                let rcs: [Vec<u8>; 2] = [0, 1].map(|s| recs[s].seq().iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect());
+                let mut cand: [Vec<(usize, i64, bool)>; 2] = [Vec::new(), Vec::new()];
+                for side in 0..2 {
+                    if q[side] {
+                        cand[side] = fm_candidates(fm, recs[side].seq(), &rcs[side], args.fm_step.max(1), args.fm_max_hits, &mut stats.fm_located, &mut stats.fm_lf_steps);
+                    }
+                }
+                // Pair filter on positions only: a candidate needs one of the partner's (its FM
+                // candidates, or else its seeds) on the same reference within the pairing window.
+                let partner_pos: [Vec<(usize, i64)>; 2] = [0, 1].map(|side| {
+                    let mut v: Vec<(usize, i64)> = if q[side] {
+                        cand[side].iter().map(|c| (c.0, c.1)).collect()
+                    } else {
+                        ses[side].retrieve().iter().map(|sd| (sd.rval as usize, sd.rpos as i64)).collect()
+                    };
+                    v.sort_unstable();
+                    v
+                });
+                for side in 0..2 {
+                    if !q[side] || partner_pos[1 - side].is_empty() {
+                        continue;
+                    }
+                    let other = &partner_pos[1 - side];
+                    let kept: Vec<(usize, i64, bool)> = cand[side].iter().copied().filter(|&(id, st, _)| {
+                        let lo = other.partition_point(|x| *x < (id, st - MAX_INSERT - 200));
+                        other.get(lo).is_some_and(|x| x.0 == id && x.1 <= st + MAX_INSERT + 200)
+                    }).collect();
+                    if !kept.is_empty() {
+                        cand[side] = kept;
+                    }
+                }
+                // Whole-read mismatches, packed.
+                let mut scored: [Vec<(usize, usize, i64, bool)>; 2] = [Vec::new(), Vec::new()];
+                for side in 0..2 {
+                    if !q[side] {
+                        continue;
+                    }
+                    let seq = recs[side].seq();
+                    let (pf, pr) = (pack2(seq), pack2(&rcs[side]));
+                    let mut best = usize::MAX;
+                    for &(id, st, fwd) in &cand[side] {
+                        let Some(rv) = self.db.get_reference(id) else { continue };
+                        if st < 0 || st as usize + seq.len() > rv.len() {
+                            continue;
+                        }
+                        let (s, pk) = if fwd { (seq, &pf) } else { (&rcs[side][..], &pr) };
+                        let bound = best.saturating_add(3).min(40);
+                        let mm = rv.mismatches(st as usize, s, pk, bound);
+                        if mm <= bound {
+                            best = best.min(mm);
+                            scored[side].push((mm, id, st, fwd));
+                        }
+                    }
+                    stats.fm_compared += cand[side].len();
+                    scored[side].retain(|x| x.0 <= best.saturating_add(3));
+                }
+                // Pairs: opposite strands, same reference, within the pairing window; a mate the
+                // path did not place counts as 0 (its own seeds place it). Distinct pairs by locus.
+                let mut pairs: Vec<(usize, i64, usize, usize, i64, usize, i64)> = Vec::new(); // (cost, dev, id, st0, st1)
+                let mean = crate::align::common::INSERT_STATS.get().map(|s| s.0);
+                let len = [recs[0].seq().len() as i64, recs[1].seq().len() as i64];
+                if q[0] && q[1] {
+                    let mut b = scored[1].clone();
+                    b.sort_unstable_by_key(|x| (x.1, x.2));
+                    for &(m0, id, s0, f0) in &scored[0] {
+                        let lo = b.partition_point(|x| (x.1, x.2) < (id, s0 - MAX_INSERT));
+                        for &(m1, id1, s1, f1) in &b[lo..] {
+                            if id1 != id || s1 > s0 + MAX_INSERT {
+                                break;
+                            }
+                            if f1 == f0 {
+                                continue;
+                            }
+                            let ins = (s0 + len[0]).max(s1 + len[1]) - s0.min(s1);
+                            let dev = mean.map_or(0, |m| (ins as f64 - m).abs() as i64);
+                            pairs.push((m0 + m1, dev, id, s0 as usize, s1, 0, 0));
+                        }
+                    }
+                }
+                // No pair (or one mate on the path): the mates on their own.
+                let single = pairs.is_empty();
+                if single {
+                    for side in 0..2 {
+                        for &(m, id, st, _) in &scored[side] {
+                            pairs.push((m, 0, id, if side == 0 { st as usize } else { usize::MAX }, if side == 1 { st } else { i64::MIN }, side, 0));
+                        }
+                    }
+                }
+                if !pairs.is_empty() {
+                    pairs.sort_unstable();
+                    let best = pairs[0].0;
+                    let at_best: Vec<_> = pairs.iter().take_while(|p| p.0 == best).collect();
+                    // Among equally good pairs the insert closest to the mean wins (within 25 bp).
+                    let lo_dev = at_best.iter().map(|p| p.1).min().unwrap_or(0);
+                    let top: Vec<_> = at_best.iter().filter(|p| p.1 <= lo_dev + 25).collect();
+                    let second = pairs.iter().find(|p| p.0 > best).map(|p| p.0);
+                    let n_near = pairs.iter().filter(|p| p.0 == best + 1).count();
+                    let one = if q[0] != q[1] { Some(if q[0] { 0 } else { 1 }) } else { None };
+                    let single_info = one.filter(|_| single).map(|sd| (sd, scored[sd].iter().map(|x| (x.0, x.1, x.2)).collect()));
+                    let mut info = FmInfo { best, n_best: top.len(), second, n_near, loci: [Vec::new(), Vec::new()], used: q, single: single_info };
+                    if top.len() <= args.fm_keep {
+                        for p in &top {
+                            if p.3 != usize::MAX && (!single || p.5 == 0) {
+                                info.loci[0].push((p.2, p.3 as i64));
+                            }
+                            if p.4 != i64::MIN && (!single || p.5 == 1) {
+                                info.loci[1].push((p.2, p.4));
+                            }
+                        }
+                        // Seeds for the chosen copies: two per copy (its ends), as the index would
+                        // have made them, so the anchor's strand follows from them.
+                        for side in 0..2 {
+                            if !q[side] || info.loci[side].is_empty() {
+                                continue;
+                            }
+                            let l = len[side];
+                            let k = C as i64;
+                            let mut extra = Vec::new();
+                            for &(id, st) in &info.loci[side] {
+                                let fwd = scored[side].iter().find(|x| x.1 == id && x.2 == st).map_or(true, |x| x.3);
+                                for qpos in [0i64, l - k] {
+                                    let rpos = if fwd { st + qpos } else { st + (l - qpos - k) };
+                                    extra.push(Seed { qpos: qpos as u32, rpos: rpos as u64, rval: id as u64, mismatch: 0, length: C as u8, flag: 0 });
+                                }
+                            }
+                            let se = if side == 0 { &mut self.seed_extractor_fwd } else { &mut self.seed_extractor_rev };
+                            let mut seeds = se.take_seeds();
+                            seeds.extend(extra);
+                            crate::align::common::sort_short_by_key(&mut seeds, |s: &Seed| (s.rval, s.rpos));
+                            se.put_seeds(seeds);
+                            stats.fm_seeded += 1;
+                        }
+                    } else {
+                        stats.fm_ambiguous += 1;
+                    }
+                    FM_INFO.with(|f| *f.borrow_mut() = Some(info));
+                }
+            }
+        }
         if self.options.args.tie_mapq {
             let flex = if difficult { self.options.args.adaptive_flex } else { default_flex };
             let max_copies = self.options.args.tie_read_max_copies;
@@ -2199,6 +2359,25 @@ impl<
         // equal ones keep the extractor's order), and every pair tied with the best brought into
         // the extension window (at most --screen-tie-cap), so a better copy past -z is extended and
         // an equally good one is seen by the MAPQ.
+        let near_name = {
+            let n = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+            n.strip_suffix("/1").unwrap_or(&n).to_string()
+        };
+        let mut near_scr: [Vec<(u64, i64, usize)>; 2] = [Vec::new(), Vec::new()];
+        if near_traced(&near_name) {
+            let (f1, r1, f2, r2) = (rec_fwd.seq(), self.rec_fwd_revc.seq(), rec_rev.seq(), self.rec_rev_revc.seq());
+            let (pf1, pr1, pf2, pr2) = (pack2(f1), pack2(r1), pack2(f2), pack2(r2));
+            for AnchorPair(a1, a2) in anchors.iter().take(128) {
+                if let Some(a) = a1 {
+                    let (m, st, _) = anchor_read_mm(self.db, a, f1, &pf1, r1, &pr1, 60);
+                    if m != usize::MAX { near_scr[0].push((a.reference, st, m)); }
+                }
+                if let Some(a) = a2 {
+                    let (m, st, _) = anchor_read_mm(self.db, a, f2, &pf2, r2, &pr2, 60);
+                    if m != usize::MAX { near_scr[1].push((a.reference, st, m)); }
+                }
+            }
+        }
         let screen_n = self.options.args.screen_z;
         if screen_n > extend_top_z && anchors.len() > extend_top_z {
             let n = min(screen_n, anchors.len());
@@ -3225,7 +3404,7 @@ impl<
                 let chosen = rv.mismatches(start as usize, seq, &pack2(seq), usize::MAX);
                 stats.tie_mapq_checked += 1;
                 let others: Vec<(u64, i64)> = tie_copies_upto::<D, C, F>(self.db, fwd, &ranges[side][*ri], tied, chosen)
-                    .into_iter().filter(|&(v, st)| !(v == a.reference && (st - start).abs() <= 150)).collect();
+                    .into_iter().filter(|&(v, st, _)| !(v == a.reference && (st - start).abs() <= 150)).map(|(v, st, _)| (v, st)).collect();
                 eq[side] = Some(others);
             }
             let near = |x: &(u64, i64), ys: &[(u64, i64)]| ys.iter().any(|y| y.0 == x.0 && (y.1 - x.1).abs() <= MAX_INSERT);
@@ -3247,6 +3426,122 @@ impl<
                 pseudo_mapq = 0;
                 stats.tie_mapq_zeroed += 1;
             }
+        }
+
+        // --fm: the FM path's competition among the copies sets the pair's MAPQ. Placed where the
+        // path's best pair lies: a tie is MAPQ 0, else the margin to the next best pair (per
+        // mismatch, as --mapq-per-mismatch) less 4.343 ln(1 + pairs within one mismatch of the best).
+        // Placed elsewhere than the path's best: the placement is not trusted (MAPQ 0).
+        if self.options.args.fm && pseudo_mapq > 0 {
+            if let Some(mut info) = FM_INFO.with(|f| f.borrow().clone()) {
+                let placed = [fwd_anchor, rev_anchor];
+                // One mate alone on the path, its partner placed: only its copies that pair with
+                // the partner's placement compete.
+                if let Some((sd, copies)) = info.single.take() {
+                    if let Some(p) = placed[1 - sd].filter(|a| a.cigar.is_some()) {
+                        let lead = p.cigar.as_ref().unwrap().0.iter().take_while(|&&o| o == b'S').count() as i64;
+                        let pst = p.reference_cigar_range.start as i64 - lead;
+                        let mut near: Vec<(usize, i64)> = copies.iter()
+                            .filter(|c| c.1 as u64 == p.reference && (c.2 - pst).abs() <= MAX_INSERT + 200)
+                            .map(|c| (c.0, c.2)).collect();
+                        near.sort_unstable();
+                        near.dedup_by(|x, y| x.0 == y.0 && (x.1 - y.1).abs() <= 10);
+                        if let Some(&(b, _)) = near.first() {
+                            info.best = b;
+                            info.n_best = near.iter().filter(|x| x.0 == b).count();
+                            info.second = near.iter().find(|x| x.0 > b).map(|x| x.0);
+                            info.n_near = near.iter().filter(|x| x.0 == b + 1).count();
+                            info.loci[sd] = near.iter().filter(|x| x.0 == b).map(|x| (p.reference as usize, x.1)).collect();
+                        }
+                    }
+                }
+                let mut on_best = true;
+                let mut checked = false;
+                for side in 0..2 {
+                    if !info.used[side] {
+                        continue;
+                    }
+                    let Some(a) = placed[side].filter(|a| a.cigar.is_some()) else { continue };
+                    let lead = a.cigar.as_ref().unwrap().0.iter().take_while(|&&o| o == b'S').count() as i64;
+                    let start = a.reference_cigar_range.start as i64 - lead;
+                    checked = true;
+                    on_best &= info.loci[side].iter().any(|&(id, st)| id as u64 == a.reference && (st - start).abs() <= 150);
+                }
+                if checked {
+                    // Error rates measured on human (simulated pairs the FM path judged): a tie
+                    // among the path's best pairs is wrong 59 %; a placement off the path's best
+                    // 22 %; the next best one mismatch away 0.7-1 % (6 % with 16+ pairs there),
+                    // two / three / four away 0.23 / 0.14 / 0.07 %; from five on no cap.
+                    let cap = if info.n_best > 1 {
+                        0.0
+                    } else if !on_best {
+                        self.options.args.fm_offbest_mapq as f64
+                    } else {
+                        match info.second.map(|s| s - info.best) {
+                            Some(0) => 0.0,
+                            Some(1) if info.n_near >= 16 => 12.0,
+                            Some(1) => 20.0,
+                            Some(2) => 26.0,
+                            Some(3) => 28.0,
+                            Some(4) => 31.0,
+                            _ => 60.0,
+                        }
+                    };
+                    let capped = (pseudo_mapq as f64).min(cap.round()) as u8;
+                    if let Some(w) = fm_trace() {
+                        use std::io::Write;
+                        let line = format!("{near_name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", info.best, info.n_best,
+                            info.second.map_or(-1, |s| s as i64), info.n_near, on_best as u8, (info.used[0] as u8) + 2 * (info.used[1] as u8), pseudo_mapq, capped);
+                        let _ = w.lock().unwrap().write_all(line.as_bytes());
+                    }
+                    if capped < pseudo_mapq {
+                        stats.fm_mapq_lowered += 1;
+                    }
+                    pseudo_mapq = capped;
+                }
+            }
+        }
+
+        if near_traced(&near_name) {
+            let picks = TIE_PICKS.with(|t| t.borrow().clone());
+            let placed = [fwd_anchor, rev_anchor];
+            let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
+            let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
+            let mut line = format!("{near_name}\t{pseudo_mapq}");
+            for side in 0..2 {
+                let mut cols = vec![0usize; 11];
+                if let Some(a) = placed[side].filter(|a| a.cigar.is_some()) {
+                    let c = a.cigar.as_ref().unwrap();
+                    let lead = c.0.iter().take_while(|&&o| o == b'S').count() as i64;
+                    let start = a.reference_cigar_range.start as i64 - lead;
+                    let (fwd, rc) = reads[side];
+                    let seq = if a.forward { fwd } else { rc };
+                    if let Some(rv) = self.db.get_reference(a.reference as usize) {
+                        if start >= 0 && (start as usize + seq.len()) <= rv.len() {
+                            let chosen = rv.mismatches(start as usize, seq, &pack2(seq), usize::MAX);
+                            let away = |v: u64, st: i64| !(v == a.reference && (st - start).abs() <= 150);
+                            let cut: Vec<(u64, i64, usize)> = match &picks[side] {
+                                Some((ri, _, tied)) => tie_copies_upto::<D, C, F>(self.db, fwd, &ranges[side][*ri], tied, chosen + 2)
+                                    .into_iter().filter(|x| away(x.0, x.1)).collect(),
+                                None => Vec::new(),
+                            };
+                            let mut scr: Vec<(u64, i64, usize)> = near_scr[side].iter().copied().filter(|x| away(x.0, x.1) && x.2 <= chosen + 2).collect();
+                            scr.sort_unstable();
+                            scr.dedup_by(|x, y| x.0 == y.0 && (x.1 - y.1).abs() <= 150);
+                            let mut all: Vec<(u64, i64, usize)> = cut.iter().chain(scr.iter()).copied().collect();
+                            all.sort_unstable();
+                            all.dedup_by(|x, y| x.0 == y.0 && (x.1 - y.1).abs() <= 150);
+                            let count = |v: &[(u64, i64, usize)], d: usize| v.iter().filter(|x| x.2 <= chosen + d).count();
+                            cols = vec![1, chosen, count(&cut, 0), count(&cut, 1), count(&cut, 2), count(&scr, 0), count(&scr, 1), count(&scr, 2), count(&all, 0), count(&all, 1), count(&all, 2)];
+                        }
+                    }
+                }
+                for c in cols {
+                    line.push_str(&format!("\t{c}"));
+                }
+            }
+            line.push('\n');
+            near_write(&line);
         }
 
         // --mapq-per-mate: each mate's MAPQ from the competition for its own placement.
@@ -3921,7 +4216,7 @@ fn anchor_read_mm<D: FlexalignDatabase>(db: &D, a: &Anchor, fwd: &[u8], pf: &[u6
 /// of them looked at.
 fn tie_copies_upto<D: FlexalignDatabase, const C: usize, const F: usize>(
     db: &D, seq: &[u8], r: &crate::align::process::range_extractor::Range<F>, tied: &[usize], bound: usize,
-) -> Vec<(u64, i64)> {
+) -> Vec<(u64, i64, usize)> {
     let len = seq.len() as i64;
     let k = C as i64;
     let rc: Vec<u8> = seq.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
@@ -3944,13 +4239,159 @@ fn tie_copies_upto<D: FlexalignDatabase, const C: usize, const F: usize>(
             if st < 0 || ((st + len) as usize) > rv.len() {
                 continue;
             }
-            if rv.mismatches(st as usize, s, pk, bound) <= bound {
-                out.push((v, st));
+            let m = rv.mismatches(st as usize, s, pk, bound);
+            if m <= bound {
+                out.push((v, st, m));
                 break;
             }
         }
     }
     out
+}
+
+/// FA_NEAR_READS=<file of read names> with FA_NEAR_OUT=<file>: for those pairs, how many other
+/// copies each placed mate has within +0/+1/+2 gap-free mismatches of where it was placed (from its
+/// least-tied cut core, from the top 128 candidates, and both), at the final MAPQ.
+fn near_traced(name: &str) -> bool {
+    static SET: std::sync::OnceLock<Option<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let p = std::env::var_os("FA_NEAR_READS")?;
+        Some(std::fs::read_to_string(p).ok()?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    }).as_ref().is_some_and(|s| s.contains(name))
+}
+
+fn near_write(line: &str) {
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let p = std::env::var_os("FA_NEAR_OUT")?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(p).ok()?);
+        use std::io::Write as _;
+        let _ = writeln!(w, "#read\tmapq\t{}", ["1", "2"].iter().map(|m| format!("placed{m}\tmm{m}\tcut{m}_0\tcut{m}_1\tcut{m}_2\tscr{m}_0\tscr{m}_1\tscr{m}_2\tall{m}_0\tall{m}_1\tall{m}_2")).collect::<Vec<_>>().join("\t"));
+        Some(std::sync::Mutex::new(w))
+    });
+    if let Some(w) = out {
+        use std::io::Write as _;
+        let mut w = w.lock().unwrap();
+        let _ = w.write_all(line.as_bytes());
+        let _ = w.flush();
+    }
+}
+
+/// --fm: a mate's candidate placements from the whole-genome FM-index, as (reference id, the
+/// read's first base on it, forward): from every `step`-th read position (both strands) the
+/// longest exact match ending there, and the interval it held before its last shrink (a paralog
+/// that shares a sequencing error carries the match past it, and the true copy drops out of the
+/// interval there), each located when it has at most `max_hits` copies and is at least 31 long.
+fn fm_candidates(set: &crate::database::fmd::FmdSet, seq: &[u8], rc: &[u8], step: usize, max_hits: u64, located: &mut usize, lf_steps: &mut usize) -> Vec<(usize, i64, bool)> {
+    const MIN_MEM: usize = 31;
+    let len = seq.len();
+    let mut out = Vec::new();
+    for (fwd, s) in [(true, seq), (false, rc)] {
+        let codes: Vec<u8> = s.iter().map(|&b| match b { b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3, _ => 4 }).collect();
+        // Each piece on its own: a pair lies within one reference, so within one piece.
+        for fm in &set.pieces {
+            let mut seen: Vec<(u64, u64)> = Vec::new();
+            let mut i = len;
+            while i >= MIN_MEM {
+                let (mut lo, mut hi) = (0u64, fm.n);
+                let mut j = i;
+                let mut before: Option<(usize, u64, u64)> = None;
+                while j > 0 {
+                    let c = codes[j - 1];
+                    if c > 3 {
+                        break;
+                    }
+                    let (nl, nh) = fm.step(c, lo, hi);
+                    if nl >= nh {
+                        break;
+                    }
+                    if i - (j - 1) > MIN_MEM && nh - nl < hi - lo {
+                        before = Some((j, lo, hi));
+                    }
+                    lo = nl;
+                    hi = nh;
+                    j -= 1;
+                }
+                let mut take = |j: usize, lo: u64, hi: u64, out: &mut Vec<(usize, i64, bool)>| {
+                    if hi - lo > max_hits || seen.contains(&(lo, hi)) {
+                        return;
+                    }
+                    seen.push((lo, hi));
+                    *located += (hi - lo) as usize;
+                    for row in lo..hi {
+                        let (tp, st) = fm.locate(row);
+                        *lf_steps += st as usize;
+                        if tp < j as u64 {
+                            continue;
+                        }
+                        let (id, off) = fm.to_ref(tp - j as u64);
+                        if off + len as u64 <= fm.ref_len(id) {
+                            out.push((id, off as i64, fwd));
+                        }
+                    }
+                };
+                if i - j >= MIN_MEM {
+                    take(j, lo, hi, &mut out);
+                }
+                if let Some((bj, bl, bh)) = before {
+                    take(bj, bl, bh, &mut out);
+                }
+                if i < step {
+                    break;
+                }
+                i -= step;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+
+/// `FA_FM_TRACE=<path>`: one line per pair whose MAPQ the FM path judged: name, best, n_best,
+/// second (-1 none), n_near, on_best, mates on the path (bit 1 first, bit 2 second), MAPQ before, after.
+pub fn fm_trace_flush() {
+    if let Some(w) = fm_trace() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
+}
+
+fn fm_trace() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_FM_TRACE").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p).expect("FA_FM_TRACE file")))))
+        .as_ref()
+}
+
+
+
+/// `FA_FM_FORCE` set: every mate takes the FM path (for measuring what the trigger misses).
+fn fm_force() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FA_FM_FORCE").is_some())
+}
+
+
+
+/// --fm: what the FM path found for the pair being aligned, for its MAPQ: the best pair's
+/// mismatches, how many distinct pairs reach it, the next best, how many within one mismatch of
+/// the best, and the best pairs' read starts per mate (reference id, start).
+#[derive(Clone, Default)]
+struct FmInfo {
+    best: usize,
+    n_best: usize,
+    second: Option<usize>,
+    n_near: usize,
+    loci: [Vec<(usize, i64)>; 2],
+    used: [bool; 2],
+    /// One mate alone on the path: its side and its scored copies (mismatches, reference id,
+    /// start), so the MAPQ can keep those that pair with where the partner was placed.
+    single: Option<(usize, Vec<(usize, usize, i64)>)>,
+}
+
+thread_local! {
+    static FM_INFO: std::cell::RefCell<Option<FmInfo>> = const { std::cell::RefCell::new(None) };
 }
 
 thread_local! {
@@ -4208,3 +4649,19 @@ thread_local! {
     static COPIES_CAP: std::cell::Cell<u8> = const { std::cell::Cell::new(60) };
 }
 
+
+#[cfg(test)]
+mod fm_skip_tests {
+    #[test]
+    fn contained_matches_skipped() {
+        let mut x: u64 = 11;
+        let r: Vec<u8> = (0..20000).map(|_| { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); b"ACGT"[(x >> 62) as usize] }).collect();
+        let set = crate::database::fmd::FmdSet::build(&mut vec![r.clone()].into_iter(), u64::MAX);
+        let read = &r[5000..5150];
+        let rc: Vec<u8> = read.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' }).collect();
+        let (mut loc, mut st) = (0usize, 0usize);
+        let c = super::fm_candidates(&set, read, &rc, 16, 5000, &mut loc, &mut st);
+        eprintln!("cands {:?} located {loc}", c);
+        assert_eq!(loc, 1);
+    }
+}

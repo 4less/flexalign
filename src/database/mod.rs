@@ -8,3 +8,4 @@ pub mod flexmap;
 pub mod hashed_lines;
 pub mod refseq2;
 pub mod refview;
+pub mod fmd;

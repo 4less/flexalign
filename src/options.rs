@@ -570,6 +570,44 @@ pub struct Args {
     #[arg(long = "tie-mapq", action)]
     pub tie_mapq: bool,
 
+    /// Build the whole-genome FM-index next to the index (<reference>.fmd) and exit.
+    #[arg(long = "fm-build", action)]
+    pub fm_build: bool,
+
+    /// --fm-build: the largest piece of the FM-index in bases (references are cut into pieces at
+    /// their boundaries; each piece is its own index). At most just under 2^32.
+    #[arg(long = "fm-piece", default_value_t = 4_294_967_294)]
+    pub fm_piece: u64,
+
+    /// Place pairs whose cores the index cannot resolve with the whole-genome FM-index: a pair
+    /// with a mate seeded at most --fm-max-seeded cores, and some cut at the flank-tie limit or
+    /// most k-mers missing from the index (cores over the copy cap). Both mates: exact matches
+    /// from every --fm-step-th read position (and the interval before each one's last shrink),
+    /// located up to --fm-max-hits copies, paired between the mates, compared with the whole read
+    /// in the packed 2-bit form. The best pairs (at most --fm-keep) become seeds; the margin to the
+    /// next best pair sets the MAPQ (a tie: 0; placed off the best: --fm-offbest-mapq). Needs
+    /// <reference>.fmd (--fm-build).
+    #[arg(long = "fm", action)]
+    pub fm: bool,
+
+    #[arg(long = "fm-max-seeded", default_value_t = 8)]
+    pub fm_max_seeded: usize,
+
+    #[arg(long = "fm-keep", default_value_t = 16)]
+    pub fm_keep: usize,
+
+    #[arg(long = "fm-step", default_value_t = 32)]
+    pub fm_step: usize,
+
+    /// --fm: MAPQ of a pair placed elsewhere than the FM path's best pair (measured: wrong one
+    /// time in five).
+    #[arg(long = "fm-offbest-mapq", default_value_t = 5)]
+    pub fm_offbest_mapq: u8,
+
+    /// --fm: a match with more copies than this is not located.
+    #[arg(long = "fm-max-hits", default_value_t = 1000)]
+    pub fm_max_hits: u64,
+
     /// --tie-read: leave a mate to the rescue next to its partner when the partner has more than
     /// this many cores seeded.
     #[arg(long = "tie-read-skip-seeded-partner")]
