@@ -3602,7 +3602,7 @@ impl<
             line.push_str(&format!("\t{p0}\t{p1}"));
             // Cheaper picks: (flank slack, votes) = (1, 2), (0, 1), (0, 2). Per variant: copies
             // compared (both mates), mates with a tie / +1 copy, pairs at the chosen total / +1.
-            for (slack, votes) in [(1u32, 2usize), (0, 1), (0, 2)] {
+            for (slack, votes, rel, cap) in [(1u32, 2usize, 0.0f64, usize::MAX), (1, 2, 0.75, 64), (1, 2, 0.5, 64), (0, 2, 0.75, 64), (1, 2, 0.0, 32)] {
                 let mut sets: [Vec<(u64, i64, usize)>; 2] = [Vec::new(), Vec::new()];
                 let (mut compared, mut m0, mut m1) = (0usize, 0usize, 0usize);
                 let mut ok = [false, false];
@@ -3610,7 +3610,7 @@ impl<
                     let (Some(a), Some(chosen)) = (placed[side].filter(|a| a.cigar.is_some()), chosen_mm[side]) else { continue };
                     let ch = *all[side].last().unwrap();
                     let (fwd, rc) = reads[side];
-                    let (n, mut loci) = near_pick::<D, C, F>(self.db, fwd, rc, ranges[side], slack, votes, chosen + 2, &mut dist);
+                    let (n, mut loci) = near_pick::<D, C, F>(self.db, fwd, rc, ranges[side], slack, votes, rel, cap, chosen + 2, &mut dist);
                     compared += n;
                     loci.retain(|x| !(x.0 == a.reference && (x.1 - ch.1).abs() <= 150));
                     loci.sort_unstable();
@@ -4395,7 +4395,7 @@ fn tie_copies_upto<D: FlexalignDatabase, const C: usize, const F: usize>(
 /// compared with the whole read up to `bound`. Returns (compared, loci (ref, start, mismatches)).
 fn near_pick<D: FlexalignDatabase, const C: usize, const F: usize>(
     db: &D, seq: &[u8], rc: &[u8], ranges: &[crate::align::process::range_extractor::Range<F>],
-    slack: u32, votes: usize, bound: usize, dist: &mut Vec<u8>,
+    slack: u32, votes: usize, rel: f64, cap: usize, bound: usize, dist: &mut Vec<u8>,
 ) -> (usize, Vec<(u64, i64, usize)>) {
     let len = seq.len() as i64;
     let k = C as i64;
@@ -4421,7 +4421,7 @@ fn near_pick<D: FlexalignDatabase, const C: usize, const F: usize>(
     }
     starts.sort_unstable();
     // Votes: distinct ranges per cluster of starts within 10 bp on one reference and strand.
-    let mut picked: Vec<(u64, i64, bool)> = Vec::new();
+    let mut picked: Vec<(u64, i64, bool, usize)> = Vec::new();
     let mut i = 0;
     while i < starts.len() {
         let mut j = i + 1;
@@ -4442,14 +4442,19 @@ fn near_pick<D: FlexalignDatabase, const C: usize, const F: usize>(
                     k0 = k1;
                 }
             }
-            picked.push((starts[i].0, best, starts[i].2));
+            picked.push((starts[i].0, best, starts[i].2, rs.len()));
         }
         i = j;
     }
+    // Keep the most voted: at least `rel` of the top count, at most `cap` loci.
+    let maxv = picked.iter().map(|x| x.3).max().unwrap_or(0);
+    picked.retain(|x| x.3 as f64 >= rel * maxv as f64);
+    picked.sort_unstable_by(|a, b| b.3.cmp(&a.3));
+    picked.truncate(cap);
     // Same-strand orientation is unknown here: compare each picked start on its strand's sequence.
     let (pf, pr) = (pack2(seq), pack2(rc));
     let mut out = Vec::new();
-    for &(v, st, fwd) in &picked {
+    for &(v, st, fwd, _) in &picked {
         let Some(rv) = db.get_reference(v as usize) else { continue };
         if st < 0 || ((st + len) as usize) > rv.len() {
             continue;
