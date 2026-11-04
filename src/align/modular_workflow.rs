@@ -3599,7 +3599,45 @@ impl<
                     }
                 }
             }
-            line.push_str(&format!("\t{p0}\t{p1}\n"));
+            line.push_str(&format!("\t{p0}\t{p1}"));
+            // Cheaper picks: (flank slack, votes) = (1, 2), (0, 1), (0, 2). Per variant: copies
+            // compared (both mates), mates with a tie / +1 copy, pairs at the chosen total / +1.
+            for (slack, votes) in [(1u32, 2usize), (0, 1), (0, 2)] {
+                let mut sets: [Vec<(u64, i64, usize)>; 2] = [Vec::new(), Vec::new()];
+                let (mut compared, mut m0, mut m1) = (0usize, 0usize, 0usize);
+                let mut ok = [false, false];
+                for side in 0..2 {
+                    let (Some(a), Some(chosen)) = (placed[side].filter(|a| a.cigar.is_some()), chosen_mm[side]) else { continue };
+                    let ch = *all[side].last().unwrap();
+                    let (fwd, rc) = reads[side];
+                    let (n, mut loci) = near_pick::<D, C, F>(self.db, fwd, rc, ranges[side], slack, votes, chosen + 2, &mut dist);
+                    compared += n;
+                    loci.retain(|x| !(x.0 == a.reference && (x.1 - ch.1).abs() <= 150));
+                    loci.sort_unstable();
+                    loci.dedup_by(|x, y| x.0 == y.0 && (x.1 - y.1).abs() <= 10);
+                    m0 += loci.iter().any(|x| x.2 <= chosen) as usize;
+                    m1 += loci.iter().any(|x| x.2 <= chosen + 1) as usize;
+                    loci.push(ch);
+                    sets[side] = loci;
+                    ok[side] = true;
+                }
+                let (mut q0, mut q1) = (0usize, 0usize);
+                if ok[0] && ok[1] {
+                    let (c0, c1) = (chosen_mm[0].unwrap(), chosen_mm[1].unwrap());
+                    let (ch0, ch1) = (*sets[0].last().unwrap(), *sets[1].last().unwrap());
+                    for x in &sets[0] {
+                        for y in &sets[1] {
+                            if x.0 != y.0 || (x.1 - y.1).abs() > 1000 || (*x == ch0 && *y == ch1) {
+                                continue;
+                            }
+                            q0 += (x.2 + y.2 <= c0 + c1) as usize;
+                            q1 += (x.2 + y.2 <= c0 + c1 + 1) as usize;
+                        }
+                    }
+                }
+                line.push_str(&format!("\t{compared}\t{m0}\t{m1}\t{q0}\t{q1}"));
+            }
+            line.push('\n');
             use std::io::Write;
             let _ = w.lock().unwrap().write_all(line.as_bytes());
         }
@@ -4349,6 +4387,80 @@ fn tie_copies_upto<D: FlexalignDatabase, const C: usize, const F: usize>(
         }
     }
     out
+}
+
+/// FA_NEAR2_OUT: one way to pick a mate's competing copies from its ranges. Copies within `slack`
+/// flank mismatches of each range's best flank give read starts (both strands; at most 4096 a
+/// range); a start counts once per range; those with at least `votes` ranges (within 10 bp) are
+/// compared with the whole read up to `bound`. Returns (compared, loci (ref, start, mismatches)).
+fn near_pick<D: FlexalignDatabase, const C: usize, const F: usize>(
+    db: &D, seq: &[u8], rc: &[u8], ranges: &[crate::align::process::range_extractor::Range<F>],
+    slack: u32, votes: usize, bound: usize, dist: &mut Vec<u8>,
+) -> (usize, Vec<(u64, i64, usize)>) {
+    let len = seq.len() as i64;
+    let k = C as i64;
+    let mut starts: Vec<(u64, i64, bool, usize)> = Vec::new(); // (ref, start, fwd, range)
+    for (ri, r) in ranges.iter().enumerate() {
+        let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, dist);
+        if dist.is_empty() {
+            continue;
+        }
+        let mut n = 0;
+        for (i, &d) in dist.iter().enumerate() {
+            if d as u32 > min + slack {
+                continue;
+            }
+            n += 1;
+            if n > 4096 {
+                break;
+            }
+            let (v, p) = r.vrange.value(i);
+            starts.push((v, p as i64 - r.qpos as i64, true, ri));
+            starts.push((v, p as i64 - (len - r.qpos as i64 - k), false, ri));
+        }
+    }
+    starts.sort_unstable();
+    // Votes: distinct ranges per cluster of starts within 10 bp on one reference and strand.
+    let mut picked: Vec<(u64, i64, bool)> = Vec::new();
+    let mut i = 0;
+    while i < starts.len() {
+        let mut j = i + 1;
+        while j < starts.len() && starts[j].0 == starts[i].0 && starts[j].2 == starts[i].2 && starts[j].1 - starts[j - 1].1 <= 10 {
+            j += 1;
+        }
+        let mut rs: Vec<usize> = starts[i..j].iter().map(|x| x.3).collect();
+        rs.sort_unstable();
+        rs.dedup();
+        if rs.len() >= votes {
+            // The cluster's most common start.
+            let mut c: Vec<i64> = starts[i..j].iter().map(|x| x.1).collect();
+            c.sort_unstable();
+            let (mut best, mut bn, mut k0) = (c[0], 0, 0);
+            for k1 in 0..=c.len() {
+                if k1 == c.len() || c[k1] != c[k0] {
+                    if k1 - k0 > bn { bn = k1 - k0; best = c[k0]; }
+                    k0 = k1;
+                }
+            }
+            picked.push((starts[i].0, best, starts[i].2));
+        }
+        i = j;
+    }
+    // Same-strand orientation is unknown here: compare each picked start on its strand's sequence.
+    let (pf, pr) = (pack2(seq), pack2(rc));
+    let mut out = Vec::new();
+    for &(v, st, fwd) in &picked {
+        let Some(rv) = db.get_reference(v as usize) else { continue };
+        if st < 0 || ((st + len) as usize) > rv.len() {
+            continue;
+        }
+        let (s, pk) = if fwd { (seq, &pf) } else { (rc, &pr) };
+        let m = rv.mismatches(st as usize, s, pk, bound);
+        if m <= bound {
+            out.push((v, st, m));
+        }
+    }
+    (picked.len(), out)
 }
 
 /// FA_NEAR_READS=<file of read names> with FA_NEAR_OUT=<file>: for those pairs, how many other
