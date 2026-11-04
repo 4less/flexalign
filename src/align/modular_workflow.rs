@@ -4589,6 +4589,7 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
 ) -> (usize, usize) {
     // No range of either mate with two copies within one flank mismatch of its best: no other
     // pair can collect votes, and no position is read.
+    let _t_pre = fm_time::Span::new(&fm_time::NEAR_PRE_NS);
     let mut any = false;
     'outer: for side in 0..2 {
         for r in ranges[side].iter() {
@@ -4599,15 +4600,20 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
             }
         }
     }
+    drop(_t_pre);
     if !any {
         return (0, 0);
     }
+    fm_time::NEAR_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _t_read = fm_time::Span::new(&fm_time::NEAR_READ_NS);
     let mut lists: [Vec<(u64, i64, bool, usize)>; 2] = [Vec::new(), Vec::new()];
     for side in 0..2 {
         let (fwd, rc) = reads[side];
         let _ = near_pick_n::<D, C, F>(db, fwd, rc, ranges[side], 1, 2, 0.0, 0, 0, dist, per_range);
         lists[side] = NEAR_STARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     }
+    drop(_t_read);
+    let _t_join = fm_time::Span::new(&fm_time::NEAR_JOIN_NS);
     let mut b = std::mem::take(&mut lists[1]);
     b.sort_unstable();
     let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
@@ -4624,6 +4630,8 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
     }
     pairs.sort_unstable_by(|a, c| c.0.cmp(&a.0));
     pairs.truncate(cap);
+    drop(_t_join);
+    let _t_cmp = fm_time::Span::new(&fm_time::NEAR_CMP_NS);
     let total = chosen[0].2 + chosen[1].2;
     let mut memo: Vec<((usize, usize), usize)> = Vec::new();
     let mut mm = |side: usize, idx: usize, x: (u64, i64, bool, usize)| -> usize {
@@ -4769,6 +4777,11 @@ pub mod fm_time {
     pub static SEARCH_NS: AtomicU64 = AtomicU64::new(0);
     pub static LOCATE_NS: AtomicU64 = AtomicU64::new(0);
     pub static HAMMING_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NEAR_PRE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NEAR_READ_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NEAR_JOIN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NEAR_CMP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NEAR_RUN: AtomicU64 = AtomicU64::new(0);
     thread_local! { static IS_FM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4823,6 +4836,8 @@ pub mod fm_time {
         eprintln!("[fm-time] pairs: FM path {fp} ({:.1} %), other {op}", 100.0 * fp as f64 / (fp + op).max(1) as f64);
         eprintln!("[fm-time] thread-seconds in run_pair: FM pairs {:.1} ({:.1} us/pair), other pairs {:.1} ({:.1} us/pair)",
             s(&FM_PAIR_NS), 1e6 * s(&FM_PAIR_NS) / fp.max(1) as f64, s(&OTHER_PAIR_NS), 1e6 * s(&OTHER_PAIR_NS) / op.max(1) as f64);
+        eprintln!("[fm-time] near pairs: {} pairs past the precheck; precheck {:.1} s, read+vote {:.1} s, join {:.1} s, compare {:.1} s",
+            NEAR_RUN.load(Relaxed), s(&NEAR_PRE_NS), s(&NEAR_READ_NS), s(&NEAR_JOIN_NS), s(&NEAR_CMP_NS));
         eprintln!("[fm-time] FM block {:.1} s: search+locate {:.1} (locate {:.1}), Hamming {:.1}",
             s(&FM_BLOCK_NS), s(&SEARCH_NS), s(&LOCATE_NS), s(&HAMMING_NS));
     }
