@@ -577,6 +577,10 @@ pub struct Args {
     #[arg(long = "near-pairs", default_value_t = 0)]
     pub near_pairs: usize,
 
+    /// --near-pairs: at most this many copies of a range give read starts.
+    #[arg(long = "near-per-range", default_value_t = 256)]
+    pub near_per_range: usize,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 
