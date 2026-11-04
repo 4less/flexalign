@@ -3637,6 +3637,68 @@ impl<
                 }
                 line.push_str(&format!("\t{compared}\t{m0}\t{m1}\t{q0}\t{q1}"));
             }
+            // Pair votes: each mate's read starts (+1 flank, >= 2 ranges), joined into pairs on one
+            // reference within 1 kb on opposite strands, ranked by the votes of both, the top
+            // `cap` pairs compared (each locus once).
+            for cap in [16usize, 32, 64] {
+                let mut lists: [Vec<(u64, i64, bool, usize)>; 2] = [Vec::new(), Vec::new()];
+                let mut ok = [false, false];
+                for side in 0..2 {
+                    if placed[side].filter(|a| a.cigar.is_some()).is_none() || chosen_mm[side].is_none() {
+                        continue;
+                    }
+                    let (fwd, rc) = reads[side];
+                    let _ = near_pick::<D, C, F>(self.db, fwd, rc, ranges[side], 1, 2, 0.0, 0, 0, &mut dist);
+                    lists[side] = NEAR_STARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+                    ok[side] = true;
+                }
+                let (mut compared, mut q0, mut q1) = (0usize, 0usize, 0usize);
+                if ok[0] && ok[1] {
+                    let mut b = lists[1].clone();
+                    b.sort_unstable();
+                    let mut pairs: Vec<(usize, usize, usize)> = Vec::new(); // (votes, i0, i1)
+                    for (i0, x) in lists[0].iter().enumerate() {
+                        let lo = b.partition_point(|y| (y.0, y.1) < (x.0, x.1 - 1000));
+                        for (i1, y) in b.iter().enumerate().skip(lo) {
+                            if y.0 != x.0 || y.1 > x.1 + 1000 {
+                                break;
+                            }
+                            if y.2 != x.2 {
+                                pairs.push((x.3 + y.3, i0, i1));
+                            }
+                        }
+                    }
+                    pairs.sort_unstable_by(|a, c| c.0.cmp(&a.0));
+                    pairs.truncate(cap);
+                    let (c0, c1) = (chosen_mm[0].unwrap(), chosen_mm[1].unwrap());
+                    let (ch0, ch1) = (*all[0].last().unwrap(), *all[1].last().unwrap());
+                    let mut memo: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+                    let reads2 = [reads[0], reads[1]];
+                    let mut mm = |side: usize, x: (u64, i64, bool, usize), idx: usize| -> usize {
+                        *memo.entry((side, idx)).or_insert_with(|| {
+                            compared += 1;
+                            let (fwd, rc) = reads2[side];
+                            let s = if x.2 { fwd } else { rc };
+                            match self.db.get_reference(x.0 as usize) {
+                                Some(rv) if x.1 >= 0 && ((x.1 as usize) + s.len()) <= rv.len() => rv.mismatches(x.1 as usize, s, &pack2(s), c0 + c1 + 2),
+                                _ => usize::MAX / 4,
+                            }
+                        })
+                    };
+                    for &(_, i0, i1) in &pairs {
+                        let (x, y) = (lists[0][i0], b[i1]);
+                        let near0 = x.0 == ch0.0 && (x.1 - ch0.1).abs() <= 150;
+                        let near1 = y.0 == ch1.0 && (y.1 - ch1.1).abs() <= 150;
+                        if near0 && near1 {
+                            continue;
+                        }
+                        let t = mm(0, x, i0) + mm(1, y, 1_000_000 + i1);
+                        q0 += (t <= c0 + c1) as usize;
+                        q1 += (t <= c0 + c1 + 1) as usize;
+                    }
+                }
+                line.push_str(&format!("\t{compared}\t0\t0\t{q0}\t{q1}"));
+            }
             line.push('\n');
             use std::io::Write;
             let _ = w.lock().unwrap().write_all(line.as_bytes());
@@ -4389,6 +4451,10 @@ fn tie_copies_upto<D: FlexalignDatabase, const C: usize, const F: usize>(
     out
 }
 
+thread_local! {
+    static NEAR_STARTS: std::cell::RefCell<Vec<(u64, i64, bool, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// FA_NEAR2_OUT: one way to pick a mate's competing copies from its ranges. Copies within `slack`
 /// flank mismatches of each range's best flank give read starts (both strands; at most 4096 a
 /// range); a start counts once per range; those with at least `votes` ranges (within 10 bp) are
@@ -4445,6 +4511,11 @@ fn near_pick<D: FlexalignDatabase, const C: usize, const F: usize>(
             picked.push((starts[i].0, best, starts[i].2, rs.len()));
         }
         i = j;
+    }
+    if cap == 0 {
+        // Starts only (for pair voting): the caller pairs and compares.
+        NEAR_STARTS.with(|c| *c.borrow_mut() = picked.clone());
+        return (0, Vec::new());
     }
     // Keep the most voted: at least `rel` of the top count, at most `cap` loci.
     let maxv = picked.iter().map(|x| x.3).max().unwrap_or(0);
