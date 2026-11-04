@@ -3479,7 +3479,7 @@ impl<
             if ok {
                 let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
                 let mut dist = Vec::new();
-                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac);
+                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac, self.options.args.near_slack);
                 let cap = if q0 > 0 { self.options.args.near_tie_mapq } else if q1 > 0 { self.options.args.near_one_mapq } else { 255 };
                 if cap < pseudo_mapq {
                     pseudo_mapq = cap.max(if q0 > 0 { 0 } else { 1 });
@@ -4595,7 +4595,7 @@ fn near_pick_sel<D: FlexalignDatabase, const C: usize, const F: usize>(
 /// fewer, pairs at +1), the chosen pair itself excluded.
 fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
     db: &D, reads: [(&[u8], &[u8]); 2], ranges: [&[crate::align::process::range_extractor::Range<F>]; 2],
-    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>, per_range: usize, n_rare: usize, min_frac: f64,
+    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>, per_range: usize, n_rare: usize, min_frac: f64, slack: u32,
 ) -> (usize, usize) {
     // No range of either mate with two copies within one flank mismatch of its best: no other
     // pair can collect votes, and no position is read.
@@ -4648,7 +4648,7 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
                 }
             }
         }
-        let _ = near_pick_sel::<D, C, F>(db, fwd, rc, ranges[side], if n_rare > 0 { Some(&use_sel) } else { None }, 1, 2, 0.0, 0, 0, dist, per_range);
+        let _ = near_pick_sel::<D, C, F>(db, fwd, rc, ranges[side], if n_rare > 0 { Some(&use_sel) } else { None }, slack, 2, 0.0, 0, 0, dist, per_range);
         lists[side] = NEAR_STARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     }
     drop(_t_read);

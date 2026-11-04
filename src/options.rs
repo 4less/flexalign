@@ -590,6 +590,10 @@ pub struct Args {
     #[arg(long = "near-min-frac", default_value_t = 0.0)]
     pub near_min_frac: f64,
 
+    /// --near-pairs: copies within this many flank mismatches of a range's best give read starts.
+    #[arg(long = "near-slack", default_value_t = 1)]
+    pub near_slack: u32,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 
