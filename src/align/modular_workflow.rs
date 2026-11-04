@@ -3458,7 +3458,7 @@ impl<
         // Placed elsewhere than the path's best: the placement is not trusted (MAPQ 0).
         // --near-pairs: another pair of loci from flexmap's ranges fits as well (MAPQ at most
         // --near-tie-mapq) or one mismatch worse (at most --near-one-mapq).
-        if self.options.args.near_pairs > 0 && pseudo_mapq > 0 {
+        if self.options.args.near_pairs > 0 && pseudo_mapq > self.options.args.near_one_mapq {
             let placed = [fwd_anchor, rev_anchor];
             let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
             let mut chosen = [(0u64, 0i64, 0usize); 2];
@@ -4509,14 +4509,18 @@ fn near_pick_n<D: FlexalignDatabase, const C: usize, const F: usize>(
         if dist.is_empty() {
             continue;
         }
-        let mut n = 0;
+        // At most `per_range` copies, spread evenly over the range (its first ones may all be
+        // one region's).
+        let near = dist.iter().filter(|&&d| d as u32 <= min + slack).count();
+        let every = near.div_ceil(per_range.max(1)).max(1);
+        let mut n = 0usize;
         for (i, &d) in dist.iter().enumerate() {
             if d as u32 > min + slack {
                 continue;
             }
             n += 1;
-            if n > per_range {
-                break;
+            if (n - 1) % every != 0 {
+                continue;
             }
             let (v, p) = r.vrange.value(i);
             starts.push((v, p as i64 - r.qpos as i64, true, ri));
