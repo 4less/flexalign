@@ -1754,6 +1754,24 @@ impl<
             }
         }
         FM_INFO.with(|f| *f.borrow_mut() = None);
+        // FA_REPEAT_MAPQ: how much of each mate lies in repeats, as minibwa's frac_high (the share
+        // of the read covered by seeds of more than 250 copies). Mode 1: the share of the mate's
+        // found cores cut at the flank-tie limit; mode 2: cut cores plus k-mers not in the index
+        // (cores over the copy cap, or a sequencing error) among all its k-mers.
+        if let Some((mode, _)) = repeat_mapq() {
+            let ses = [&self.seed_extractor_fwd, &self.seed_extractor_rev];
+            let n_kmers = [n_kmers_fwd, n_kmers_rev];
+            let n_ranges = [ranges_fwd.len(), ranges_rev.len()];
+            let f = [0, 1].map(|s| {
+                let (seeded, cut) = ses[s].last_ties();
+                let absent = n_kmers[s].saturating_sub(n_ranges[s]);
+                match mode {
+                    1 => if seeded + cut == 0 { 0.0 } else { cut as f64 / (seeded + cut) as f64 },
+                    _ => if n_kmers[s] == 0 { 0.0 } else { ((cut + absent) as f64 / n_kmers[s] as f64).min(1.0) },
+                }
+            });
+            REPEAT_FRAC.with(|c| c.set(f));
+        }
         if let (true, Some(fm)) = (self.options.args.fm, crate::database::fmd::FMD.get()) {
             let args = &self.options.args;
             let n_kmers = [n_kmers_fwd, n_kmers_rev];
@@ -3438,6 +3456,12 @@ impl<
         // path's best pair lies: a tie is MAPQ 0, else the margin to the next best pair (per
         // mismatch, as --mapq-per-mismatch) less 4.343 ln(1 + pairs within one mismatch of the best).
         // Placed elsewhere than the path's best: the placement is not trusted (MAPQ 0).
+        // FA_REPEAT_MAPQ: minibwa's pair MAPQ scaling, MAPQ * (1 - w (f1 + f2)); a pair keeps 1.
+        if let Some((_, w)) = repeat_mapq().filter(|_| pseudo_mapq > 0) {
+            let f = REPEAT_FRAC.with(|c| c.get());
+            let scaled = (pseudo_mapq as f64 * (1.0 - w * (f[0] + f[1])).max(0.0)).round() as u8;
+            pseudo_mapq = scaled.max(1);
+        }
         if self.options.args.fm && pseudo_mapq > 0 {
             if let Some(mut info) = FM_INFO.with(|f| f.borrow().clone()) {
                 let placed = [fwd_anchor, rev_anchor];
@@ -4444,6 +4468,23 @@ fn fm_trace() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::Fi
 }
 
 
+
+thread_local! {
+    static REPEAT_FRAC: std::cell::Cell<[f64; 2]> = const { std::cell::Cell::new([0.0, 0.0]) };
+}
+
+/// `FA_REPEAT_MAPQ=<mode>[,<w>]`: scale the pair MAPQ by how much of the mates lies in repeats
+/// (see `REPEAT_FRAC`); w defaults to 0.5 as in minibwa.
+fn repeat_mapq() -> Option<(u32, f64)> {
+    static V: std::sync::OnceLock<Option<(u32, f64)>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("FA_REPEAT_MAPQ").ok()?;
+        let mut it = v.split(',');
+        let mode = it.next()?.parse().ok()?;
+        let w = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.5);
+        Some((mode, w))
+    })
+}
 
 /// `FA_FM_FORCE` set: every mate takes the FM path (for measuring what the trigger misses).
 fn fm_force() -> bool {
