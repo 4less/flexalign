@@ -143,6 +143,7 @@ pub struct Stats {
     pub fm_pairs: usize,
     pub fm_compared: usize,
     pub fm_located: usize,
+    pub near_mapq_lowered: usize,
     pub fm_lf_steps: usize,
     pub fm_seeded: usize,
     pub fm_ambiguous: usize,
@@ -532,6 +533,7 @@ impl Merge for Stats {
         self.fm_pairs += other.fm_pairs;
         self.fm_compared += other.fm_compared;
         self.fm_located += other.fm_located;
+        self.near_mapq_lowered += other.near_mapq_lowered;
         self.fm_lf_steps += other.fm_lf_steps;
         self.fm_seeded += other.fm_seeded;
         self.fm_ambiguous += other.fm_ambiguous;
@@ -585,6 +587,9 @@ impl Display for Stats {
     /// GOLDSTD_EVAL build. Otherwise those counters are all zero and only clutter the log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t = self.threads.max(1) as u32;
+        if self.near_mapq_lowered > 0 {
+            writeln!(f, "Near pairs: MAPQ lowered {}", self.near_mapq_lowered)?;
+        }
         if self.fm_pairs > 0 {
             writeln!(f, "FM pairs: {}, rows located: {} ({} BWT steps), copies compared: {}, mates seeded: {}, ambiguous (> --fm-keep): {}, MAPQ lowered: {}",
                 self.fm_pairs, self.fm_located, self.fm_lf_steps, self.fm_compared, self.fm_seeded, self.fm_ambiguous, self.fm_mapq_lowered)?;
@@ -852,6 +857,7 @@ impl Default for Stats {
             fm_pairs: 0,
             fm_compared: 0,
             fm_located: 0,
+            near_mapq_lowered: 0,
             fm_lf_steps: 0,
             fm_seeded: 0,
             fm_ambiguous: 0,

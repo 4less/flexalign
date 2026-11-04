@@ -570,6 +570,19 @@ pub struct Args {
     #[arg(long = "tie-mapq", action)]
     pub tie_mapq: bool,
 
+    /// Check the placed pair against the pairs of loci flexmap's own ranges suggest: copies within
+    /// one flank mismatch of each range's best, voted by read start, joined into pairs, the top N
+    /// pairs compared with both whole reads. Another pair as good caps the MAPQ at
+    /// --near-tie-mapq, one mismatch worse at --near-one-mapq. 0 turns it off.
+    #[arg(long = "near-pairs", default_value_t = 0)]
+    pub near_pairs: usize,
+
+    #[arg(long = "near-tie-mapq", default_value_t = 0)]
+    pub near_tie_mapq: u8,
+
+    #[arg(long = "near-one-mapq", default_value_t = 10)]
+    pub near_one_mapq: u8,
+
     /// Build the whole-genome FM-index next to the index (<reference>.fmd) and exit.
     #[arg(long = "fm-build", action)]
     pub fm_build: bool,

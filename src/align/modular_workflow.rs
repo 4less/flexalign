@@ -3456,6 +3456,37 @@ impl<
         // path's best pair lies: a tie is MAPQ 0, else the margin to the next best pair (per
         // mismatch, as --mapq-per-mismatch) less 4.343 ln(1 + pairs within one mismatch of the best).
         // Placed elsewhere than the path's best: the placement is not trusted (MAPQ 0).
+        // --near-pairs: another pair of loci from flexmap's ranges fits as well (MAPQ at most
+        // --near-tie-mapq) or one mismatch worse (at most --near-one-mapq).
+        if self.options.args.near_pairs > 0 && pseudo_mapq > 0 {
+            let placed = [fwd_anchor, rev_anchor];
+            let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
+            let mut chosen = [(0u64, 0i64, 0usize); 2];
+            let mut ok = true;
+            for side in 0..2 {
+                let Some(a) = placed[side].filter(|a| a.cigar.is_some()) else { ok = false; break };
+                let lead = a.cigar.as_ref().unwrap().0.iter().take_while(|&&o| o == b'S').count() as i64;
+                let start = a.reference_cigar_range.start as i64 - lead;
+                let (fwd, rc) = reads[side];
+                let seq = if a.forward { fwd } else { rc };
+                match self.db.get_reference(a.reference as usize) {
+                    Some(rv) if start >= 0 && (start as usize + seq.len()) <= rv.len() => {
+                        chosen[side] = (a.reference, start, rv.mismatches(start as usize, seq, &pack2(seq), usize::MAX));
+                    }
+                    _ => { ok = false; break; }
+                }
+            }
+            if ok {
+                let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
+                let mut dist = Vec::new();
+                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist);
+                let cap = if q0 > 0 { self.options.args.near_tie_mapq } else if q1 > 0 { self.options.args.near_one_mapq } else { 255 };
+                if cap < pseudo_mapq {
+                    pseudo_mapq = cap.max(if q0 > 0 { 0 } else { 1 });
+                    stats.near_mapq_lowered += 1;
+                }
+            }
+        }
         // FA_REPEAT_MAPQ: minibwa's pair MAPQ scaling, MAPQ * (1 - w (f1 + f2)); a pair keeps 1.
         if let Some((_, w)) = repeat_mapq().filter(|_| pseudo_mapq > 0) {
             let f = REPEAT_FRAC.with(|c| c.get());
@@ -4537,6 +4568,68 @@ fn near_pick<D: FlexalignDatabase, const C: usize, const F: usize>(
         }
     }
     (picked.len(), out)
+}
+
+/// --near-pairs: does another pair of loci fit the read pair as well as the chosen one, as far as
+/// flexmap's own ranges tell? Each mate's read starts from the copies within +1 flank mismatch of
+/// each range's best flank, counted once per range (>= 2 ranges); joined into pairs (one reference,
+/// within 1 kb, opposite strands) and ranked by the votes of both mates; the top `cap` pairs
+/// compared with both whole reads (gap-free). Returns (pairs at the chosen pair's mismatches or
+/// fewer, pairs at +1), the chosen pair itself excluded.
+fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
+    db: &D, reads: [(&[u8], &[u8]); 2], ranges: [&[crate::align::process::range_extractor::Range<F>]; 2],
+    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>,
+) -> (usize, usize) {
+    let mut lists: [Vec<(u64, i64, bool, usize)>; 2] = [Vec::new(), Vec::new()];
+    for side in 0..2 {
+        let (fwd, rc) = reads[side];
+        let _ = near_pick::<D, C, F>(db, fwd, rc, ranges[side], 1, 2, 0.0, 0, 0, dist);
+        lists[side] = NEAR_STARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    }
+    let mut b = std::mem::take(&mut lists[1]);
+    b.sort_unstable();
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for (i0, x) in lists[0].iter().enumerate() {
+        let lo = b.partition_point(|y| (y.0, y.1) < (x.0, x.1 - 1000));
+        for (i1, y) in b.iter().enumerate().skip(lo) {
+            if y.0 != x.0 || y.1 > x.1 + 1000 {
+                break;
+            }
+            if y.2 != x.2 {
+                pairs.push((x.3 + y.3, i0, i1));
+            }
+        }
+    }
+    pairs.sort_unstable_by(|a, c| c.0.cmp(&a.0));
+    pairs.truncate(cap);
+    let total = chosen[0].2 + chosen[1].2;
+    let mut memo: Vec<((usize, usize), usize)> = Vec::new();
+    let mut mm = |side: usize, idx: usize, x: (u64, i64, bool, usize)| -> usize {
+        if let Some(m) = memo.iter().find(|e| e.0 == (side, idx)) {
+            return m.1;
+        }
+        let (fwd, rc) = reads[side];
+        let s = if x.2 { fwd } else { rc };
+        let m = match db.get_reference(x.0 as usize) {
+            Some(rv) if x.1 >= 0 && ((x.1 as usize) + s.len()) <= rv.len() => rv.mismatches(x.1 as usize, s, &pack2(s), total + 2),
+            _ => usize::MAX / 4,
+        };
+        memo.push(((side, idx), m));
+        m
+    };
+    let (mut q0, mut q1) = (0, 0);
+    for &(_, i0, i1) in &pairs {
+        let (x, y) = (lists[0][i0], b[i1]);
+        let near0 = x.0 == chosen[0].0 && (x.1 - chosen[0].1).abs() <= 150;
+        let near1 = y.0 == chosen[1].0 && (y.1 - chosen[1].1).abs() <= 150;
+        if near0 && near1 {
+            continue;
+        }
+        let t = mm(0, i0, x) + mm(1, i1, y);
+        q0 += (t <= total) as usize;
+        q1 += (t <= total + 1) as usize;
+    }
+    (q0, q1)
 }
 
 /// FA_NEAR_READS=<file of read names> with FA_NEAR_OUT=<file>: for those pairs, how many other
