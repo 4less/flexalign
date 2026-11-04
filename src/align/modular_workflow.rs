@@ -3532,6 +3532,78 @@ impl<
             }
         }
 
+        // FA_NEAR2_OUT=<file>: what flexmap's own ranges know about competitors. Per placed mate:
+        // every copy within +1 flank mismatch of its range's best flank (all ranges with flank
+        // headers, cut ones too, up to 4096 a range), placed with the whole read; those away from
+        // the chosen locus within +0/+1 whole-read mismatches; and pairs of such loci (with the
+        // chosen ones) on one reference within 1 kb, at the chosen pair's total or +1.
+        if let Some(w) = near2_out() {
+            let placed = [fwd_anchor, rev_anchor];
+            let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
+            let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
+            let mut line = format!("{near_name}\t{pseudo_mapq}");
+            let mut all: [Vec<(u64, i64, usize)>; 2] = [Vec::new(), Vec::new()];
+            let mut chosen_mm: [Option<usize>; 2] = [None, None];
+            let mut dist: Vec<u8> = Vec::new();
+            for side in 0..2 {
+                let mut cols = [0usize; 6];
+                if let Some(a) = placed[side].filter(|a| a.cigar.is_some()) {
+                    let lead = a.cigar.as_ref().unwrap().0.iter().take_while(|&&o| o == b'S').count() as i64;
+                    let start = a.reference_cigar_range.start as i64 - lead;
+                    let (fwd, rc) = reads[side];
+                    let seq = if a.forward { fwd } else { rc };
+                    if let Some(rv) = self.db.get_reference(a.reference as usize) {
+                        if start >= 0 && (start as usize + seq.len()) <= rv.len() {
+                            let chosen = rv.mismatches(start as usize, seq, &pack2(seq), usize::MAX);
+                            chosen_mm[side] = Some(chosen);
+                            let away = |v: u64, st: i64| !(v == a.reference && (st - start).abs() <= 150);
+                            let (mut listed, mut wide) = (0usize, 0usize);
+                            let mut loci: Vec<(u64, i64, usize)> = Vec::new();
+                            for r in ranges[side].iter() {
+                                let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
+                                if dist.is_empty() {
+                                    continue;
+                                }
+                                let idx: Vec<usize> = dist.iter().enumerate().filter(|x| (*x.1 as u32) <= min + 1).map(|x| x.0).take(4096).collect();
+                                if idx.len() > 16 {
+                                    wide += 1;
+                                }
+                                listed += idx.len();
+                                loci.extend(tie_copies_upto::<D, C, F>(self.db, fwd, r, &idx, chosen + 2).into_iter().filter(|x| away(x.0, x.1)));
+                            }
+                            loci.sort_unstable();
+                            loci.dedup_by(|x, y| x.0 == y.0 && (x.1 - y.1).abs() <= 10);
+                            let n0 = loci.iter().filter(|x| x.2 <= chosen).count();
+                            let n1 = loci.iter().filter(|x| x.2 <= chosen + 1).count();
+                            cols = [1, chosen, listed, wide, n0, n1];
+                            loci.push((a.reference, start, chosen));
+                            all[side] = loci;
+                        }
+                    }
+                }
+                for c in cols {
+                    line.push_str(&format!("\t{c}"));
+                }
+            }
+            let (mut p0, mut p1) = (0usize, 0usize);
+            if let (Some(c0), Some(c1)) = (chosen_mm[0], chosen_mm[1]) {
+                let (ch0, ch1) = (*all[0].last().unwrap(), *all[1].last().unwrap());
+                for x in &all[0] {
+                    for y in &all[1] {
+                        if x.0 != y.0 || (x.1 - y.1).abs() > 1000 || (*x == ch0 && *y == ch1) {
+                            continue;
+                        }
+                        let t = x.2 + y.2;
+                        p0 += (t <= c0 + c1) as usize;
+                        p1 += (t <= c0 + c1 + 1) as usize;
+                    }
+                }
+            }
+            line.push_str(&format!("\t{p0}\t{p1}\n"));
+            use std::io::Write;
+            let _ = w.lock().unwrap().write_all(line.as_bytes());
+        }
+
         if near_traced(&near_name) {
             let picks = TIE_PICKS.with(|t| t.borrow().clone());
             let placed = [fwd_anchor, rev_anchor];
@@ -4453,8 +4525,18 @@ pub mod fm_time {
     }
 }
 
+fn near2_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_NEAR2_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).expect("FA_NEAR2_OUT file")))))
+        .as_ref()
+}
+
 pub fn fm_trace_flush() {
     fm_time::report();
+    if let Some(w) = near2_out() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
     if let Some(w) = fm_trace() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
