@@ -3479,7 +3479,7 @@ impl<
             if ok {
                 let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
                 let mut dist = Vec::new();
-                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range);
+                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare);
                 let cap = if q0 > 0 { self.options.args.near_tie_mapq } else if q1 > 0 { self.options.args.near_one_mapq } else { 255 };
                 if cap < pseudo_mapq {
                     pseudo_mapq = cap.max(if q0 > 0 { 0 } else { 1 });
@@ -4501,10 +4501,20 @@ fn near_pick_n<D: FlexalignDatabase, const C: usize, const F: usize>(
     db: &D, seq: &[u8], rc: &[u8], ranges: &[crate::align::process::range_extractor::Range<F>],
     slack: u32, votes: usize, rel: f64, cap: usize, bound: usize, dist: &mut Vec<u8>, per_range: usize,
 ) -> (usize, Vec<(u64, i64, usize)>) {
+    near_pick_sel::<D, C, F>(db, seq, rc, ranges, None, slack, votes, rel, cap, bound, dist, per_range)
+}
+
+fn near_pick_sel<D: FlexalignDatabase, const C: usize, const F: usize>(
+    db: &D, seq: &[u8], rc: &[u8], ranges: &[crate::align::process::range_extractor::Range<F>], sel: Option<&[usize]>,
+    slack: u32, votes: usize, rel: f64, cap: usize, bound: usize, dist: &mut Vec<u8>, per_range: usize,
+) -> (usize, Vec<(u64, i64, usize)>) {
     let len = seq.len() as i64;
     let k = C as i64;
     let mut starts: Vec<(u64, i64, bool, usize)> = Vec::new(); // (ref, start, fwd, range)
     for (ri, r) in ranges.iter().enumerate() {
+        if sel.is_some_and(|sel| !sel.contains(&ri)) {
+            continue;
+        }
         let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, dist);
         if dist.is_empty() {
             continue;
@@ -4585,21 +4595,31 @@ fn near_pick_n<D: FlexalignDatabase, const C: usize, const F: usize>(
 /// fewer, pairs at +1), the chosen pair itself excluded.
 fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
     db: &D, reads: [(&[u8], &[u8]); 2], ranges: [&[crate::align::process::range_extractor::Range<F>]; 2],
-    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>, per_range: usize,
+    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>, per_range: usize, n_rare: usize,
 ) -> (usize, usize) {
     // No range of either mate with two copies within one flank mismatch of its best: no other
     // pair can collect votes, and no position is read.
     let _t_pre = fm_time::Span::new(&fm_time::NEAR_PRE_NS);
-    let mut any = false;
-    'outer: for side in 0..2 {
-        for r in ranges[side].iter() {
+    // Per mate, its ranges with two or more copies within one flank mismatch of their best, the
+    // `n_rare` with the fewest such copies (0: all): a paralog shares nearly all the read's cores,
+    // so it is among the copies of its rarest ones too.
+    let mut sel: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    for side in 0..2 {
+        let mut cnt: Vec<(usize, usize)> = Vec::new();
+        for (ri, r) in ranges[side].iter().enumerate() {
             let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, dist);
-            if dist.iter().filter(|&&d| d as u32 <= min + 1).nth(1).is_some() {
-                any = true;
-                break 'outer;
+            let n = dist.iter().filter(|&&d| d as u32 <= min + 1).count();
+            if n >= 2 {
+                cnt.push((n, ri));
             }
         }
+        cnt.sort_unstable();
+        if n_rare > 0 {
+            cnt.truncate(n_rare);
+        }
+        sel[side] = cnt.into_iter().map(|x| x.1).collect();
     }
+    let any = !sel[0].is_empty() || !sel[1].is_empty();
     drop(_t_pre);
     if !any {
         return (0, 0);
@@ -4609,7 +4629,16 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
     let mut lists: [Vec<(u64, i64, bool, usize)>; 2] = [Vec::new(), Vec::new()];
     for side in 0..2 {
         let (fwd, rc) = reads[side];
-        let _ = near_pick_n::<D, C, F>(db, fwd, rc, ranges[side], 1, 2, 0.0, 0, 0, dist, per_range);
+        // Count-1 ranges add the read's own locus (and a lone paralog's) as votes too.
+        let mut use_sel = sel[side].clone();
+        if n_rare > 0 {
+            for (ri, r) in ranges[side].iter().enumerate() {
+                if !use_sel.contains(&ri) && r.range_size <= 1 {
+                    use_sel.push(ri);
+                }
+            }
+        }
+        let _ = near_pick_sel::<D, C, F>(db, fwd, rc, ranges[side], if n_rare > 0 { Some(&use_sel) } else { None }, 1, 2, 0.0, 0, 0, dist, per_range);
         lists[side] = NEAR_STARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     }
     drop(_t_read);
