@@ -582,8 +582,13 @@ pub struct Args {
     pub near_per_range: usize,
 
     /// --near-pairs: vote with each mate's this many ranges of fewest near copies (0: all).
-    #[arg(long = "near-rare", default_value_t = 4)]
+    #[arg(long = "near-rare", default_value_t = 0)]
     pub near_rare: usize,
+
+    /// --near-pairs: check a pair only when both mates have at least this share of their
+    /// flank-headered ranges with two or more copies within one flank mismatch of the best.
+    #[arg(long = "near-min-frac", default_value_t = 0.0)]
+    pub near_min_frac: f64,
 
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,

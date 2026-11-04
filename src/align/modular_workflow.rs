@@ -3479,7 +3479,7 @@ impl<
             if ok {
                 let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
                 let mut dist = Vec::new();
-                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare);
+                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac);
                 let cap = if q0 > 0 { self.options.args.near_tie_mapq } else if q1 > 0 { self.options.args.near_one_mapq } else { 255 };
                 if cap < pseudo_mapq {
                     pseudo_mapq = cap.max(if q0 > 0 { 0 } else { 1 });
@@ -4595,7 +4595,7 @@ fn near_pick_sel<D: FlexalignDatabase, const C: usize, const F: usize>(
 /// fewer, pairs at +1), the chosen pair itself excluded.
 fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
     db: &D, reads: [(&[u8], &[u8]); 2], ranges: [&[crate::align::process::range_extractor::Range<F>]; 2],
-    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>, per_range: usize, n_rare: usize,
+    chosen: [(u64, i64, usize); 2], cap: usize, dist: &mut Vec<u8>, per_range: usize, n_rare: usize, min_frac: f64,
 ) -> (usize, usize) {
     // No range of either mate with two copies within one flank mismatch of its best: no other
     // pair can collect votes, and no position is read.
@@ -4604,14 +4604,24 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
     // `n_rare` with the fewest such copies (0: all): a paralog shares nearly all the read's cores,
     // so it is among the copies of its rarest ones too.
     let mut sel: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    let mut frac_ok = true;
     for side in 0..2 {
         let mut cnt: Vec<(usize, usize)> = Vec::new();
+        let mut headered = 0usize;
         for (ri, r) in ranges[side].iter().enumerate() {
             let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, dist);
+            if dist.is_empty() {
+                continue;
+            }
+            headered += 1;
             let n = dist.iter().filter(|&&d| d as u32 <= min + 1).count();
             if n >= 2 {
                 cnt.push((n, ri));
             }
+        }
+        // A paralog pair repeats nearly every core of both mates.
+        if (cnt.len() as f64) < min_frac * headered.max(1) as f64 || cnt.is_empty() && min_frac > 0.0 {
+            frac_ok = false;
         }
         cnt.sort_unstable();
         if n_rare > 0 {
@@ -4619,7 +4629,7 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
         }
         sel[side] = cnt.into_iter().map(|x| x.1).collect();
     }
-    let any = !sel[0].is_empty() || !sel[1].is_empty();
+    let any = frac_ok && (!sel[0].is_empty() || !sel[1].is_empty());
     drop(_t_pre);
     if !any {
         return (0, 0);
