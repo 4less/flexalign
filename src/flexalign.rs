@@ -220,6 +220,10 @@ pub fn run(args: Args) {
         },
     };
 
+    if let Some(t) = std::env::var("FA_INDEX_STATS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        crate::align::modular_workflow::index_flank_ladder(&db, C, t, options.args.threads.max(1) as usize);
+        return;
+    }
     // --fm-build / --fm: the whole-genome FM-index next to the index.
     let fm_path = format!("{}.fmd", options.args.reference);
     if options.args.fm_build {

@@ -1982,6 +1982,15 @@ impl<
         }
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
+        if let (Some(truth), Some(w)) = (TRACE_TRUTH.get(), ext_out()) {
+            use std::io::Write as _;
+            for l in [
+                ext_funnel(self.db, truth, rec_fwd, "1", self.range_extractor_fwd.retrieve()),
+                ext_funnel(self.db, truth, rec_rev, "2", self.range_extractor_rev.retrieve()),
+            ].into_iter().flatten() {
+                let _ = w.lock().unwrap().write_all(l.as_bytes());
+            }
+        }
         if let Some(truth) = TRACE_TRUTH.get() {
             let flex = if difficult { self.options.args.adaptive_flex } else { self.options.args.max_best_flex };
             let lines = [
@@ -4890,6 +4899,10 @@ fn near2_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
 
 pub fn fm_trace_flush() {
     fm_time::report();
+    if let Some(w) = ext_out() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
     if let Some(w) = near2_out() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
@@ -5223,4 +5236,218 @@ mod fm_skip_tests {
         eprintln!("cands {:?} located {loc}", c);
         assert_eq!(loc, 1);
     }
+}
+
+/// `FA_INDEX_STATS=<T>`: what a flank ladder would store. Over every key of the index: its copies
+/// grouped by flank cell (identical 31-mers); a group of more than `T` copies gets level 1, 8 more
+/// reference bases on each side (strand-free: the lesser of the extension and its reverse
+/// complement), regrouped; a group still over `T` gets level 2; and so on to level 4 (95 bp).
+/// Prints the copies (and 4-byte cells) each level stores, and the copies still tied after it.
+pub fn index_flank_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, t: usize, threads: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    const LEVELS: usize = 4;
+    let keys = 1u64 << (2 * c);
+    let next = AtomicU64::new(0);
+    let total = AtomicU64::new(0);
+    let headered = AtomicU64::new(0);
+    let plain = AtomicU64::new(0);
+    let entering: [AtomicU64; LEVELS + 1] = Default::default();
+    let groups_entering: [AtomicU64; LEVELS + 1] = Default::default();
+    let started = std::time::Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| {
+                let comp = |b: u8| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x };
+                loop {
+                    let k0 = next.fetch_add(1 << 16, Relaxed);
+                    if k0 >= keys {
+                        break;
+                    }
+                    for key in k0..(k0 + (1 << 16)).min(keys) {
+                        let Some(r) = db.get_vrange(key) else { continue };
+                        let n = r.len() as u64;
+                        total.fetch_add(n, Relaxed);
+                        if !r.has_header() {
+                            continue;
+                        }
+                        headered.fetch_add(n, Relaxed);
+                        let flex = match &r {
+                            flexmap::range::AnyRange::Packed(p) => p.flex_bytes(),
+                            _ => { plain.fetch_add(n, Relaxed); continue; }
+                        };
+                        // Level 0 groups: identical flank cells.
+                        let mut idx: Vec<(Vec<u8>, usize)> = flex.chunks_exact(4).enumerate().map(|(i, c)| (c.to_vec(), i)).collect();
+                        idx.sort_unstable();
+                        let mut groups: Vec<Vec<usize>> = Vec::new();
+                        let mut i = 0;
+                        while i < idx.len() {
+                            let mut j = i + 1;
+                            while j < idx.len() && idx[j].0 == idx[i].0 { j += 1; }
+                            if j - i > t { groups.push(idx[i..j].iter().map(|x| x.1).collect()); }
+                            i = j;
+                        }
+                        for level in 1..=LEVELS {
+                            if groups.is_empty() { break; }
+                            groups_entering[level].fetch_add(groups.len() as u64, Relaxed);
+                            let mut next_groups = Vec::new();
+                            for g in groups {
+                                entering[level].fetch_add(g.len() as u64, Relaxed);
+                                let mut ext: Vec<(Vec<u8>, usize)> = Vec::with_capacity(g.len());
+                                for &ci in &g {
+                                    let (v, p) = r.value(ci);
+                                    let e = 8 * level as i64;
+                                    let key = db.get_reference(v as usize).and_then(|rv| {
+                                        let (a, b) = (p as i64 - e, p as i64 + 31 + e);
+                                        if a < 0 || b as usize > rv.len() { return None; }
+                                        let w = rv.window(a as usize..b as usize);
+                                        let mut f: Vec<u8> = w[..e as usize].to_vec();
+                                        f.extend_from_slice(&w[w.len() - e as usize..]);
+                                        let mut rc: Vec<u8> = w[w.len() - e as usize..].iter().rev().map(|&x| comp(x)).collect();
+                                        rc.extend(w[..e as usize].iter().rev().map(|&x| comp(x)));
+                                        Some(f.min(rc))
+                                    }).unwrap_or_else(|| ci.to_le_bytes().to_vec());
+                                    ext.push((key, ci));
+                                }
+                                crate::database::refseq2::reset_scratch();
+                                ext.sort_unstable();
+                                let mut i = 0;
+                                while i < ext.len() {
+                                    let mut j = i + 1;
+                                    while j < ext.len() && ext[j].0 == ext[i].0 { j += 1; }
+                                    if j - i > t { next_groups.push(ext[i..j].iter().map(|x| x.1).collect()); }
+                                    i = j;
+                                }
+                            }
+                            groups = next_groups;
+                        }
+                        // Still tied after the last level.
+                        let left: u64 = groups.iter().map(|g| g.len() as u64).sum();
+                        entering[0].fetch_add(left, Relaxed);
+                        groups_entering[0].fetch_add(groups.len() as u64, Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let (tot, hd) = (total.load(Relaxed), headered.load(Relaxed));
+    eprintln!("[ladder] T = {t}: {tot} copies in the index ({hd} in headered ranges, {} plain-format skipped), {:.0} s", plain.load(Relaxed), started.elapsed().as_secs_f64());
+    for level in 1..=LEVELS {
+        let e = entering[level].load(Relaxed);
+        eprintln!("[ladder] level {level} ({} bp): {} copies in {} groups need it ({:.2} % of copies; {:.2} GB at 4 bytes)", 31 + 16 * level, e, groups_entering[level].load(Relaxed), 100.0 * e as f64 / tot.max(1) as f64, 4.0 * e as f64 / 1e9);
+    }
+    eprintln!("[ladder] still tied after {} bp: {} copies in {} groups", 31 + 16 * LEVELS, entering[0].load(Relaxed), groups_entering[0].load(Relaxed));
+}
+
+/// `FA_EXT_OUT=<file>` with `FA_TRACE_TRUTH`: the multi-core funnel with longer flanks, per traced
+/// mate. Every range with a header and two or more copies tied at its best flank (identical
+/// 31-mers to the read's nearest) takes part. Each tied copy (at most 4096 a range) is compared
+/// with the read over a window of `w` read bases around the k-mer (31 = today's flank; 47 = 16 more
+/// flank bases, 64 bits; 63), on the better strand; a range keeps the copies within `s` mismatches
+/// of its best. The kept copies vote for read starts (within 10 bp); a start kept by all ranges
+/// ("all") or by at least half ("half") survives. Per (w, s): copies kept (positions a funnel
+/// would read), starts surviving all / half, and whether the true start is among them.
+fn ext_funnel<DB: FlexalignDatabase, const F: usize>(
+    db: &DB, truth: &std::collections::HashMap<String, (String, u64)>, rec: &RefFastqRecord, mate: &str,
+    ranges: &[crate::align::process::range_extractor::Range<F>],
+) -> Option<String> {
+    let name = String::from_utf8_lossy(rec.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+    let name = name.strip_suffix("/1").or_else(|| name.strip_suffix("/2")).unwrap_or(&name).to_string();
+    let (contig, pos0) = truth.get(&format!("{name}\t{mate}"))?;
+    static RID_OF: std::sync::OnceLock<std::collections::HashMap<String, u64>> = std::sync::OnceLock::new();
+    let rid_of = RID_OF.get_or_init(|| (0..).map_while(|i| db.get_rname(i).map(|n| (n.to_string(), i as u64))).collect());
+    let rid = *rid_of.get(contig)?;
+    let fwd: Vec<u8> = rec.seq().to_vec();
+    let rc: Vec<u8> = fwd.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
+    let (len, k) = (fwd.len() as i64, 31i64);
+    let ws = [31usize, 47, 63];
+    // Per range: per tied copy, (read start, per-window mismatches).
+    let mut per_range: Vec<Vec<(u64, i64, [usize; 3])>> = Vec::new();
+    let mut tied_total = 0usize;
+    let mut dist = Vec::new();
+    for r in ranges {
+        let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
+        if dist.is_empty() {
+            continue;
+        }
+        let tied: Vec<usize> = dist.iter().enumerate().filter(|x| *x.1 as u32 == min).map(|x| x.0).take(4096).collect();
+        if tied.len() < 2 {
+            continue;
+        }
+        tied_total += tied.len();
+        let mut copies = Vec::with_capacity(tied.len());
+        for &i in &tied {
+            let (v, p) = r.vrange.value(i);
+            let Some(rv) = db.get_reference(v as usize) else { continue };
+            let mut best: Option<(i64, [usize; 3], usize)> = None;
+            for (seq, start, kpos) in [(&fwd, p as i64 - r.qpos as i64, r.qpos as i64), (&rc, p as i64 - (len - r.qpos as i64 - k), len - r.qpos as i64 - k)] {
+                if start < 0 || (start + len) as usize > rv.len() {
+                    continue;
+                }
+                let mut mm = [0usize; 3];
+                for (wi, &w) in ws.iter().enumerate() {
+                    let w = (w as i64).min(len);
+                    let a = (kpos - (w - k) / 2).clamp(0, len - w);
+                    let refw = rv.window((start + a) as usize..(start + a + w) as usize);
+                    mm[wi] = seq[a as usize..(a + w) as usize].iter().zip(refw).filter(|(x, y)| x != y).count();
+                }
+                if best.is_none_or(|b| mm[2] < b.2) {
+                    best = Some((start, mm, mm[2]));
+                }
+            }
+            if let Some((st, mm, _)) = best {
+                copies.push((v, st, mm));
+            }
+        }
+        crate::database::refseq2::reset_scratch();
+        if copies.len() >= 2 {
+            per_range.push(copies);
+        }
+    }
+    let nr = per_range.len();
+    let mut out = format!("X\t{name}\t{mate}\t{nr}\t{tied_total}");
+    for wi in 0..3 {
+        for s in [0usize, 1] {
+            // Kept copies per range.
+            let mut starts: Vec<(u64, i64, usize)> = Vec::new();
+            let mut kept = 0usize;
+            for (ri, copies) in per_range.iter().enumerate() {
+                let best = copies.iter().map(|c| c.2[wi]).min().unwrap_or(usize::MAX);
+                for c in copies.iter().filter(|c| c.2[wi] <= best + s) {
+                    kept += 1;
+                    starts.push((c.0, c.1, ri));
+                }
+            }
+            starts.sort_unstable();
+            let (mut all, mut half, mut t_all, mut t_half) = (0usize, 0usize, 0u8, 0u8);
+            let mut i = 0;
+            while i < starts.len() {
+                let mut j = i + 1;
+                while j < starts.len() && starts[j].0 == starts[i].0 && starts[j].1 - starts[j - 1].1 <= 10 {
+                    j += 1;
+                }
+                let mut rs: Vec<usize> = starts[i..j].iter().map(|x| x.2).collect();
+                rs.sort_unstable();
+                rs.dedup();
+                let is_truth = starts[i].0 == rid && starts[i..j].iter().any(|x| (x.1 - *pos0 as i64).abs() <= 10);
+                if rs.len() == nr {
+                    all += 1;
+                    t_all |= is_truth as u8;
+                }
+                if 2 * rs.len() >= nr {
+                    half += 1;
+                    t_half |= is_truth as u8;
+                }
+                i = j;
+            }
+            out.push_str(&format!("\t{kept}\t{all}\t{t_all}\t{half}\t{t_half}"));
+        }
+    }
+    out.push('\n');
+    Some(out)
+}
+
+fn ext_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_EXT_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).expect("FA_EXT_OUT file")))))
+        .as_ref()
 }
