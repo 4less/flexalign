@@ -1797,7 +1797,21 @@ impl<
                     stats.flank_ext_ranges += 1;
                     stats.flank_ext_copies += tied.len();
                     let mut scored: Vec<(usize, usize)> = Vec::with_capacity(tied.len());
+                    // --flankext: the stored windows of this core, when it has them.
+                    let store = crate::database::flankext::FLANKEXT.get()
+                        .and_then(|st| st.lookup(r.key).map(|(w, f)| (st, w, f)));
+                    let rwin = store.map(|_| [crate::database::flankext::ReadWindow::new(seq, r.qpos as i64, e as usize),
+                        crate::database::flankext::ReadWindow::new(&rc, len - r.qpos as i64 - k, e as usize)]);
+                    let nw = crate::database::flankext::words_per_copy(e as usize);
                     for &i in &tied {
+                        if let (Some((st, w0, f0)), Some(rw)) = (store, rwin.as_ref()) {
+                            if !st.is_exception(f0 + i) {
+                                let cell = st.cell(w0 + i * nw, nw);
+                                stats.flank_ext_stored += 1;
+                                scored.push((rw[0].mismatches(cell).min(rw[1].mismatches(cell)), i));
+                                continue;
+                            }
+                        }
                         let (v, p) = r.vrange.value(i);
                         let Some(rv) = self.db.get_reference(v as usize) else { continue };
                         let mut best = usize::MAX;
@@ -5594,4 +5608,57 @@ pub fn index_size_hist<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: u
         }
     }
     eprintln!("[hist] {} keys walked in {:.0} s", keys, started.elapsed().as_secs_f64());
+}
+
+
+/// `--flankext-build`: the flank side store of the built index for `--flank-brackets` /
+/// `--flank-lengths` (see `database::flankext`).
+pub fn build_flankext<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, brackets: &[usize], lengths: &[usize], index_bytes: u64) -> crate::database::flankext::FlankExt {
+    use crate::database::flankext::{ext_for, pack_window, words_per_copy, FlankExt, KMER};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let keys = 1u64 << (2 * c);
+    let next = AtomicU64::new(0);
+    let found = std::sync::Mutex::new(Vec::<(u64, usize, usize)>::new());
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let k0 = next.fetch_add(1 << 16, Relaxed);
+                    if k0 >= keys {
+                        break;
+                    }
+                    for key in k0..(k0 + (1 << 16)).min(keys) {
+                        if let Some(r) = db.get_vrange(key) {
+                            let e = ext_for(brackets, lengths, r.len());
+                            if e > 0 && r.has_header() {
+                                local.push((key, r.len(), e));
+                            }
+                        }
+                    }
+                }
+                found.lock().unwrap().extend(local);
+            });
+        }
+    });
+    let mut cores = found.into_inner().unwrap();
+    cores.sort_unstable();
+    let fill = |i: usize, ws: &mut [u64], fs: &mut [u8]| {
+        let (key, n, e) = cores[i];
+        let nw = words_per_copy(e);
+        let Some(r) = db.get_vrange(key) else { fs.iter_mut().for_each(|x| *x = 1); return };
+        debug_assert_eq!(r.len(), n);
+        for j in 0..n {
+            let (v, p) = r.value(j);
+            let p = p as usize;
+            let ok = db.get_reference(v as usize).is_some_and(|rv| {
+                p >= e && p + KMER + e <= rv.len() && pack_window(rv.window(p - e..p + KMER + e), &mut ws[j * nw..(j + 1) * nw])
+            });
+            if !ok {
+                fs[j] = 1;
+            }
+        }
+        crate::database::refseq2::reset_scratch();
+    };
+    FlankExt::assemble(brackets.to_vec(), lengths.to_vec(), index_bytes, &cores, threads, &fill)
 }

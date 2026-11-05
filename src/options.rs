@@ -609,6 +609,16 @@ pub struct Args {
     #[arg(long = "flank-lengths", value_delimiter = ',')]
     pub flank_lengths: Vec<usize>,
 
+    /// Build the flank side store (<reference>.flankext) for --flank-brackets / --flank-lengths
+    /// and exit.
+    #[arg(long = "flankext-build", action)]
+    pub flankext_build: bool,
+
+    /// --flank-ext / --flank-lengths: compare cut cores against <reference>.flankext instead of
+    /// the reference (its brackets must match).
+    #[arg(long = "flankext", action)]
+    pub flankext: bool,
+
     /// --flank-ext: only cores with more than this many positions.
     #[arg(long = "flank-ext-min", default_value_t = 0)]
     pub flank_ext_min: usize,

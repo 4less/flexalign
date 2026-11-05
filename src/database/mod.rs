@@ -9,3 +9,4 @@ pub mod hashed_lines;
 pub mod refseq2;
 pub mod refview;
 pub mod fmd;
+pub mod flankext;

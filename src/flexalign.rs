@@ -230,6 +230,24 @@ pub fn run(args: Args) {
     }
     // --fm-build / --fm: the whole-genome FM-index next to the index.
     let fm_path = format!("{}.fmd", options.args.reference);
+    let fx_path = format!("{}.flankext", options.args.reference);
+    let index_bytes = std::fs::metadata(format!("{}.flex.index.hashed.bundle", options.args.reference)).map(|m| m.len()).unwrap_or(0);
+    if options.args.flankext_build {
+        let started = Instant::now();
+        let st = crate::align::modular_workflow::build_flankext(&db, C, options.args.threads.max(1) as usize, &options.args.flank_brackets, &options.args.flank_lengths, index_bytes);
+        st.save(&fx_path).expect("writing the flank side store");
+        eprintln!("[flankext] {} written in {:.0} s: {:.2} GB in memory, {} exception copies", fx_path, started.elapsed().as_secs_f64(), st.bytes() as f64 / 1e9, st.exceptions());
+        return;
+    }
+    if options.args.flankext {
+        let started = Instant::now();
+        let st = crate::database::flankext::FlankExt::load(&fx_path).unwrap_or_else(|e| panic!("--flankext needs {fx_path} (build it with --flankext-build): {e}"));
+        assert!(st.index_bytes == 0 || index_bytes == 0 || st.index_bytes == index_bytes, "{fx_path} was built for another index");
+        assert!(st.brackets == options.args.flank_brackets && st.lengths == options.args.flank_lengths,
+            "{fx_path} holds brackets {:?} / lengths {:?}; the run asks for {:?} / {:?}", st.brackets, st.lengths, options.args.flank_brackets, options.args.flank_lengths);
+        eprintln!("[flankext] {} loaded in {:.1} s ({:.2} GB)", fx_path, started.elapsed().as_secs_f64(), st.bytes() as f64 / 1e9);
+        let _ = crate::database::flankext::FLANKEXT.set(st);
+    }
     if options.args.fm_build {
         let started = Instant::now();
         let mut id = 0usize;

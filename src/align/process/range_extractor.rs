@@ -12,6 +12,8 @@ use crate::{align::{common::{RangeExtractor, UniqueHit}, process::seed_extractor
 
 #[derive(Clone)]
 pub struct Range<'a, const F: usize> {
+    /// The index key of the core (as looked up).
+    pub key: u64,
     pub qpos: usize,
     pub fmer: Kmer<F>,
     pub vrange: AnyRange<'a>,
@@ -181,12 +183,12 @@ impl<'a, const K: usize, const C: usize, const F: usize, D: FlexalignDatabase> S
 
         // All of the read's keys in one call, so that the index can fetch them ahead.
         let db: &'a D = self.db;
-        let (ranges, key_info) = (&mut self.ranges, &self.key_info);
-        db.for_each_vrange(&self.keys, &mut |i, range| {
+        let (ranges, key_info, keys) = (&mut self.ranges, &self.key_info, &self.keys);
+        db.for_each_vrange(keys, &mut |i, range| {
             if let Some(range) = range {
                 let (qpos, fmer) = (key_info[i].0, key_info[i].1.clone());
                 let range_size = range.len() as u32;
-                ranges.push(Range { qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0 });
+                ranges.push(Range { key: keys[i], qpos, fmer, vrange: range, range_size, core_min_phredq: 0, flex_min_phredq: 0 });
             }
         });
     }
