@@ -2146,6 +2146,33 @@ impl<
         {
             let cores = |sd: &[Seed]| { let mut q: Vec<(u32, u8)> = sd.iter().map(|x| (x.qpos, x.length)).collect(); q.sort_unstable(); q.dedup(); q.len() };
             SEEDED_CORES.with(|c| c.set([cores(&seeds_fwd), cores(&seeds_rev)]));
+            // --near-min-agree: the share of a mate's seeded cores holding its most supported locus
+            // (reference, read start in 8 bp buckets, either strand).
+            if self.options.args.near_min_agree > 0.0 {
+                let agree = |sd: &[Seed], len: usize| -> f64 {
+                    let mut by: Vec<((u32, u8), (u64, i64))> = Vec::with_capacity(sd.len() * 2);
+                    for x in sd {
+                        let (a, b) = x.offsets(len);
+                        by.push(((x.qpos, x.length), (x.rval, a.div_euclid(8))));
+                        by.push(((x.qpos, x.length), (x.rval, b.div_euclid(8))));
+                    }
+                    by.sort_unstable();
+                    by.dedup();
+                    let nc = cores(sd);
+                    if nc == 0 {
+                        return 0.0;
+                    }
+                    let mut loci: Vec<(u64, i64)> = by.iter().map(|x| x.1).collect();
+                    loci.sort_unstable();
+                    let (mut best, mut run) = (0usize, 0usize);
+                    for i in 0..loci.len() {
+                        run = if i > 0 && loci[i] == loci[i - 1] { run + 1 } else { 1 };
+                        best = best.max(run);
+                    }
+                    best as f64 / nc as f64
+                };
+                SEED_AGREE.with(|c| c.set([agree(&seeds_fwd, rec_fwd.seq().len()), agree(&seeds_rev, rec_rev.seq().len())]));
+            }
         }
         // FA_AGREE_OUT=<file>: do a mate's seeded cores agree on where it lies? Per mate: cores
         // with seeds, distinct loci (reference, read start in 8 bp buckets, both strands), the
@@ -3676,8 +3703,11 @@ impl<
         // --near-tie-mapq) or one mismatch worse (at most --near-one-mapq).
         // --near-max-seeded N: only pairs with a mate seeded at fewer than N cores (the mates
         // whose placement rests on too little evidence).
-        let few_seeds = self.options.args.near_max_seeded == 0
-            || SEEDED_CORES.with(|c| c.get()).iter().any(|&n| n < self.options.args.near_max_seeded);
+        // and --near-min-agree X: or a mate whose seeded cores agree on its locus less than X.
+        let (nseeded, agree) = (self.options.args.near_max_seeded, self.options.args.near_min_agree);
+        let few_seeds = (nseeded == 0 && agree <= 0.0)
+            || (nseeded > 0 && SEEDED_CORES.with(|c| c.get()).iter().any(|&n| n < nseeded))
+            || (agree > 0.0 && SEED_AGREE.with(|c| c.get()).iter().any(|&a| a < agree));
         if self.options.args.near_pairs > 0 && pseudo_mapq > 0 && few_seeds {
             let placed = [fwd_anchor, rev_anchor];
             let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
@@ -5144,6 +5174,7 @@ fn fm_trace() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::Fi
 
 thread_local! {
     static SEEDED_CORES: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([usize::MAX, usize::MAX]) };
+    static SEED_AGREE: std::cell::Cell<[f64; 2]> = const { std::cell::Cell::new([1.0, 1.0]) };
 }
 
 thread_local! {

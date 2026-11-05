@@ -663,6 +663,11 @@ pub struct Args {
     #[arg(long = "near-max-seeded", default_value_t = 0)]
     pub near_max_seeded: usize,
 
+    /// --near-pairs: also pairs with a mate whose seeded cores agree on its most supported locus
+    /// less than this share (0: off).
+    #[arg(long = "near-min-agree", default_value_t = 0.0)]
+    pub near_min_agree: f64,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 
