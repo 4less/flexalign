@@ -1757,8 +1757,18 @@ impl<
         // tie limit keeps) is looked at again over a window E bases wider on each side, the
         // extension read from the reference here (a side store would hold it). The copies at the
         // best over that window are seeded when they now fit under the limit.
-        if self.options.args.flank_ext > 0 {
-            let e = self.options.args.flank_ext as i64;
+        // --flank-brackets / --flank-lengths: the extension per core follows its multiplicity
+        // bracket (flank bases L: (L - 16) / 2 more on each side; 16 = none).
+        let bracket_ext = |n: usize| -> i64 {
+            let a = &self.options.args;
+            if a.flank_lengths.is_empty() {
+                return a.flank_ext as i64;
+            }
+            let bi = a.flank_brackets.iter().position(|&b| n <= b).unwrap_or(a.flank_brackets.len());
+            let l = *a.flank_lengths.get(bi).or(a.flank_lengths.last()).unwrap_or(&16);
+            (l.saturating_sub(16) / 2) as i64
+        };
+        if self.options.args.flank_ext > 0 || !self.options.args.flank_lengths.is_empty() {
             let slack = self.options.args.flank_slack;
             let mut dist: Vec<u8> = Vec::new();
             for side in 0..2 {
@@ -1770,6 +1780,10 @@ impl<
                 let mut extra: Vec<Seed> = Vec::new();
                 for r in ranges.iter() {
                     if r.vrange.len() <= self.options.args.flank_ext_min {
+                        continue;
+                    }
+                    let e = bracket_ext(r.vrange.len());
+                    if e == 0 {
                         continue;
                     }
                     let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);

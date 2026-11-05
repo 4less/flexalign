@@ -600,6 +600,15 @@ pub struct Args {
     #[arg(long = "flank-ext", default_value_t = 0)]
     pub flank_ext: usize,
 
+    /// Multiplicity brackets for the flank extension: "64,512" gives 1-64, 65-512, 513-cap.
+    #[arg(long = "flank-brackets", value_delimiter = ',')]
+    pub flank_brackets: Vec<usize>,
+
+    /// Flank bases per bracket (one more value than --flank-brackets; 16 = today's, no
+    /// extension), e.g. "16,32,64". Replaces --flank-ext.
+    #[arg(long = "flank-lengths", value_delimiter = ',')]
+    pub flank_lengths: Vec<usize>,
+
     /// --flank-ext: only cores with more than this many positions.
     #[arg(long = "flank-ext-min", default_value_t = 0)]
     pub flank_ext_min: usize,
