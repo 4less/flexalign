@@ -1768,7 +1768,8 @@ impl<
             let l = *a.flank_lengths.get(bi).or(a.flank_lengths.last()).unwrap_or(&16);
             (l.saturating_sub(16) / 2) as i64
         };
-        let ladder = crate::database::flankext::FLANKEXT.get().filter(|st| st.ladder_t > 0);
+        let levels: &[crate::database::flankext::FlankExt] = crate::database::flankext::FLANKEXT.get().map(|v| v.as_slice()).unwrap_or(&[]);
+        let ladder = levels.first().filter(|st| st.ladder_t > 0);
         if self.options.args.flank_ext > 0 || !self.options.args.flank_lengths.is_empty() || ladder.is_some() {
             let slack = self.options.args.flank_slack;
             let mut dist: Vec<u8> = Vec::new();
@@ -1830,7 +1831,7 @@ impl<
                     stats.flank_ext_copies += tied.len();
                     let mut scored: Vec<(usize, usize)> = Vec::with_capacity(tied.len());
                     // --flankext: the stored windows of this core, when it has them.
-                    let store = crate::database::flankext::FLANKEXT.get()
+                    let store = levels.first()
                         .and_then(|st| st.lookup(r.key).map(|(w, f, c)| (st, w, f, c)));
                     let rwin = store.map(|_| [crate::database::flankext::ReadWindow::new(seq, r.qpos as i64, e as usize),
                         crate::database::flankext::ReadWindow::new(&rc, len - r.qpos as i64 - k, e as usize)]);
@@ -1865,6 +1866,29 @@ impl<
                     crate::database::refseq2::reset_scratch();
                     let Some(b) = scored.iter().map(|x| x.0).min() else { continue };
                     let mut keep: Vec<usize> = scored.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
+                    // The ladder's further levels: copies still tied, judged over ever wider windows
+                    // (a copy without a cell at a level was separated before it and stays).
+                    for st in levels.iter().skip(1) {
+                        if keep.len() <= flex {
+                            break;
+                        }
+                        let Some((w0, f0, cnt)) = st.lookup(r.key) else { break };
+                        let e2 = st.ladder_e;
+                        let rw = [crate::database::flankext::ReadWindow::new(seq, r.qpos as i64, e2),
+                            crate::database::flankext::ReadWindow::new(&rc, len - r.qpos as i64 - k, e2)];
+                        let nw2 = crate::database::flankext::words_per_copy(e2);
+                        let mut sc: Vec<(usize, usize)> = Vec::new();
+                        let mut other: Vec<usize> = Vec::new();
+                        for &i in &keep {
+                            match st.member_slot(f0, cnt, i).filter(|&j| !st.is_exception(f0 + j)) {
+                                Some(j) => { let cell = st.cell(w0 + j * nw2, nw2); sc.push((rw[0].mismatches(cell).min(rw[1].mismatches(cell)), i)); }
+                                None => other.push(i),
+                            }
+                        }
+                        stats.flank_ext_level_compares += sc.len();
+                        let Some(b2) = sc.iter().map(|x| x.0).min() else { break };
+                        keep = sc.iter().filter(|x| x.0 == b2).map(|x| x.1).chain(other).collect();
+                    }
                     // Still too many after the wider window, but few enough to afford: the whole
                     // read decides (gap-free, both strands), its best copies kept.
                     if keep.len() > flex && keep.len() <= a.flank_ext_hamming {
@@ -5764,74 +5788,93 @@ pub fn index_size_hist<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: u
 
 /// `--flankext-build`: the flank side store of the built index for `--flank-brackets` /
 /// `--flank-lengths` (see `database::flankext`).
-/// `--flankext-build --flankext-ladder T`: the ladder store. Every core whose copies hold a group of
-/// more than T identical flank cells (identical 31-mers, the copies a tie cut drops); only those
-/// groups' copies get cells, each `e` extra bases a side.
-pub fn build_flankext_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, t: usize, e: usize, index_bytes: u64) -> crate::database::flankext::FlankExt {
+/// `--flankext-build --flankext-ladder T1,T2,.. --flankext-ladder-ext E1,E2,..`: the ladder store.
+/// Level 1: every core's groups of more than T1 identical flank cells (identical 31-mers, what a
+/// tie cut drops) get, per copy, the reference window E1 bases wider on each side. Level k: the
+/// copies of level k-1 regrouped by that window, groups of more than Tk getting the window Ek
+/// wide. A level holds only the copies still tied after the one before.
+pub fn build_flankext_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, ts: &[usize], es: &[usize], index_bytes: u64) -> Vec<crate::database::flankext::FlankExt> {
     use crate::database::flankext::{pack_window, words_per_copy, FlankExt, KMER};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let nl = ts.len();
+    let ext = |k: usize| *es.get(k).or(es.last()).unwrap_or(&16);
     let keys = 1u64 << (2 * c);
     let next = AtomicU64::new(0);
-    let found = std::sync::Mutex::new(Vec::<(u64, Vec<u32>)>::new());
+    // Per level: (key, members, cells, exception flags) of every core that has the level.
+    type Core = (u64, Vec<u32>, Vec<u64>, Vec<u8>);
+    let found: Vec<std::sync::Mutex<Vec<Core>>> = (0..nl).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1) {
             sc.spawn(|| {
-                let mut local = Vec::new();
+                let mut local: Vec<Vec<Core>> = (0..nl).map(|_| Vec::new()).collect();
                 loop {
-                    let k0 = next.fetch_add(1 << 16, Relaxed);
+                    let k0 = next.fetch_add(1 << 14, Relaxed);
                     if k0 >= keys {
                         break;
                     }
-                    for key in k0..(k0 + (1 << 16)).min(keys) {
+                    for key in k0..(k0 + (1 << 14)).min(keys) {
                         let Some(r) = db.get_vrange(key) else { continue };
                         let flex = match &r { flexmap::range::AnyRange::Packed(p) if r.has_header() => p.flex_bytes(), _ => continue };
-                        let mut idx: Vec<(u32, u32)> = flex.chunks_exact(4).enumerate().map(|(i, b)| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]), i as u32)).collect();
-                        idx.sort_unstable();
-                        let mut members: Vec<u32> = Vec::new();
-                        let mut i = 0;
-                        while i < idx.len() {
-                            let mut j = i + 1;
-                            while j < idx.len() && idx[j].0 == idx[i].0 { j += 1; }
-                            if j - i > t { members.extend(idx[i..j].iter().map(|x| x.1)); }
-                            i = j;
-                        }
-                        if !members.is_empty() {
+                        // Level 0 groups: identical flank cells.
+                        let mut idx: Vec<(Vec<u64>, u32)> = flex.chunks_exact(4).enumerate()
+                            .map(|(i, b)| (vec![u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64], i as u32)).collect();
+                        for level in 0..nl {
+                            idx.sort_unstable();
+                            let mut members: Vec<u32> = Vec::new();
+                            let mut i = 0;
+                            while i < idx.len() {
+                                let mut j = i + 1;
+                                while j < idx.len() && idx[j].0 == idx[i].0 { j += 1; }
+                                if j - i > ts[level] { members.extend(idx[i..j].iter().map(|x| x.1)); }
+                                i = j;
+                            }
+                            if members.is_empty() {
+                                break;
+                            }
                             members.sort_unstable();
-                            local.push((key, members));
+                            let e = ext(level);
+                            let nw = words_per_copy(e);
+                            let mut cells = vec![0u64; members.len() * nw];
+                            let mut exc = vec![0u8; members.len()];
+                            let mut next_idx: Vec<(Vec<u64>, u32)> = Vec::with_capacity(members.len());
+                            for (slot, &m) in members.iter().enumerate() {
+                                let (v, p) = r.value(m as usize);
+                                let p = p as usize;
+                                let ok = db.get_reference(v as usize).is_some_and(|rv| {
+                                    p >= e && p + KMER + e <= rv.len() && pack_window(rv.window(p - e..p + KMER + e), &mut cells[slot * nw..(slot + 1) * nw])
+                                });
+                                if ok {
+                                    next_idx.push((cells[slot * nw..(slot + 1) * nw].to_vec(), m));
+                                } else {
+                                    exc[slot] = 1;
+                                }
+                            }
+                            crate::database::refseq2::reset_scratch();
+                            local[level].push((key, members, cells, exc));
+                            idx = next_idx;
                         }
                     }
                 }
-                found.lock().unwrap().extend(local);
+                for (l, v) in local.into_iter().enumerate() {
+                    found[l].lock().unwrap().extend(v);
+                }
             });
         }
     });
-    let mut found = found.into_inner().unwrap();
-    found.sort_unstable_by_key(|x| x.0);
-    let cores: Vec<(u64, usize, usize)> = found.iter().map(|(k, m)| (*k, m.len(), e)).collect();
-    let mut moff = Vec::with_capacity(found.len());
-    let mut members: Vec<u32> = Vec::with_capacity(cores.iter().map(|x| x.1).sum());
-    for (_, m) in &found {
-        moff.push(members.len());
-        members.extend_from_slice(m);
+    let mut levels = Vec::with_capacity(nl);
+    for (level, f) in found.into_iter().enumerate() {
+        let mut cores_full = f.into_inner().unwrap();
+        cores_full.sort_unstable_by_key(|x| x.0);
+        let e = ext(level);
+        let cores: Vec<(u64, usize, usize)> = cores_full.iter().map(|x| (x.0, x.1.len(), e)).collect();
+        let members: Vec<u32> = cores_full.iter().flat_map(|x| x.1.iter().copied()).collect();
+        let fill = |i: usize, ws: &mut [u64], fs: &mut [u8]| {
+            ws.copy_from_slice(&cores_full[i].2);
+            fs.copy_from_slice(&cores_full[i].3);
+        };
+        levels.push(FlankExt::assemble_ladder(Vec::new(), vec![16 + 2 * e], index_bytes, ts[level], e, &cores, members, threads, &fill));
     }
-    let nw = words_per_copy(e);
-    let fill = |i: usize, ws: &mut [u64], fs: &mut [u8]| {
-        let (key, n, _) = cores[i];
-        let Some(r) = db.get_vrange(key) else { fs.iter_mut().for_each(|x| *x = 1); return };
-        for slot in 0..n {
-            let (v, p) = r.value(members[moff[i] + slot] as usize);
-            let p = p as usize;
-            let ok = db.get_reference(v as usize).is_some_and(|rv| {
-                p >= e && p + KMER + e <= rv.len() && pack_window(rv.window(p - e..p + KMER + e), &mut ws[slot * nw..(slot + 1) * nw])
-            });
-            if !ok {
-                fs[slot] = 1;
-            }
-        }
-        crate::database::refseq2::reset_scratch();
-    };
-    let members2 = members.clone();
-    FlankExt::assemble_ladder(Vec::new(), vec![16 + 2 * e], index_bytes, t, e, &cores, members2, threads, &fill)
+    levels
 }
 
 pub fn build_flankext<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, brackets: &[usize], lengths: &[usize], index_bytes: u64) -> crate::database::flankext::FlankExt {

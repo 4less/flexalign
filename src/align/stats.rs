@@ -151,6 +151,7 @@ pub struct Stats {
     pub flank_ext_mates_skipped: usize,
     pub flank_ext_cores_skipped: usize,
     pub flank_ext_hamming: usize,
+    pub flank_ext_level_compares: usize,
     pub flank_ext_stored: usize,
     pub fm_lf_steps: usize,
     pub fm_seeded: usize,
@@ -549,6 +550,7 @@ impl Merge for Stats {
         self.flank_ext_mates_skipped += other.flank_ext_mates_skipped;
         self.flank_ext_cores_skipped += other.flank_ext_cores_skipped;
         self.flank_ext_hamming += other.flank_ext_hamming;
+        self.flank_ext_level_compares += other.flank_ext_level_compares;
         self.flank_ext_stored += other.flank_ext_stored;
         self.fm_lf_steps += other.fm_lf_steps;
         self.fm_seeded += other.fm_seeded;
@@ -604,8 +606,8 @@ impl Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t = self.threads.max(1) as u32;
         if self.flank_ext_ranges > 0 {
-            writeln!(f, "Flank ext: cut cores looked at {}, tied copies compared {} ({} from the side store), cores rescued {}, seeds added {}, mates skipped {}, cores skipped {}, whole-read compares {}",
-                self.flank_ext_ranges, self.flank_ext_copies, self.flank_ext_stored, self.flank_ext_rescued, self.flank_ext_seeds, self.flank_ext_mates_skipped, self.flank_ext_cores_skipped, self.flank_ext_hamming)?;
+            writeln!(f, "Flank ext: cut cores looked at {}, tied copies compared {} ({} from the side store), cores rescued {}, seeds added {}, mates skipped {}, cores skipped {}, whole-read compares {}, deeper-level compares {}",
+                self.flank_ext_ranges, self.flank_ext_copies, self.flank_ext_stored, self.flank_ext_rescued, self.flank_ext_seeds, self.flank_ext_mates_skipped, self.flank_ext_cores_skipped, self.flank_ext_hamming, self.flank_ext_level_compares)?;
         }
         if self.near_mapq_lowered > 0 {
             writeln!(f, "Near pairs: MAPQ lowered {}", self.near_mapq_lowered)?;
@@ -885,6 +887,7 @@ impl Default for Stats {
             flank_ext_mates_skipped: 0,
             flank_ext_cores_skipped: 0,
             flank_ext_hamming: 0,
+            flank_ext_level_compares: 0,
             flank_ext_stored: 0,
             fm_lf_steps: 0,
             fm_seeded: 0,

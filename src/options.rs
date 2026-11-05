@@ -632,14 +632,15 @@ pub struct Args {
     #[arg(long = "flank-ext-max-tied", default_value_t = 0)]
     pub flank_ext_max_tied: usize,
 
-    /// --flankext-build: the ladder store instead of brackets: cells only for copies in groups of
-    /// more than this many identical flank cells (the copies a tie cut drops). 0: brackets.
-    #[arg(long = "flankext-ladder", default_value_t = 0)]
-    pub flankext_ladder: usize,
+    /// --flankext-build: the ladder store instead of brackets, one threshold per level: level 1
+    /// stores copies in groups of more than T1 identical flank cells, level k the copies still in
+    /// groups of more than Tk after level k-1 (e.g. "64,64,64"). Empty: brackets.
+    #[arg(long = "flankext-ladder", value_delimiter = ',')]
+    pub flankext_ladder: Vec<usize>,
 
-    /// --flankext-ladder: extra bases a side each stored copy gets.
-    #[arg(long = "flankext-ladder-ext", default_value_t = 8)]
-    pub flankext_ladder_ext: usize,
+    /// --flankext-ladder: extra bases a side per level (e.g. "16,32,48"; the last repeats).
+    #[arg(long = "flankext-ladder-ext", value_delimiter = ',', default_value = "16")]
+    pub flankext_ladder_ext: Vec<usize>,
 
     /// --flank-ext: only cut cores with more tied copies than this (fewer are left to the
     /// recovery pass and --tie-read).

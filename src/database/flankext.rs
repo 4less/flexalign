@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 
-const MAGIC: [u8; 8] = *b"FLXEXT02";
+const MAGIC: [u8; 8] = *b"FLXEXT03";
 pub const KMER: usize = 31;
 
 pub struct FlankExt {
@@ -238,10 +238,7 @@ impl FlankExt {
         self.exc.iter().filter(|&&x| x != 0).count()
     }
 
-    pub fn save(&self, path: &str) -> std::io::Result<()> {
-        let tmp = format!("{path}.tmp");
-        let mut w = std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(&tmp)?);
-        w.write_all(&MAGIC)?;
+    fn write_to(&self, w: &mut dyn Write) -> std::io::Result<()> {
         for v in [self.index_bytes, self.brackets.len() as u64, self.lengths.len() as u64, self.table.len() as u64, self.words.len() as u64, self.exc.len() as u64,
                   self.ladder_t as u64, self.ladder_e as u64, self.members.len() as u64] {
             w.write_all(&v.to_le_bytes())?;
@@ -257,18 +254,35 @@ impl FlankExt {
                 w.write_all(ch)?;
             }
         }
+        Ok(())
+    }
+
+    /// Writes the store's levels (a bracket store is one level) to `path`.
+    pub fn save_levels(levels: &[FlankExt], path: &str) -> std::io::Result<()> {
+        let tmp = format!("{path}.tmp");
+        let mut w = std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(&tmp)?);
+        w.write_all(&MAGIC)?;
+        w.write_all(&(levels.len() as u64).to_le_bytes())?;
+        for l in levels {
+            l.write_to(&mut w)?;
+        }
         w.flush()?;
         drop(w);
         std::fs::rename(tmp, path)
     }
 
-    pub fn load(path: &str) -> std::io::Result<FlankExt> {
-        let mut f = std::io::BufReader::with_capacity(1 << 24, std::fs::File::open(path)?);
-        let mut magic = [0u8; 8];
-        f.read_exact(&mut magic)?;
-        if magic != MAGIC {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path} is not a flank side store of this version")));
-        }
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let tmp = format!("{path}.tmp");
+        let mut w = std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(&tmp)?);
+        w.write_all(&MAGIC)?;
+        w.write_all(&1u64.to_le_bytes())?;
+        self.write_to(&mut w)?;
+        w.flush()?;
+        drop(w);
+        std::fs::rename(tmp, path)
+    }
+
+    fn read_from(f: &mut dyn Read) -> std::io::Result<FlankExt> {
         let mut u = || -> std::io::Result<u64> {
             let mut b = [0u8; 8];
             f.read_exact(&mut b)?;
@@ -287,10 +301,27 @@ impl FlankExt {
         f.read_exact(unsafe { std::slice::from_raw_parts_mut(members.as_mut_ptr() as *mut u8, members.len() * 4) })?;
         Ok(FlankExt { brackets, lengths, index_bytes, ladder_t: lt as usize, ladder_e: le as usize, table, words, exc, members })
     }
+
+    /// The store's levels from `path`.
+    pub fn load_levels(path: &str) -> std::io::Result<Vec<FlankExt>> {
+        let mut f = std::io::BufReader::with_capacity(1 << 24, std::fs::File::open(path)?);
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic)?;
+        if magic != MAGIC {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path} is not a flank side store of this version")));
+        }
+        let mut b = [0u8; 8];
+        f.read_exact(&mut b)?;
+        (0..u64::from_le_bytes(b)).map(|_| Self::read_from(&mut f)).collect()
+    }
+
+    pub fn load(path: &str) -> std::io::Result<FlankExt> {
+        Ok(Self::load_levels(path)?.into_iter().next().expect("a store with no level"))
+    }
 }
 
-/// The loaded store of the run (`--flankext`).
-pub static FLANKEXT: std::sync::OnceLock<FlankExt> = std::sync::OnceLock::new();
+/// The loaded store of the run (`--flankext`): its levels, the first one consulted first.
+pub static FLANKEXT: std::sync::OnceLock<Vec<FlankExt>> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod tests {
