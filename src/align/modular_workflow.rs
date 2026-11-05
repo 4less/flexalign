@@ -2142,6 +2142,48 @@ impl<
         }
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
+        // FA_AGREE_OUT=<file>: do a mate's seeded cores agree on where it lies? Per mate: cores
+        // with seeds, distinct loci (reference, read start in 8 bp buckets, both strands), the
+        // share of cores holding the most supported locus, and the mean pairwise Jaccard of the
+        // cores' locus sets.
+        if let Some(w) = agree_out() {
+            let mut line = String::new();
+            for (mate, seeds, len) in [("1", &seeds_fwd, rec_fwd.seq().len()), ("2", &seeds_rev, rec_rev.seq().len())] {
+                let mut by_core: std::collections::BTreeMap<(u32, u8), std::collections::BTreeSet<(u64, i64)>> = Default::default();
+                for sd in seeds.iter() {
+                    let (a, b) = sd.offsets(len);
+                    let e = by_core.entry((sd.qpos, sd.length)).or_default();
+                    e.insert((sd.rval, a.div_euclid(8)));
+                    e.insert((sd.rval, b.div_euclid(8)));
+                }
+                let sets: Vec<&std::collections::BTreeSet<(u64, i64)>> = by_core.values().collect();
+                let nc = sets.len();
+                let mut count: std::collections::HashMap<(u64, i64), usize> = Default::default();
+                for st in &sets {
+                    for &l in st.iter() {
+                        *count.entry(l).or_default() += 1;
+                    }
+                }
+                let top = count.values().copied().max().unwrap_or(0);
+                let (mut jsum, mut jn) = (0.0f64, 0usize);
+                for i in 0..nc {
+                    for j in i + 1..nc {
+                        let inter = sets[i].intersection(sets[j]).count();
+                        let uni = sets[i].len() + sets[j].len() - inter;
+                        if uni > 0 {
+                            jsum += inter as f64 / uni as f64;
+                            jn += 1;
+                        }
+                    }
+                }
+                let name = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+                let name = name.strip_suffix("/1").unwrap_or(&name).to_string();
+                line.push_str(&format!("{name}\t{mate}\t{nc}\t{}\t{:.3}\t{:.3}\n", count.len(),
+                    if nc > 0 { top as f64 / nc as f64 } else { 0.0 }, if jn > 0 { jsum / jn as f64 } else { -1.0 }));
+            }
+            use std::io::Write;
+            let _ = w.lock().unwrap().write_all(line.as_bytes());
+        }
         if let (Some(truth), Some(w)) = (TRACE_TRUTH.get(), ext_out()) {
             use std::io::Write as _;
             for l in [
@@ -5057,8 +5099,18 @@ fn near2_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
         .as_ref()
 }
 
+fn agree_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_AGREE_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p).expect("FA_AGREE_OUT file")))))
+        .as_ref()
+}
+
 pub fn fm_trace_flush() {
     fm_time::report();
+    if let Some(w) = agree_out() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
     if let Some(w) = ext_out() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
