@@ -1753,6 +1753,83 @@ impl<
                 stats.tie_read_seeded += 1;
             }
         }
+        // --flank-ext E: a core cut at the flank-tie limit (more copies at its best flank than the
+        // tie limit keeps) is looked at again over a window E bases wider on each side, the
+        // extension read from the reference here (a side store would hold it). The copies at the
+        // best over that window are seeded when they now fit under the limit.
+        if self.options.args.flank_ext > 0 {
+            let e = self.options.args.flank_ext as i64;
+            let slack = self.options.args.flank_slack;
+            let mut dist: Vec<u8> = Vec::new();
+            for side in 0..2 {
+                let (ranges, seq): (&[crate::align::process::range_extractor::Range<F>], &[u8]) = if side == 0 { (ranges_fwd, rec_fwd.seq()) } else { (ranges_rev, rec_rev.seq()) };
+                let flex = if side == 0 { self.seed_extractor_fwd.max_best_flex() } else { self.seed_extractor_rev.max_best_flex() };
+                let rc: Vec<u8> = seq.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x }).collect();
+                let len = seq.len() as i64;
+                let k = C as i64;
+                let mut extra: Vec<Seed> = Vec::new();
+                for r in ranges.iter() {
+                    if r.vrange.len() <= self.options.args.flank_ext_min {
+                        continue;
+                    }
+                    let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
+                    if dist.is_empty() {
+                        continue;
+                    }
+                    let tied: Vec<usize> = dist.iter().enumerate().filter(|x| *x.1 as u32 <= min + slack).map(|x| x.0).take(self.options.args.flank_ext_cap).collect();
+                    if tied.len() <= flex {
+                        continue;
+                    }
+                    stats.flank_ext_ranges += 1;
+                    stats.flank_ext_copies += tied.len();
+                    let mut scored: Vec<(usize, usize)> = Vec::with_capacity(tied.len());
+                    for &i in &tied {
+                        let (v, p) = r.vrange.value(i);
+                        let Some(rv) = self.db.get_reference(v as usize) else { continue };
+                        let mut best = usize::MAX;
+                        for (s, kpos) in [(seq, r.qpos as i64), (&rc[..], len - r.qpos as i64 - k)] {
+                            // The window [kpos - e, kpos + k + e) of the read, clipped to the read and
+                            // the reference, against the reference around the copy's k-mer.
+                            let a = (kpos - e).max(0).max(kpos - p as i64);
+                            let b = (kpos + k + e).min(len).min(kpos + (rv.len() as i64 - p as i64));
+                            if b <= a {
+                                continue;
+                            }
+                            let rs = p as i64 - kpos + a;
+                            let w = rv.window(rs as usize..(rs + b - a) as usize);
+                            let m = s[a as usize..b as usize].iter().zip(w).filter(|(x, y)| x != y).count();
+                            best = best.min(m);
+                        }
+                        scored.push((best, i));
+                    }
+                    crate::database::refseq2::reset_scratch();
+                    let Some(b) = scored.iter().map(|x| x.0).min() else { continue };
+                    let keep: Vec<usize> = scored.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
+                    if keep.len() <= flex {
+                        stats.flank_ext_rescued += 1;
+                        for i in keep {
+                            let (v, p) = r.vrange.value(i);
+                            // As Seed::from_flexmer with the whole k-mer C and the core C - F.
+                            let d = dist[i] as u32;
+                            extra.push(if d == 0 {
+                                Seed { qpos: r.qpos as u32, rpos: p, rval: v, mismatch: 0, length: C as u8, flag: 0 }
+                            } else {
+                                Seed { qpos: (r.qpos + F / 2) as u32, rpos: p + (F / 2) as u64, rval: v, mismatch: d as u8, length: (C - F) as u8, flag: 0 }
+                            });
+                        }
+                    }
+                }
+                if !extra.is_empty() {
+                    stats.flank_ext_seeds += extra.len();
+                    let se = if side == 0 { &mut self.seed_extractor_fwd } else { &mut self.seed_extractor_rev };
+                    let mut seeds = se.take_seeds();
+                    seeds.extend(extra);
+                    crate::align::common::sort_short_by_key(&mut seeds, |s: &Seed| (s.rval, s.rpos));
+                    seeds.dedup_by(|a, b| a.rval == b.rval && a.rpos == b.rpos && a.qpos == b.qpos);
+                    se.put_seeds(seeds);
+                }
+            }
+        }
         FM_INFO.with(|f| *f.borrow_mut() = None);
         // FA_REPEAT_MAPQ: how much of each mate lies in repeats, as minibwa's frac_high (the share
         // of the read covered by seeds of more than 250 copies). Mode 1: the share of the mate's

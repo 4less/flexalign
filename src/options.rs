@@ -594,6 +594,20 @@ pub struct Args {
     #[arg(long = "near-slack", default_value_t = 1)]
     pub near_slack: u32,
 
+    /// Prototype: a core cut at the flank-tie limit is compared with the read over a window this
+    /// many bases wider on each side (from the reference); the copies at the best are seeded when
+    /// they fit under the limit. 0 turns it off.
+    #[arg(long = "flank-ext", default_value_t = 0)]
+    pub flank_ext: usize,
+
+    /// --flank-ext: only cores with more than this many positions.
+    #[arg(long = "flank-ext-min", default_value_t = 0)]
+    pub flank_ext_min: usize,
+
+    /// --flank-ext: at most this many tied copies of a core are compared.
+    #[arg(long = "flank-ext-cap", default_value_t = 4096)]
+    pub flank_ext_cap: usize,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 

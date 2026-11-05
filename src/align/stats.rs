@@ -144,6 +144,10 @@ pub struct Stats {
     pub fm_compared: usize,
     pub fm_located: usize,
     pub near_mapq_lowered: usize,
+    pub flank_ext_ranges: usize,
+    pub flank_ext_copies: usize,
+    pub flank_ext_rescued: usize,
+    pub flank_ext_seeds: usize,
     pub fm_lf_steps: usize,
     pub fm_seeded: usize,
     pub fm_ambiguous: usize,
@@ -534,6 +538,10 @@ impl Merge for Stats {
         self.fm_compared += other.fm_compared;
         self.fm_located += other.fm_located;
         self.near_mapq_lowered += other.near_mapq_lowered;
+        self.flank_ext_ranges += other.flank_ext_ranges;
+        self.flank_ext_copies += other.flank_ext_copies;
+        self.flank_ext_rescued += other.flank_ext_rescued;
+        self.flank_ext_seeds += other.flank_ext_seeds;
         self.fm_lf_steps += other.fm_lf_steps;
         self.fm_seeded += other.fm_seeded;
         self.fm_ambiguous += other.fm_ambiguous;
@@ -587,6 +595,10 @@ impl Display for Stats {
     /// GOLDSTD_EVAL build. Otherwise those counters are all zero and only clutter the log.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let t = self.threads.max(1) as u32;
+        if self.flank_ext_ranges > 0 {
+            writeln!(f, "Flank ext: cut cores looked at {}, tied copies compared {}, cores rescued {}, seeds added {}",
+                self.flank_ext_ranges, self.flank_ext_copies, self.flank_ext_rescued, self.flank_ext_seeds)?;
+        }
         if self.near_mapq_lowered > 0 {
             writeln!(f, "Near pairs: MAPQ lowered {}", self.near_mapq_lowered)?;
         }
@@ -858,6 +870,10 @@ impl Default for Stats {
             fm_compared: 0,
             fm_located: 0,
             near_mapq_lowered: 0,
+            flank_ext_ranges: 0,
+            flank_ext_copies: 0,
+            flank_ext_rescued: 0,
+            flank_ext_seeds: 0,
             fm_lf_steps: 0,
             fm_seeded: 0,
             fm_ambiguous: 0,
