@@ -632,6 +632,25 @@ pub struct Args {
     #[arg(long = "flank-ext-max-tied", default_value_t = 0)]
     pub flank_ext_max_tied: usize,
 
+    /// --flankext-build: the ladder store instead of brackets: cells only for copies in groups of
+    /// more than this many identical flank cells (the copies a tie cut drops). 0: brackets.
+    #[arg(long = "flankext-ladder", default_value_t = 0)]
+    pub flankext_ladder: usize,
+
+    /// --flankext-ladder: extra bases a side each stored copy gets.
+    #[arg(long = "flankext-ladder-ext", default_value_t = 8)]
+    pub flankext_ladder_ext: usize,
+
+    /// --flank-ext: only cut cores with more tied copies than this (fewer are left to the
+    /// recovery pass and --tie-read).
+    #[arg(long = "flank-ext-min-tied", default_value_t = 0)]
+    pub flank_ext_min_tied: usize,
+
+    /// --flank-ext: when more than the tie limit remain after the wider window but at most this
+    /// many, the whole read decides among them (0: off).
+    #[arg(long = "flank-ext-hamming", default_value_t = 0)]
+    pub flank_ext_hamming: usize,
+
     /// --flank-ext: only cores with more than this many positions.
     #[arg(long = "flank-ext-min", default_value_t = 0)]
     pub flank_ext_min: usize,

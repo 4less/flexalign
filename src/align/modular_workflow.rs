@@ -1768,7 +1768,8 @@ impl<
             let l = *a.flank_lengths.get(bi).or(a.flank_lengths.last()).unwrap_or(&16);
             (l.saturating_sub(16) / 2) as i64
         };
-        if self.options.args.flank_ext > 0 || !self.options.args.flank_lengths.is_empty() {
+        let ladder = crate::database::flankext::FLANKEXT.get().filter(|st| st.ladder_t > 0);
+        if self.options.args.flank_ext > 0 || !self.options.args.flank_lengths.is_empty() || ladder.is_some() {
             let slack = self.options.args.flank_slack;
             let mut dist: Vec<u8> = Vec::new();
             for side in 0..2 {
@@ -1791,7 +1792,11 @@ impl<
                 }
                 let mut cands: Vec<(usize, usize)> = Vec::new(); // (tied copies, range index)
                 for (ri, r) in ranges.iter().enumerate() {
-                    if r.vrange.len() <= a.flank_ext_min || bracket_ext(r.vrange.len()) == 0 {
+                    if r.vrange.len() <= a.flank_ext_min {
+                        continue;
+                    }
+                    // The ladder store holds the cores that can be cut; otherwise the brackets say.
+                    if match ladder { Some(st) => st.lookup(r.key).is_none(), None => bracket_ext(r.vrange.len()) == 0 } {
                         continue;
                     }
                     let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
@@ -1799,7 +1804,9 @@ impl<
                         continue;
                     }
                     let n = dist.iter().filter(|&&d| d as u32 <= min + slack).count();
-                    if n > flex {
+                    // Cores of up to --flank-ext-min-tied tied copies are left to the recovery pass
+                    // and --tie-read, which reach them.
+                    if n > flex && n > a.flank_ext_min_tied {
                         cands.push((n, ri));
                     }
                 }
@@ -1816,7 +1823,7 @@ impl<
                     }
                     done += 1;
                     let r = &ranges[ri];
-                    let e = bracket_ext(r.vrange.len());
+                    let e = match ladder { Some(st) => st.ladder_e as i64, None => bracket_ext(r.vrange.len()) };
                     let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
                     let tied: Vec<usize> = dist.iter().enumerate().filter(|x| *x.1 as u32 <= min + slack).map(|x| x.0).take(a.flank_ext_cap).collect();
                     stats.flank_ext_ranges += 1;
@@ -1824,14 +1831,14 @@ impl<
                     let mut scored: Vec<(usize, usize)> = Vec::with_capacity(tied.len());
                     // --flankext: the stored windows of this core, when it has them.
                     let store = crate::database::flankext::FLANKEXT.get()
-                        .and_then(|st| st.lookup(r.key).map(|(w, f)| (st, w, f)));
+                        .and_then(|st| st.lookup(r.key).map(|(w, f, c)| (st, w, f, c)));
                     let rwin = store.map(|_| [crate::database::flankext::ReadWindow::new(seq, r.qpos as i64, e as usize),
                         crate::database::flankext::ReadWindow::new(&rc, len - r.qpos as i64 - k, e as usize)]);
                     let nw = crate::database::flankext::words_per_copy(e as usize);
                     for &i in &tied {
-                        if let (Some((st, w0, f0)), Some(rw)) = (store, rwin.as_ref()) {
-                            if !st.is_exception(f0 + i) {
-                                let cell = st.cell(w0 + i * nw, nw);
+                        if let (Some((st, w0, f0, cnt)), Some(rw)) = (store, rwin.as_ref()) {
+                            if let Some(j) = st.member_slot(f0, cnt, i).filter(|&j| !st.is_exception(f0 + j)) {
+                                let cell = st.cell(w0 + j * nw, nw);
                                 stats.flank_ext_stored += 1;
                                 scored.push((rw[0].mismatches(cell).min(rw[1].mismatches(cell)), i));
                                 continue;
@@ -1857,7 +1864,29 @@ impl<
                     }
                     crate::database::refseq2::reset_scratch();
                     let Some(b) = scored.iter().map(|x| x.0).min() else { continue };
-                    let keep: Vec<usize> = scored.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
+                    let mut keep: Vec<usize> = scored.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
+                    // Still too many after the wider window, but few enough to afford: the whole
+                    // read decides (gap-free, both strands), its best copies kept.
+                    if keep.len() > flex && keep.len() <= a.flank_ext_hamming {
+                        let (pf, pr) = (pack2(seq), pack2(&rc));
+                        let mut whole: Vec<(usize, usize)> = Vec::with_capacity(keep.len());
+                        for &i in &keep {
+                            let (v, p) = r.vrange.value(i);
+                            let Some(rv) = self.db.get_reference(v as usize) else { continue };
+                            let mut best = usize::MAX;
+                            for (s2, pk, st) in [(seq, &pf, p as i64 - r.qpos as i64), (&rc[..], &pr, p as i64 - (len - r.qpos as i64 - k))] {
+                                if st >= 0 && ((st + len) as usize) <= rv.len() {
+                                    best = best.min(rv.mismatches(st as usize, s2, pk, usize::MAX));
+                                }
+                            }
+                            whole.push((best, i));
+                        }
+                        crate::database::refseq2::reset_scratch();
+                        stats.flank_ext_hamming += whole.len();
+                        if let Some(bw) = whole.iter().map(|x| x.0).min() {
+                            keep = whole.iter().filter(|x| x.0 == bw).map(|x| x.1).collect();
+                        }
+                    }
                     if keep.len() <= flex {
                         stats.flank_ext_rescued += 1;
                         evidence = true;
@@ -5639,6 +5668,76 @@ pub fn index_size_hist<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: u
 
 /// `--flankext-build`: the flank side store of the built index for `--flank-brackets` /
 /// `--flank-lengths` (see `database::flankext`).
+/// `--flankext-build --flankext-ladder T`: the ladder store. Every core whose copies hold a group of
+/// more than T identical flank cells (identical 31-mers, the copies a tie cut drops); only those
+/// groups' copies get cells, each `e` extra bases a side.
+pub fn build_flankext_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, t: usize, e: usize, index_bytes: u64) -> crate::database::flankext::FlankExt {
+    use crate::database::flankext::{pack_window, words_per_copy, FlankExt, KMER};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let keys = 1u64 << (2 * c);
+    let next = AtomicU64::new(0);
+    let found = std::sync::Mutex::new(Vec::<(u64, Vec<u32>)>::new());
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let k0 = next.fetch_add(1 << 16, Relaxed);
+                    if k0 >= keys {
+                        break;
+                    }
+                    for key in k0..(k0 + (1 << 16)).min(keys) {
+                        let Some(r) = db.get_vrange(key) else { continue };
+                        let flex = match &r { flexmap::range::AnyRange::Packed(p) if r.has_header() => p.flex_bytes(), _ => continue };
+                        let mut idx: Vec<(u32, u32)> = flex.chunks_exact(4).enumerate().map(|(i, b)| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]), i as u32)).collect();
+                        idx.sort_unstable();
+                        let mut members: Vec<u32> = Vec::new();
+                        let mut i = 0;
+                        while i < idx.len() {
+                            let mut j = i + 1;
+                            while j < idx.len() && idx[j].0 == idx[i].0 { j += 1; }
+                            if j - i > t { members.extend(idx[i..j].iter().map(|x| x.1)); }
+                            i = j;
+                        }
+                        if !members.is_empty() {
+                            members.sort_unstable();
+                            local.push((key, members));
+                        }
+                    }
+                }
+                found.lock().unwrap().extend(local);
+            });
+        }
+    });
+    let mut found = found.into_inner().unwrap();
+    found.sort_unstable_by_key(|x| x.0);
+    let cores: Vec<(u64, usize, usize)> = found.iter().map(|(k, m)| (*k, m.len(), e)).collect();
+    let mut moff = Vec::with_capacity(found.len());
+    let mut members: Vec<u32> = Vec::with_capacity(cores.iter().map(|x| x.1).sum());
+    for (_, m) in &found {
+        moff.push(members.len());
+        members.extend_from_slice(m);
+    }
+    let nw = words_per_copy(e);
+    let fill = |i: usize, ws: &mut [u64], fs: &mut [u8]| {
+        let (key, n, _) = cores[i];
+        let Some(r) = db.get_vrange(key) else { fs.iter_mut().for_each(|x| *x = 1); return };
+        for slot in 0..n {
+            let (v, p) = r.value(members[moff[i] + slot] as usize);
+            let p = p as usize;
+            let ok = db.get_reference(v as usize).is_some_and(|rv| {
+                p >= e && p + KMER + e <= rv.len() && pack_window(rv.window(p - e..p + KMER + e), &mut ws[slot * nw..(slot + 1) * nw])
+            });
+            if !ok {
+                fs[slot] = 1;
+            }
+        }
+        crate::database::refseq2::reset_scratch();
+    };
+    let members2 = members.clone();
+    FlankExt::assemble_ladder(Vec::new(), vec![16 + 2 * e], index_bytes, t, e, &cores, members2, threads, &fill)
+}
+
 pub fn build_flankext<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, brackets: &[usize], lengths: &[usize], index_bytes: u64) -> crate::database::flankext::FlankExt {
     use crate::database::flankext::{ext_for, pack_window, words_per_copy, FlankExt, KMER};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

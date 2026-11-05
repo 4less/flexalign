@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 
-const MAGIC: [u8; 8] = *b"FLXEXT01";
+const MAGIC: [u8; 8] = *b"FLXEXT02";
 pub const KMER: usize = 31;
 
 pub struct FlankExt {
@@ -25,9 +25,15 @@ pub struct FlankExt {
     pub lengths: Vec<usize>,
     /// Size of the main index file the store was built for (0: unknown).
     pub index_bytes: u64,
-    table: Vec<[u64; 3]>,
+    /// Ladder store (`ladder_t` > 0): only copies in groups of more than `ladder_t` identical
+    /// flank cells have cells, all with `ladder_e` extra bases a side; `members` lists, per core,
+    /// the copy indices that have one (sorted), aligned with the cells and flags.
+    pub ladder_t: usize,
+    pub ladder_e: usize,
+    table: Vec<[u64; 4]>,
     words: Vec<u64>,
     exc: Vec<u8>,
+    members: Vec<u32>,
 }
 
 /// Extra bases a side for a core of `n` positions, by bracket.
@@ -109,9 +115,9 @@ impl ReadWindow {
 }
 
 impl FlankExt {
-    /// (first word, first flag) of a core's cells.
+    /// (first word, first flag, cells) of a core's cells.
     #[inline]
-    pub fn lookup(&self, key: u64) -> Option<(usize, usize)> {
+    pub fn lookup(&self, key: u64) -> Option<(usize, usize, usize)> {
         if self.table.is_empty() {
             return None;
         }
@@ -120,7 +126,7 @@ impl FlankExt {
         loop {
             let e = &self.table[s];
             if e[0] == key {
-                return Some((e[1] as usize, e[2] as usize));
+                return Some((e[1] as usize, e[2] as usize, e[3] as usize));
             }
             if e[0] == u64::MAX {
                 return None;
@@ -139,11 +145,31 @@ impl FlankExt {
         self.exc[flag] != 0
     }
 
+    /// Ladder store: the cell slot (0-based within the core) of copy `i`, if it has one.
+    #[inline]
+    pub fn member_slot(&self, flag0: usize, count: usize, i: usize) -> Option<usize> {
+        if self.ladder_t == 0 {
+            return Some(i);
+        }
+        self.members[flag0..flag0 + count].binary_search(&(i as u32)).ok()
+    }
+
     /// Builds the store from per-core cells: `cores` lists (key, copies, e) in fill order and
     /// `fill(core index, words, flags)` writes a core's cells (n * words_per_copy(e) words, n
     /// flags), called from `threads` threads on disjoint cores.
     pub fn assemble(
         brackets: Vec<usize>, lengths: Vec<usize>, index_bytes: u64, cores: &[(u64, usize, usize)], threads: usize,
+        fill: &(dyn Fn(usize, &mut [u64], &mut [u8]) + Sync),
+    ) -> FlankExt {
+        Self::assemble_ladder(brackets, lengths, index_bytes, 0, 0, cores, Vec::new(), threads, fill)
+    }
+
+    /// As `assemble`; with `ladder_t` > 0, `members` holds every core's member copy indices
+    /// (cores[i].1 of them, in core order) and `fill` writes one cell per member.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_ladder(
+        brackets: Vec<usize>, lengths: Vec<usize>, index_bytes: u64, ladder_t: usize, ladder_e: usize,
+        cores: &[(u64, usize, usize)], members: Vec<u32>, threads: usize,
         fill: &(dyn Fn(usize, &mut [u64], &mut [u8]) + Sync),
     ) -> FlankExt {
         let mut word_off = Vec::with_capacity(cores.len() + 1);
@@ -193,19 +219,19 @@ impl FlankExt {
             });
         }
         let cap = (cores.len() * 2).next_power_of_two().max(2);
-        let mut table = vec![[u64::MAX, 0, 0]; cap];
-        for (i, &(key, _, _)) in cores.iter().enumerate() {
+        let mut table = vec![[u64::MAX, 0, 0, 0]; cap];
+        for (i, &(key, n, _)) in cores.iter().enumerate() {
             let mut s = (key as usize) & (cap - 1);
             while table[s][0] != u64::MAX {
                 s = (s + 1) & (cap - 1);
             }
-            table[s] = [key, word_off[i] as u64, flag_off[i] as u64];
+            table[s] = [key, word_off[i] as u64, flag_off[i] as u64, n as u64];
         }
-        FlankExt { brackets, lengths, index_bytes, table, words, exc }
+        FlankExt { brackets, lengths, index_bytes, ladder_t, ladder_e, table, words, exc, members }
     }
 
     pub fn bytes(&self) -> usize {
-        self.table.len() * 24 + self.words.len() * 8 + self.exc.len()
+        self.table.len() * 32 + self.words.len() * 8 + self.exc.len() + self.members.len() * 4
     }
 
     pub fn exceptions(&self) -> usize {
@@ -216,15 +242,17 @@ impl FlankExt {
         let tmp = format!("{path}.tmp");
         let mut w = std::io::BufWriter::with_capacity(1 << 24, std::fs::File::create(&tmp)?);
         w.write_all(&MAGIC)?;
-        for v in [self.index_bytes, self.brackets.len() as u64, self.lengths.len() as u64, self.table.len() as u64, self.words.len() as u64, self.exc.len() as u64] {
+        for v in [self.index_bytes, self.brackets.len() as u64, self.lengths.len() as u64, self.table.len() as u64, self.words.len() as u64, self.exc.len() as u64,
+                  self.ladder_t as u64, self.ladder_e as u64, self.members.len() as u64] {
             w.write_all(&v.to_le_bytes())?;
         }
         for &v in self.brackets.iter().chain(self.lengths.iter()) {
             w.write_all(&(v as u64).to_le_bytes())?;
         }
-        let tb = unsafe { std::slice::from_raw_parts(self.table.as_ptr() as *const u8, self.table.len() * 24) };
+        let tb = unsafe { std::slice::from_raw_parts(self.table.as_ptr() as *const u8, self.table.len() * 32) };
         let wb = unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.words.len() * 8) };
-        for part in [tb, wb, &self.exc[..]] {
+        let mb = unsafe { std::slice::from_raw_parts(self.members.as_ptr() as *const u8, self.members.len() * 4) };
+        for part in [tb, wb, &self.exc[..], mb] {
             for ch in part.chunks(1 << 26) {
                 w.write_all(ch)?;
             }
@@ -246,16 +274,18 @@ impl FlankExt {
             f.read_exact(&mut b)?;
             Ok(u64::from_le_bytes(b))
         };
-        let (index_bytes, nb, nl, nt, nw, ne) = (u()?, u()?, u()?, u()?, u()?, u()?);
+        let (index_bytes, nb, nl, nt, nw, ne, lt, le, nm) = (u()?, u()?, u()?, u()?, u()?, u()?, u()?, u()?, u()?);
         let brackets = (0..nb).map(|_| u().map(|v| v as usize)).collect::<std::io::Result<Vec<_>>>()?;
         let lengths = (0..nl).map(|_| u().map(|v| v as usize)).collect::<std::io::Result<Vec<_>>>()?;
-        let mut table = vec![[0u64; 3]; nt as usize];
-        f.read_exact(unsafe { std::slice::from_raw_parts_mut(table.as_mut_ptr() as *mut u8, table.len() * 24) })?;
+        let mut table = vec![[0u64; 4]; nt as usize];
+        f.read_exact(unsafe { std::slice::from_raw_parts_mut(table.as_mut_ptr() as *mut u8, table.len() * 32) })?;
         let mut words = vec![0u64; nw as usize];
         f.read_exact(unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) })?;
         let mut exc = vec![0u8; ne as usize];
         f.read_exact(&mut exc)?;
-        Ok(FlankExt { brackets, lengths, index_bytes, table, words, exc })
+        let mut members = vec![0u32; nm as usize];
+        f.read_exact(unsafe { std::slice::from_raw_parts_mut(members.as_mut_ptr() as *mut u8, members.len() * 4) })?;
+        Ok(FlankExt { brackets, lengths, index_bytes, ladder_t: lt as usize, ladder_e: le as usize, table, words, exc, members })
     }
 }
 
@@ -303,7 +333,7 @@ mod tests {
         let st = FlankExt::load(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!((st.index_bytes, st.brackets.clone(), st.lengths.clone()), (12345, vec![256], vec![16, 32]));
-        let (w0, f0) = st.lookup(0xABCD).unwrap();
+        let (w0, f0, _) = st.lookup(0xABCD).unwrap();
         assert!(st.lookup(0x9999).is_none());
         let nw = words_per_copy(e);
         // A read holding copy 1's window with a mismatch and an N, k-mer near the read start.
