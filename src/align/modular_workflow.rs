@@ -1791,6 +1791,7 @@ impl<
                     stats.flank_ext_mates_skipped += 1;
                     continue;
                 }
+                let _t_sel = fm_time::Span::new(&fm_time::FE_SELECT_NS);
                 let mut cands: Vec<(usize, usize)> = Vec::new(); // (tied copies, range index)
                 for (ri, r) in ranges.iter().enumerate() {
                     if r.vrange.len() <= a.flank_ext_min {
@@ -1812,6 +1813,7 @@ impl<
                     }
                 }
                 cands.sort_unstable();
+                drop(_t_sel);
                 let mut evidence = seeded > 0;
                 let mut done = 0usize;
                 for &(n_tied, ri) in &cands {
@@ -1830,27 +1832,55 @@ impl<
                     stats.flank_ext_ranges += 1;
                     stats.flank_ext_copies += tied.len();
                     let mut scored: Vec<(usize, usize)> = Vec::with_capacity(tied.len());
+                    if a.flank_ext_direct {
+                        // --flank-ext-direct: no store, the whole read against every tied copy.
+                        let _t = fm_time::Span::new(&fm_time::FE_HAM_NS);
+                        let (pf, pr) = (pack2(seq), pack2(&rc));
+                        for &i in &tied {
+                            let (v, p) = r.vrange.value(i);
+                            let Some(rv) = self.db.get_reference(v as usize) else { continue };
+                            let mut best = usize::MAX;
+                            for (s2, pk, st) in [(seq, &pf, p as i64 - r.qpos as i64), (&rc[..], &pr, p as i64 - (len - r.qpos as i64 - k))] {
+                                if st >= 0 && ((st + len) as usize) <= rv.len() {
+                                    best = best.min(rv.mismatches(st as usize, s2, pk, usize::MAX));
+                                }
+                            }
+                            scored.push((best, i));
+                        }
+                        fm_time::FE_HAM_N.fetch_add(tied.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        stats.flank_ext_hamming += tied.len();
+                        crate::database::refseq2::reset_scratch();
+                    } else {
+                    let _t = fm_time::Span::new(&fm_time::FE_STORE_NS);
                     // --flankext: the stored windows of this core, when it has them.
                     let store = levels.first()
                         .and_then(|st| st.lookup(r.key).map(|(w, f, c)| (st, w, f, c)));
                     let rwin = store.map(|_| [crate::database::flankext::ReadWindow::new(seq, r.qpos as i64, e as usize),
                         crate::database::flankext::ReadWindow::new(&rc, len - r.qpos as i64 - k, e as usize)]);
                     let nw = crate::database::flankext::words_per_copy(e as usize);
+                    // Tied copies and the store's members are both in copy order: one merge walk
+                    // finds each copy's cell (a bracket store has a cell for every copy).
+                    let mut mpos = 0usize;
                     for &i in &tied {
                         if let (Some((st, w0, f0, cnt)), Some(rw)) = (store, rwin.as_ref()) {
-                            if let Some(j) = st.member_slot(f0, cnt, i).filter(|&j| !st.is_exception(f0 + j)) {
+                            let slot = if st.ladder_t == 0 {
+                                Some(i)
+                            } else {
+                                while mpos < cnt && (st.member(f0 + mpos) as usize) < i { mpos += 1; }
+                                (mpos < cnt && st.member(f0 + mpos) as usize == i).then_some(mpos)
+                            };
+                            if let Some(j) = slot.filter(|&j| !st.is_exception(f0 + j)) {
                                 let cell = st.cell(w0 + j * nw, nw);
                                 stats.flank_ext_stored += 1;
                                 scored.push((rw[0].mismatches(cell).min(rw[1].mismatches(cell)), i));
                                 continue;
                             }
                         }
+                        fm_time::FE_FALLBACK_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let (v, p) = r.vrange.value(i);
                         let Some(rv) = self.db.get_reference(v as usize) else { continue };
                         let mut best = usize::MAX;
                         for (s, kpos) in [(seq, r.qpos as i64), (&rc[..], len - r.qpos as i64 - k)] {
-                            // The window [kpos - e, kpos + k + e) of the read, clipped to the read and
-                            // the reference, against the reference around the copy's k-mer.
                             let a = (kpos - e).max(0).max(kpos - p as i64);
                             let b = (kpos + k + e).min(len).min(kpos + (rv.len() as i64 - p as i64));
                             if b <= a {
@@ -1863,7 +1893,9 @@ impl<
                         }
                         scored.push((best, i));
                     }
+                    fm_time::FE_STORE_N.fetch_add(tied.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     crate::database::refseq2::reset_scratch();
+                    }
                     let Some(b) = scored.iter().map(|x| x.0).min() else { continue };
                     let mut keep: Vec<usize> = scored.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
                     // The ladder's further levels: copies still tied, judged over ever wider windows
@@ -1892,6 +1924,8 @@ impl<
                     // Still too many after the wider window, but few enough to afford: the whole
                     // read decides (gap-free, both strands), its best copies kept.
                     if keep.len() > flex && keep.len() <= a.flank_ext_hamming {
+                        let _t = fm_time::Span::new(&fm_time::FE_HAM_NS);
+                        fm_time::FE_HAM_N.fetch_add(keep.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         let (pf, pr) = (pack2(seq), pack2(&rc));
                         let mut whole: Vec<(usize, usize)> = Vec::with_capacity(keep.len());
                         for &i in &keep {
@@ -5095,6 +5129,12 @@ pub mod fm_time {
     pub static NEAR_JOIN_NS: AtomicU64 = AtomicU64::new(0);
     pub static NEAR_CMP_NS: AtomicU64 = AtomicU64::new(0);
     pub static NEAR_RUN: AtomicU64 = AtomicU64::new(0);
+    pub static FE_SELECT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FE_STORE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FE_STORE_N: AtomicU64 = AtomicU64::new(0);
+    pub static FE_FALLBACK_N: AtomicU64 = AtomicU64::new(0);
+    pub static FE_HAM_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FE_HAM_N: AtomicU64 = AtomicU64::new(0);
     thread_local! { static IS_FM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5151,6 +5191,10 @@ pub mod fm_time {
             s(&FM_PAIR_NS), 1e6 * s(&FM_PAIR_NS) / fp.max(1) as f64, s(&OTHER_PAIR_NS), 1e6 * s(&OTHER_PAIR_NS) / op.max(1) as f64);
         eprintln!("[fm-time] near pairs: {} pairs past the precheck; precheck {:.1} s, read+vote {:.1} s, join {:.1} s, compare {:.1} s",
             NEAR_RUN.load(Relaxed), s(&NEAR_PRE_NS), s(&NEAR_READ_NS), s(&NEAR_JOIN_NS), s(&NEAR_CMP_NS));
+        let per = |ns: &AtomicU64, n: &AtomicU64| ns.load(Relaxed) as f64 / n.load(Relaxed).max(1) as f64;
+        eprintln!("[fm-time] flank ext: select {:.2} s; store {:.2} s for {} copies ({:.1} ns a copy, {} from the reference); whole read {:.2} s for {} copies ({:.1} ns a copy)",
+            s(&FE_SELECT_NS), s(&FE_STORE_NS), FE_STORE_N.load(Relaxed), per(&FE_STORE_NS, &FE_STORE_N), FE_FALLBACK_N.load(Relaxed),
+            s(&FE_HAM_NS), FE_HAM_N.load(Relaxed), per(&FE_HAM_NS, &FE_HAM_N));
         eprintln!("[fm-time] FM block {:.1} s: search+locate {:.1} (locate {:.1}), Hamming {:.1}",
             s(&FM_BLOCK_NS), s(&SEARCH_NS), s(&LOCATE_NS), s(&HAMMING_NS));
     }

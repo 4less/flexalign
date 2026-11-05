@@ -145,6 +145,12 @@ impl FlankExt {
         self.exc[flag] != 0
     }
 
+    /// Ladder store: the copy index of member `m` (global member position).
+    #[inline]
+    pub fn member(&self, m: usize) -> u32 {
+        self.members[m]
+    }
+
     /// Ladder store: the cell slot (0-based within the core) of copy `i`, if it has one.
     #[inline]
     pub fn member_slot(&self, flag0: usize, count: usize, i: usize) -> Option<usize> {

@@ -642,6 +642,11 @@ pub struct Args {
     #[arg(long = "flankext-ladder-ext", value_delimiter = ',', default_value = "16")]
     pub flankext_ladder_ext: Vec<usize>,
 
+    /// --flank-ext: no store; compare the whole read against every tied copy of the chosen cut
+    /// cores instead (for timing the two against each other).
+    #[arg(long = "flank-ext-direct", action)]
+    pub flank_ext_direct: bool,
+
     /// --flank-ext: only cut cores with more tied copies than this (fewer are left to the
     /// recovery pass and --tie-read).
     #[arg(long = "flank-ext-min-tied", default_value_t = 0)]
