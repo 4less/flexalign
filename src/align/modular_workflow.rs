@@ -5253,6 +5253,8 @@ pub fn index_flank_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, t: usiz
     let plain = AtomicU64::new(0);
     let entering: [AtomicU64; LEVELS + 1] = Default::default();
     let groups_entering: [AtomicU64; LEVELS + 1] = Default::default();
+    let tier_cores: [AtomicU64; 3] = Default::default();
+    let tier_pos: [AtomicU64; 3] = Default::default();
     let started = std::time::Instant::now();
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1) {
@@ -5267,6 +5269,9 @@ pub fn index_flank_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, t: usiz
                         let Some(r) = db.get_vrange(key) else { continue };
                         let n = r.len() as u64;
                         total.fetch_add(n, Relaxed);
+                        let tier = if n <= 64 { 0 } else if n <= 512 { 1 } else { 2 };
+                        tier_cores[tier].fetch_add(1, Relaxed);
+                        tier_pos[tier].fetch_add(n, Relaxed);
                         if !r.has_header() {
                             continue;
                         }
@@ -5336,6 +5341,14 @@ pub fn index_flank_ladder<D: FlexalignDatabase + Sync>(db: &D, c: usize, t: usiz
         eprintln!("[ladder] level {level} ({} bp): {} copies in {} groups need it ({:.2} % of copies; {:.2} GB at 4 bytes)", 31 + 16 * level, e, groups_entering[level].load(Relaxed), 100.0 * e as f64 / tot.max(1) as f64, 4.0 * e as f64 / 1e9);
     }
     eprintln!("[ladder] still tied after {} bp: {} copies in {} groups", 31 + 16 * LEVELS, entering[0].load(Relaxed), groups_entering[0].load(Relaxed));
+    // Tiers by the core's positions (<= 64: 16 flank bases; 65-512: 32; 513-cap: 64).
+    let (tc, tp): (Vec<u64>, Vec<u64>) = (0..3).map(|i| (tier_cores[i].load(Relaxed), tier_pos[i].load(Relaxed))).unzip();
+    let cores: u64 = tc.iter().sum();
+    let extra = 4.0 * tp[1] as f64 + 12.0 * tp[2] as f64;
+    for (i, name) in ["<= 64 positions (16 flank bases)", "65-512 (32: +4 bytes a copy)", "513-cap (64: +12 bytes a copy)"].iter().enumerate() {
+        eprintln!("[tiers] {name}: {} cores ({:.2} %), {} positions ({:.2} %)", tc[i], 100.0 * tc[i] as f64 / cores.max(1) as f64, tp[i], 100.0 * tp[i] as f64 / tot.max(1) as f64);
+    }
+    eprintln!("[tiers] extra flank bytes for the tiers: {:.2} GB", extra / 1e9);
 }
 
 /// `FA_EXT_OUT=<file>` with `FA_TRACE_TRUTH`: the multi-core funnel with longer flanks, per traced
