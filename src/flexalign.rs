@@ -220,6 +220,10 @@ pub fn run(args: Args) {
         },
     };
 
+    if let Some(p) = std::env::var_os("FA_INDEX_HIST") {
+        crate::align::modular_workflow::index_size_hist(&db, C, options.args.threads.max(1) as usize, &p);
+        return;
+    }
     if let Some(t) = std::env::var("FA_INDEX_STATS").ok().and_then(|v| v.parse::<usize>().ok()) {
         crate::align::modular_workflow::index_flank_ladder(&db, C, t, options.args.threads.max(1) as usize);
         return;

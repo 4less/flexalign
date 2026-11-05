@@ -5464,3 +5464,43 @@ fn ext_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::Fil
     W.get_or_init(|| std::env::var_os("FA_EXT_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).expect("FA_EXT_OUT file")))))
         .as_ref()
 }
+
+/// `FA_INDEX_HIST=<file>`: the index's multiplicity histogram, one line per range size with any
+/// keys: size, keys (cores), and of those keys how many have a flank header.
+pub fn index_size_hist<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, path: &std::ffi::OsStr) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let keys = 1u64 << (2 * c);
+    let next = AtomicU64::new(0);
+    let hist: Vec<AtomicU64> = (0..=1 << 20).map(|_| AtomicU64::new(0)).collect();
+    let hdr: Vec<AtomicU64> = (0..=1 << 20).map(|_| AtomicU64::new(0)).collect();
+    let started = std::time::Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| loop {
+                let k0 = next.fetch_add(1 << 16, Relaxed);
+                if k0 >= keys {
+                    break;
+                }
+                for key in k0..(k0 + (1 << 16)).min(keys) {
+                    if let Some(r) = db.get_vrange(key) {
+                        let n = r.len().min(1 << 20);
+                        hist[n].fetch_add(1, Relaxed);
+                        if r.has_header() {
+                            hdr[n].fetch_add(1, Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path).expect("FA_INDEX_HIST file"));
+    let _ = writeln!(w, "size\tkeys\twith_header");
+    for (n, h) in hist.iter().enumerate() {
+        let v = h.load(Relaxed);
+        if v > 0 {
+            let _ = writeln!(w, "{n}\t{v}\t{}", hdr[n].load(Relaxed));
+        }
+    }
+    eprintln!("[hist] {} keys walked in {:.0} s", keys, started.elapsed().as_secs_f64());
+}
