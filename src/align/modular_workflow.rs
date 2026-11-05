@@ -2142,6 +2142,11 @@ impl<
         }
         let seeds_fwd = self.seed_extractor_fwd.take_seeds();
         let seeds_rev = self.seed_extractor_rev.take_seeds();
+        // Seeded cores per mate (distinct read positions with seeds), for --near-max-seeded.
+        {
+            let cores = |sd: &[Seed]| { let mut q: Vec<(u32, u8)> = sd.iter().map(|x| (x.qpos, x.length)).collect(); q.sort_unstable(); q.dedup(); q.len() };
+            SEEDED_CORES.with(|c| c.set([cores(&seeds_fwd), cores(&seeds_rev)]));
+        }
         // FA_AGREE_OUT=<file>: do a mate's seeded cores agree on where it lies? Per mate: cores
         // with seeds, distinct loci (reference, read start in 8 bp buckets, both strands), the
         // share of cores holding the most supported locus, and the mean pairwise Jaccard of the
@@ -3669,7 +3674,11 @@ impl<
         // Placed elsewhere than the path's best: the placement is not trusted (MAPQ 0).
         // --near-pairs: another pair of loci from flexmap's ranges fits as well (MAPQ at most
         // --near-tie-mapq) or one mismatch worse (at most --near-one-mapq).
-        if self.options.args.near_pairs > 0 && pseudo_mapq > 0 {
+        // --near-max-seeded N: only pairs with a mate seeded at fewer than N cores (the mates
+        // whose placement rests on too little evidence).
+        let few_seeds = self.options.args.near_max_seeded == 0
+            || SEEDED_CORES.with(|c| c.get()).iter().any(|&n| n < self.options.args.near_max_seeded);
+        if self.options.args.near_pairs > 0 && pseudo_mapq > 0 && few_seeds {
             let placed = [fwd_anchor, rev_anchor];
             let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
             let mut chosen = [(0u64, 0i64, 0usize); 2];
@@ -5132,6 +5141,10 @@ fn fm_trace() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::Fi
 }
 
 
+
+thread_local! {
+    static SEEDED_CORES: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([usize::MAX, usize::MAX]) };
+}
 
 thread_local! {
     static REPEAT_FRAC: std::cell::Cell<[f64; 2]> = const { std::cell::Cell::new([0.0, 0.0]) };

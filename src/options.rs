@@ -659,6 +659,10 @@ pub struct Args {
     #[arg(long = "flank-ext-cap", default_value_t = 4096)]
     pub flank_ext_cap: usize,
 
+    /// --near-pairs: only pairs with a mate seeded at fewer than this many cores (0: all pairs).
+    #[arg(long = "near-max-seeded", default_value_t = 0)]
+    pub near_max_seeded: usize,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 
