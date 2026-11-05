@@ -1778,22 +1778,47 @@ impl<
                 let len = seq.len() as i64;
                 let k = C as i64;
                 let mut extra: Vec<Seed> = Vec::new();
-                for r in ranges.iter() {
-                    if r.vrange.len() <= self.options.args.flank_ext_min {
-                        continue;
-                    }
-                    let e = bracket_ext(r.vrange.len());
-                    if e == 0 {
+                // Which cut cores to look at. A mate with --flank-ext-max-seeded or more seeded
+                // cores already has the evidence to place it: none. Otherwise its cut cores with
+                // the fewest tied copies first, at most --flank-ext-cores of them; a core with more
+                // than --flank-ext-max-tied tied copies only when the mate has no other evidence
+                // (no seeded core and no core rescued before it).
+                let a = &self.options.args;
+                let seeded = if side == 0 { self.seed_extractor_fwd.last_ties().0 } else { self.seed_extractor_rev.last_ties().0 };
+                if a.flank_ext_max_seeded > 0 && seeded >= a.flank_ext_max_seeded {
+                    stats.flank_ext_mates_skipped += 1;
+                    continue;
+                }
+                let mut cands: Vec<(usize, usize)> = Vec::new(); // (tied copies, range index)
+                for (ri, r) in ranges.iter().enumerate() {
+                    if r.vrange.len() <= a.flank_ext_min || bracket_ext(r.vrange.len()) == 0 {
                         continue;
                     }
                     let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
                     if dist.is_empty() {
                         continue;
                     }
-                    let tied: Vec<usize> = dist.iter().enumerate().filter(|x| *x.1 as u32 <= min + slack).map(|x| x.0).take(self.options.args.flank_ext_cap).collect();
-                    if tied.len() <= flex {
+                    let n = dist.iter().filter(|&&d| d as u32 <= min + slack).count();
+                    if n > flex {
+                        cands.push((n, ri));
+                    }
+                }
+                cands.sort_unstable();
+                let mut evidence = seeded > 0;
+                let mut done = 0usize;
+                for &(n_tied, ri) in &cands {
+                    if a.flank_ext_cores > 0 && done >= a.flank_ext_cores {
+                        break;
+                    }
+                    if a.flank_ext_max_tied > 0 && n_tied > a.flank_ext_max_tied && evidence {
+                        stats.flank_ext_cores_skipped += 1;
                         continue;
                     }
+                    done += 1;
+                    let r = &ranges[ri];
+                    let e = bracket_ext(r.vrange.len());
+                    let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
+                    let tied: Vec<usize> = dist.iter().enumerate().filter(|x| *x.1 as u32 <= min + slack).map(|x| x.0).take(a.flank_ext_cap).collect();
                     stats.flank_ext_ranges += 1;
                     stats.flank_ext_copies += tied.len();
                     let mut scored: Vec<(usize, usize)> = Vec::with_capacity(tied.len());
@@ -1835,6 +1860,7 @@ impl<
                     let keep: Vec<usize> = scored.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
                     if keep.len() <= flex {
                         stats.flank_ext_rescued += 1;
+                        evidence = true;
                         for i in keep {
                             let (v, p) = r.vrange.value(i);
                             // As Seed::from_flexmer with the whole k-mer C and the core C - F.

@@ -619,6 +619,19 @@ pub struct Args {
     #[arg(long = "flankext", action)]
     pub flankext: bool,
 
+    /// --flank-ext: a mate with this many seeded cores or more is left alone (0: never).
+    #[arg(long = "flank-ext-max-seeded", default_value_t = 0)]
+    pub flank_ext_max_seeded: usize,
+
+    /// --flank-ext: at most this many cut cores a mate, the fewest tied copies first (0: all).
+    #[arg(long = "flank-ext-cores", default_value_t = 0)]
+    pub flank_ext_cores: usize,
+
+    /// --flank-ext: a cut core with more tied copies than this is skipped when the mate has other
+    /// evidence (a seeded core, or a core rescued before it); never when it has none (0: off).
+    #[arg(long = "flank-ext-max-tied", default_value_t = 0)]
+    pub flank_ext_max_tied: usize,
+
     /// --flank-ext: only cores with more than this many positions.
     #[arg(long = "flank-ext-min", default_value_t = 0)]
     pub flank_ext_min: usize,
