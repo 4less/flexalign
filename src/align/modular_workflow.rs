@@ -1816,6 +1816,9 @@ impl<
                 drop(_t_sel);
                 let mut evidence = seeded > 0;
                 let mut done = 0usize;
+                // FA_TIED_OUT: the most copies a chosen cut core of this mate still ties after
+                // every level (0: none left tied).
+                let mut still_tied = 0usize;
                 for &(n_tied, ri) in &cands {
                     if a.flank_ext_cores > 0 && done >= a.flank_ext_cores {
                         break;
@@ -1962,6 +1965,9 @@ impl<
                             keep = whole.iter().filter(|x| x.0 == bw).map(|x| x.1).collect();
                         }
                     }
+                    if keep.len() > flex {
+                        still_tied = still_tied.max(keep.len());
+                    }
                     if keep.len() <= flex {
                         stats.flank_ext_rescued += 1;
                         evidence = true;
@@ -1975,6 +1981,14 @@ impl<
                                 Seed { qpos: (r.qpos + F / 2) as u32, rpos: p + (F / 2) as u64, rval: v, mismatch: d as u8, length: (C - F) as u8, flag: 0 }
                             });
                         }
+                    }
+                }
+                if still_tied > 0 {
+                    if let Some(w) = tied_out() {
+                        let name = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+                        let name = name.strip_suffix("/1").unwrap_or(&name).to_string();
+                        use std::io::Write;
+                        let _ = w.lock().unwrap().write_all(format!("{name}\t{}\t{still_tied}\n", side + 1).as_bytes());
                     }
                 }
                 if !extra.is_empty() {
@@ -5225,6 +5239,12 @@ fn near2_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
         .as_ref()
 }
 
+fn tied_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_TIED_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).expect("FA_TIED_OUT file")))))
+        .as_ref()
+}
+
 fn agree_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
     static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
     W.get_or_init(|| std::env::var_os("FA_AGREE_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p).expect("FA_AGREE_OUT file")))))
@@ -5233,6 +5253,10 @@ fn agree_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
 
 pub fn fm_trace_flush() {
     fm_time::report();
+    if let Some(w) = tied_out() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
     if let Some(w) = agree_out() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
