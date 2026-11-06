@@ -1836,15 +1836,18 @@ impl<
                         // --flank-ext-direct: no store, the whole read against every tied copy.
                         let _t = fm_time::Span::new(&fm_time::FE_HAM_NS);
                         let (pf, pr) = (pack2(seq), pack2(&rc));
+                        // Each copy is abandoned once it is worse than the best so far.
+                        let mut so_far = usize::MAX;
                         for &i in &tied {
                             let (v, p) = r.vrange.value(i);
                             let Some(rv) = self.db.get_reference(v as usize) else { continue };
                             let mut best = usize::MAX;
                             for (s2, pk, st) in [(seq, &pf, p as i64 - r.qpos as i64), (&rc[..], &pr, p as i64 - (len - r.qpos as i64 - k))] {
                                 if st >= 0 && ((st + len) as usize) <= rv.len() {
-                                    best = best.min(rv.mismatches(st as usize, s2, pk, usize::MAX));
+                                    best = best.min(rv.mismatches(st as usize, s2, pk, so_far));
                                 }
                             }
+                            so_far = so_far.min(best);
                             scored.push((best, i));
                         }
                         fm_time::FE_HAM_N.fetch_add(tied.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1894,6 +1897,20 @@ impl<
                         scored.push((best, i));
                     }
                     fm_time::FE_STORE_N.fetch_add(tied.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    // FA_FM_TIME: how many distinct stored windows the compared copies have.
+                    if fm_time::on() {
+                        if let Some((st, w0, f0, cnt)) = store {
+                            let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
+                            let mut mp = 0usize;
+                            for &i in &tied {
+                                while mp < cnt && (st.member(f0 + mp) as usize) < i { mp += 1; }
+                                if mp < cnt && st.member(f0 + mp) as usize == i {
+                                    seen.insert(st.cell(w0 + mp * nw, nw).to_vec());
+                                }
+                            }
+                            fm_time::FE_DISTINCT_N.fetch_add(seen.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     crate::database::refseq2::reset_scratch();
                     }
                     let Some(b) = scored.iter().map(|x| x.0).min() else { continue };
@@ -5135,6 +5152,7 @@ pub mod fm_time {
     pub static FE_FALLBACK_N: AtomicU64 = AtomicU64::new(0);
     pub static FE_HAM_NS: AtomicU64 = AtomicU64::new(0);
     pub static FE_HAM_N: AtomicU64 = AtomicU64::new(0);
+    pub static FE_DISTINCT_N: AtomicU64 = AtomicU64::new(0);
     thread_local! { static IS_FM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5195,6 +5213,7 @@ pub mod fm_time {
         eprintln!("[fm-time] flank ext: select {:.2} s; store {:.2} s for {} copies ({:.1} ns a copy, {} from the reference); whole read {:.2} s for {} copies ({:.1} ns a copy)",
             s(&FE_SELECT_NS), s(&FE_STORE_NS), FE_STORE_N.load(Relaxed), per(&FE_STORE_NS, &FE_STORE_N), FE_FALLBACK_N.load(Relaxed),
             s(&FE_HAM_NS), FE_HAM_N.load(Relaxed), per(&FE_HAM_NS, &FE_HAM_N));
+        eprintln!("[fm-time] flank ext: distinct stored windows among the compared copies: {}", FE_DISTINCT_N.load(Relaxed));
         eprintln!("[fm-time] FM block {:.1} s: search+locate {:.1} (locate {:.1}), Hamming {:.1}",
             s(&FM_BLOCK_NS), s(&SEARCH_NS), s(&LOCATE_NS), s(&HAMMING_NS));
     }
