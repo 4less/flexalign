@@ -6252,7 +6252,10 @@ pub static PLINKS: std::sync::OnceLock<PLinks> = std::sync::OnceLock::new();
 impl PLinks {
     pub fn build<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize) -> PLinks {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-        const EXT: [usize; 2] = [16, 32];
+        // FA_PLINK=<window>: the window (bp) two positions must share to be linked (default 95).
+        let wbp: usize = std::env::var("FA_PLINK").ok().and_then(|v| v.parse().ok()).filter(|&w: &usize| w >= 33).unwrap_or(95);
+        let ext_arr = [(wbp - 31) / 2];
+        let EXT: &[usize] = &ext_arr;
         let mut ref_off = vec![0u64];
         while let Some(rv) = db.get_reference(ref_off.len() - 1) {
             ref_off.push(ref_off.last().unwrap() + rv.len() as u64);
