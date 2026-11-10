@@ -3838,7 +3838,26 @@ impl<
                 let (q0, q1) = if let Some(pl) = PLINKS.get() {
                     let fwd_placed = [placed[0].map_or(true, |a| a.forward), placed[1].map_or(true, |a| a.forward)];
                     let seqs = [0, 1].map(|sd| if fwd_placed[sd] { (reads[sd].0, reads[sd].1) } else { (reads[sd].1, reads[sd].0) });
-                    let (q0, q1, deltas) = plink_competition(self.db, pl, seqs, fwd_placed, chosen, self.options.args.plink_max_class);
+                    let ql = [(rec_fwd.qual(), self.rec_fwd_revc.qual()), (rec_rev.qual(), self.rec_rev_revc.qual())];
+                    let quals = [0, 1].map(|sd| if fwd_placed[sd] { (ql[sd].0, ql[sd].1) } else { (ql[sd].1, ql[sd].0) });
+                    // A placement with gaps is not measured gap-free: its alignment cost in
+                    // mismatches, each at a typical base quality.
+                    let gapped_cost = [0, 1].map(|sd| placed[sd].and_then(|a| {
+                        let c = a.cigar.as_ref()?;
+                        c.0.iter().any(|&o| o == b'I' || o == b'D').then(|| (-(a.score as f64)).max(0.0) / penalties::MISMATCH as f64 * 3.5)
+                    }));
+                    let (q0, q1, deltas, llrs) = plink_competition(self.db, pl, seqs, quals, gapped_cost, fwd_placed, chosen, self.options.args.plink_max_class);
+                    // --plink-posterior: the MAPQ is the posterior of the placed pair among the
+                    // pairs the links know: 1 / (1 + sum of their likelihood ratios + the mass of
+                    // what cannot be seen, 1e-6). Never above the MAPQ so far.
+                    if self.options.args.plink_posterior {
+                        let sum: f64 = llrs.iter().map(|&l| 10f64.powf(l.min(6.0))).sum::<f64>() + 1e-6;
+                        let q = (-10.0 * (sum / (1.0 + sum)).log10()).clamp(0.0, 60.0).round() as u8;
+                        if q < pseudo_mapq {
+                            pseudo_mapq = q;
+                            stats.near_mapq_lowered += 1;
+                        }
+                    }
                     stats.plink_pairs += 1;
                     // FA_FEAT_OUT=<file>: what is known about the pair when its MAPQ is set.
                     if let Some(w) = feat_out() {
@@ -3887,7 +3906,9 @@ impl<
                     // track know: the margin to the best other pair (30 a mismatch), less
                     // 4.343 ln(1 + other pairs within +3), scaled by how much of both mates lies
                     // in sequence repeated at 95 bp (1 - w (f1 + f2)).
-                    if self.options.args.plink_model {
+                    if self.options.args.plink_posterior {
+                        (0, 0)
+                    } else if self.options.args.plink_model {
                         let margin = deltas.iter().copied().min().map_or(60.0, |d| 30.0 * d.max(0) as f64);
                         let mut m = (margin - 4.343 * ((1 + deltas.len()) as f64).ln()).max(0.0);
                         if let Some(t) = uniq_track() {
@@ -6454,8 +6475,9 @@ impl PLinks {
 /// inward-consistent strands and a plausible insert; both whole reads are then compared.
 /// Returns (pairs at the chosen mismatches or fewer, pairs at +1).
 fn plink_competition<D: FlexalignDatabase>(
-    db: &D, pl: &PLinks, seqs: [(&[u8], &[u8]); 2], fwd: [bool; 2], chosen: [(u64, i64, usize); 2], max_list: usize,
-) -> (usize, usize, Vec<i64>) {
+    db: &D, pl: &PLinks, seqs: [(&[u8], &[u8]); 2], quals: [(&[u8], &[u8]); 2], gapped_cost: [Option<f64>; 2],
+    fwd: [bool; 2], chosen: [(u64, i64, usize); 2], max_list: usize,
+) -> (usize, usize, Vec<i64>, Vec<f64>) {
     let _t = fm_time::Span::new(&fm_time::PLINK_NS);
     let lens = [seqs[0].0.len() as i64, seqs[1].0.len() as i64];
     let mut gstart = [0i64; 2];
@@ -6495,10 +6517,41 @@ fn plink_competition<D: FlexalignDatabase>(
         }
     }
     if srcs[0].is_empty() && srcs[1].is_empty() {
-        return (0, 0, Vec::new());
+        return (0, 0, Vec::new(), Vec::new());
     }
     // Mismatches over the chosen pair's of every alternative pair within +3.
     let deltas = std::cell::RefCell::new(Vec::<i64>::new());
+    // log10 of each such pair's likelihood over the chosen pair's: every mismatch weighs its base
+    // quality (an error of probability e hits this base with e / 3), the inserts their normal
+    // densities.
+    let llrs = std::cell::RefCell::new(Vec::<f64>::new());
+    let wmemo = std::cell::RefCell::new(Vec::<((usize, i64, bool), f64)>::new());
+    let weight = |side: usize, st: i64, flipped: bool| -> f64 {
+        if let Some(e) = wmemo.borrow().iter().find(|e| e.0 == (side, st, flipped)) { return e.1; }
+        let (s, q) = if flipped { (seqs[side].1, quals[side].1) } else { (seqs[side].0, quals[side].0) };
+        let mut w = 99.0;
+        if st >= 0 {
+            let (id, lp) = pl.local(st as u64);
+            if let Some(rv) = db.get_reference(id) {
+                if lp as usize + s.len() <= rv.len() {
+                    let r = rv.window(lp as usize..lp as usize + s.len());
+                    w = s.iter().zip(r).zip(q).filter(|((a, b), _)| a != b)
+                        .map(|(_, &ql)| (ql.saturating_sub(33).min(41) as f64) / 10.0 + 0.477).sum();
+                }
+            }
+        }
+        wmemo.borrow_mut().push(((side, st, flipped), w));
+        w
+    };
+    let w_chosen: [f64; 2] = [0, 1].map(|sd| gapped_cost[sd].unwrap_or_else(|| weight(sd, gstart[sd], false)));
+    let (ins_mean, ins_sd) = crate::align::common::INSERT_STATS.get().copied().unwrap_or((0.0, 0.0));
+    let ins_ll = |s0: i64, s1: i64| -> f64 {
+        if ins_sd <= 0.0 { return 0.0; }
+        let ins = ((s0 + lens[0]).max(s1 + lens[1]) - s0.min(s1)) as f64;
+        let z = (ins - ins_mean) / ins_sd;
+        -(z * z) / (2.0 * std::f64::consts::LN_10)
+    };
+    let ins_chosen = ins_ll(gstart[0], gstart[1]);
     // The read start an identical copy `m` of the position `me` implies, and whether it is on the
     // other strand.
     let alt = |side: usize, me: u64, m: u64| -> (i64, bool) {
@@ -6545,7 +6598,11 @@ fn plink_competition<D: FlexalignDatabase>(
         let t = m1 + known_o.unwrap_or_else(|| mm(o, so, fo));
         q0 += (t <= total) as usize;
         q1 += (t == total + 1) as usize;
-        if t <= total + 3 { deltas.borrow_mut().push(t as i64 - total as i64); }
+        if t <= total + 3 {
+            deltas.borrow_mut().push(t as i64 - total as i64);
+            let wo = if known_o.is_some() { w_chosen[o] } else { weight(o, so, fo) };
+            llrs.borrow_mut().push(w_chosen[0] + w_chosen[1] - weight(a, sa, fa) - wo + ins_ll(s0, s1) - ins_chosen);
+        }
     };
     // 1. The lister's copies, each with the other mate's chosen locus or its copies nearby.
     let mut listed = 0usize;
@@ -6585,9 +6642,12 @@ fn plink_competition<D: FlexalignDatabase>(
             let t = chosen[a].2 + mm(o, so, fo);
             q0 += (t <= total) as usize;
             q1 += (t == total + 1) as usize;
-            if t <= total + 3 { deltas.borrow_mut().push(t as i64 - total as i64); }
+            if t <= total + 3 {
+                deltas.borrow_mut().push(t as i64 - total as i64);
+                llrs.borrow_mut().push(w_chosen[o] - weight(o, so, fo) + ins_ll(s0, s1) - ins_chosen);
+            }
         }
     }
     let d = deltas.into_inner();
-    (q0, q1, d)
+    (q0, q1, d, llrs.into_inner())
 }

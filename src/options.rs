@@ -687,6 +687,11 @@ pub struct Args {
     #[arg(long = "plink-model", action)]
     pub plink_model: bool,
 
+    /// FA_PLINK: the MAPQ is the posterior of the placed pair among the pairs the links know
+    /// (mismatches weighed by base quality, inserts by their density).
+    #[arg(long = "plink-posterior", action)]
+    pub plink_posterior: bool,
+
     #[arg(long = "plink-frac-w", default_value_t = 0.5)]
     pub plink_frac_w: f64,
 
