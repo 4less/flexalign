@@ -2235,6 +2235,11 @@ impl<
         {
             let cores = |sd: &[Seed]| { let mut q: Vec<(u32, u8)> = sd.iter().map(|x| (x.qpos, x.length)).collect(); q.sort_unstable(); q.dedup(); q.len() };
             SEEDED_CORES.with(|c| c.set([cores(&seeds_fwd), cores(&seeds_rev)]));
+            // FA_FEAT_OUT: per mate k-mers, ranges found, cores cut, fewest copies of a range.
+            PAIR_FEATS.with(|c| c.set([
+                [n_kmers_fwd, ranges_fwd.len(), self.seed_extractor_fwd.last_ties().1, ranges_fwd.iter().map(|r| r.vrange.len()).min().unwrap_or(0)],
+                [n_kmers_rev, ranges_rev.len(), self.seed_extractor_rev.last_ties().1, ranges_rev.iter().map(|r| r.vrange.len()).min().unwrap_or(0)],
+            ]));
             // --near-min-agree: the share of a mate's seeded cores holding its most supported locus
             // (reference, read start in 8 bp buckets, either strand).
             if self.options.args.near_min_agree > 0.0 {
@@ -3843,9 +3848,40 @@ impl<
                         let fr = |lv: u8, sd: usize| uniq_track().map_or(0.0, |t| t.frac(lv, chosen[sd].0 as usize, chosen[sd].1.max(0) as usize, reads[sd].0.len()));
                         let ins = ((chosen[0].1 + reads[0].0.len() as i64).max(chosen[1].1 + reads[1].0.len() as i64) - chosen[0].1.min(chosen[1].1)).abs();
                         use std::io::Write;
-                        let _ = w.lock().unwrap().write_all(format!("{near_name}\t{pseudo_mapq}\t{}\t{le0}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{ins}\t{}\n",
+                        // The aligner's own view: each mate's alignment cost, clipped bases and
+                        // gaps; the candidate pairs aligned, the cost margin to the best one placed
+                        // elsewhere, and how many lie within two mismatches of the placed pair.
+                        let pf = PAIR_FEATS.with(|c| c.get());
+                        let acost = |a: &Anchor| (-(a.score as i64)).max(0);
+                        let shape = |a: Option<&Anchor>| -> (i64, usize, usize) {
+                            let Some(a) = a else { return (-1, 0, 0) };
+                            let c = a.cigar.as_ref().map(|c| &c.0[..]).unwrap_or(&[]);
+                            (acost(a), c.iter().filter(|&&o| o == b'S').count(), c.iter().filter(|&&o| o == b'I' || o == b'D').count())
+                        };
+                        let (sa, sb) = (shape(placed[0]), shape(placed[1]));
+                        let ok_a = |a: &Option<Anchor>| a.as_ref().filter(|a| a.score > -1_000_000 && a.cigar.is_some()).is_some();
+                        let pc = |p: &AnchorPair| -> Option<i64> {
+                            match (p.0.as_ref().filter(|a| a.score > -1_000_000 && a.cigar.is_some()), p.1.as_ref().filter(|a| a.score > -1_000_000 && a.cigar.is_some())) {
+                                (Some(x), Some(y)) => Some(acost(x) + acost(y) + crate::align::common::pair_insert_cost(x, y)),
+                                _ => None,
+                            }
+                        };
+                        let best_c = match (placed[0], placed[1]) { (Some(x), Some(y)) => acost(x) + acost(y) + crate::align::common::pair_insert_cost(x, y), _ => 0 };
+                        let (mut n_al, mut alt, mut n_close) = (0usize, i64::MAX, 0usize);
+                        for p in extension_anchors.iter() {
+                            n_al += (ok_a(&p.0) || ok_a(&p.1)) as usize;
+                            let Some(c) = pc(p) else { continue };
+                            let x = p.0.as_ref().unwrap();
+                            let near = placed[0].is_some_and(|a| a.reference == x.reference && a.reference_cigar_range.start.abs_diff(x.reference_cigar_range.start) < 1000);
+                            if near { continue; }
+                            alt = alt.min(c - best_c);
+                            n_close += (c - best_c <= 2 * penalties::MISMATCH as i64) as usize;
+                        }
+                        let _ = w.lock().unwrap().write_all(format!("{near_name}\t{pseudo_mapq}\t{}\t{le0}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{ins}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                             deltas.iter().copied().min().unwrap_or(9), cnt(1), cnt(2), cnt(3), fr(3, 0), fr(3, 1), fr(2, 0), fr(2, 1),
-                            chosen[0].2, chosen[1].2, sc[0].min(99), sc[1].min(99), (chosen[0].0 == chosen[1].0) as u8).as_bytes());
+                            chosen[0].2, chosen[1].2, sc[0].min(99), sc[1].min(99), (chosen[0].0 == chosen[1].0) as u8,
+                            sa.0, sb.0, sa.1, sb.1, sa.2, sb.2, n_al, if alt == i64::MAX { 999 } else { alt.clamp(-99, 998) }, n_close,
+                            pf[0][0], pf[1][0], pf[0][1], pf[1][1], pf[0][2], pf[1][2], pf[0][3], pf[1][3], extension_anchors.len()).as_bytes());
                     }
                     // --plink-model: the MAPQ as minibwa builds it, from what the links and the
                     // track know: the margin to the best other pair (30 a mismatch), less
@@ -5292,6 +5328,11 @@ fn near2_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
         .as_ref()
 }
 
+fn plink_parts() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("FA_PLINK_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
+}
+
 fn feat_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
     static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
     W.get_or_init(|| std::env::var_os("FA_FEAT_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(p).expect("FA_FEAT_OUT file")))))
@@ -5349,6 +5390,7 @@ fn fm_trace() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::Fi
 thread_local! {
     static SEEDED_CORES: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([usize::MAX, usize::MAX]) };
     static SEED_AGREE: std::cell::Cell<[f64; 2]> = const { std::cell::Cell::new([1.0, 1.0]) };
+    static PAIR_FEATS: std::cell::Cell<[[usize; 4]; 2]> = const { std::cell::Cell::new([[0; 4]; 2]) };
 }
 
 thread_local! {
@@ -6422,19 +6464,33 @@ fn plink_competition<D: FlexalignDatabase>(
         let len = lens[side];
         let g0 = pl.ref_off[chosen[side].0 as usize] as i64 + chosen[side].1;
         gstart[side] = g0;
-        let third = (len / 3).max(8);
-        for part in 0..3 {
-            let mut b = (g0 + part * third) / 8;
-            let end = (g0 + ((part + 1) * third).min(len - 31).max(0)) / 8;
-            while b <= end {
+        // FA_PLINK_PARTS: how many stretches of the read each give one linked position (default
+        // 3; 0 = every linked position under the read).
+        let parts = plink_parts();
+        if parts == 0 {
+            for b in g0 / 8..=(g0 + len - 31).max(g0) / 8 {
                 if let Some(&(ci, me)) = pl.map.get(&(b as u64)) {
                     let p = (me >> 1) as i64;
-                    if p >= g0 && p + 31 <= g0 + len && !srcs[side].iter().any(|x| x.0 == ci) {
+                    if p >= g0 && p + 31 <= g0 + len && !srcs[side].iter().any(|x| x.0 == ci) && srcs[side].len() < 32 {
                         srcs[side].push((ci, me));
-                        break;
                     }
                 }
-                b += 1;
+            }
+        } else {
+            let third = (len / parts).max(8);
+            for part in 0..parts {
+                let mut b = (g0 + part * third) / 8;
+                let end = (g0 + ((part + 1) * third).min(len - 31).max(0)) / 8;
+                while b <= end {
+                    if let Some(&(ci, me)) = pl.map.get(&(b as u64)) {
+                        let p = (me >> 1) as i64;
+                        if p >= g0 && p + 31 <= g0 + len && !srcs[side].iter().any(|x| x.0 == ci) {
+                            srcs[side].push((ci, me));
+                            break;
+                        }
+                    }
+                    b += 1;
+                }
             }
         }
     }
@@ -6497,7 +6553,7 @@ fn plink_competition<D: FlexalignDatabase>(
         for &m in pl.class(ci) {
             if m == me { continue; }
             listed += 1;
-            if listed > max_list || tried >= 256 { break 'list; }
+            if listed > max_list || tried >= 1024 { break 'list; }
             let (sa, fa) = alt(a, me, m);
             if (gstart[o] - sa).abs() <= 1200 {
                 tried += 1;
