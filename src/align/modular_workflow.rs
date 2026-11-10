@@ -6013,3 +6013,128 @@ pub fn build_flankext<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: us
     };
     FlankExt::assemble(brackets.to_vec(), lengths.to_vec(), index_bytes, &cores, threads, &fill)
 }
+
+/// `FA_UNIQ_OUT=<prefix>`: the reference uniqueness track, from the built index. Every index
+/// position gets the widest window (63 / 95 / 127 / 151 bp around its 31-mer, strand-free) that is
+/// still identical to another index position's: 1 = unique at 63 bp, 2 = tied at 63, 3 = at 95,
+/// 4 = at 127, 5 = at 151. Written per reference as one byte per 8 bp (the largest value of the
+/// bucket's positions; 0 = no index position there): `<prefix>.bin`, with `<prefix>.names.tsv`
+/// (id, name, length, byte offset).
+pub fn index_uniq_track<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize, prefix: &str) {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+    const EXT: [usize; 4] = [16, 32, 48, 60];
+    let mut lens = Vec::new();
+    while let Some(rv) = db.get_reference(lens.len()) {
+        lens.push(rv.len());
+    }
+    crate::database::refseq2::reset_scratch();
+    let mut offs = Vec::with_capacity(lens.len() + 1);
+    let mut total = 0usize;
+    for &l in &lens {
+        offs.push(total);
+        total += l / 8 + 1;
+    }
+    let track: Vec<AtomicU8> = (0..total).map(|_| AtomicU8::new(0)).collect();
+    let keys = 1u64 << (2 * c);
+    let next = AtomicU64::new(0);
+    let started = std::time::Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..threads.max(1) {
+            sc.spawn(|| {
+                let comp = |b: u8| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x };
+                let set = |v: u64, p: u64, level: u8| {
+                    if let Some(&o) = offs.get(v as usize) {
+                        track[o + (p as usize) / 8].fetch_max(level, Relaxed);
+                    }
+                };
+                loop {
+                    let k0 = next.fetch_add(1 << 14, Relaxed);
+                    if k0 >= keys {
+                        break;
+                    }
+                    for key in k0..(k0 + (1 << 14)).min(keys) {
+                        let Some(r) = db.get_vrange(key) else { continue };
+                        let n = r.len();
+                        // Start groups: identical flank cells (identical 31-mers); a range without
+                        // flank cells is one group.
+                        let mut groups: Vec<Vec<usize>> = Vec::new();
+                        match &r {
+                            flexmap::range::AnyRange::Packed(p) if r.has_header() => {
+                                let mut idx: Vec<(u32, usize)> = p.flex_bytes().chunks_exact(4).enumerate()
+                                    .map(|(i, b)| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]), i)).collect();
+                                idx.sort_unstable();
+                                let mut i = 0;
+                                while i < idx.len() {
+                                    let mut j = i + 1;
+                                    while j < idx.len() && idx[j].0 == idx[i].0 { j += 1; }
+                                    if j - i >= 2 {
+                                        groups.push(idx[i..j].iter().map(|x| x.1).collect());
+                                    } else {
+                                        let (v, p) = r.value(idx[i].1);
+                                        set(v, p, 1);
+                                    }
+                                    i = j;
+                                }
+                            }
+                            _ => {
+                                if n >= 2 { groups.push((0..n).collect()); } else if n == 1 { let (v, p) = r.value(0); set(v, p, 1); }
+                            }
+                        }
+                        for (li, &e) in EXT.iter().enumerate() {
+                            if groups.is_empty() {
+                                break;
+                            }
+                            let mut next_groups = Vec::new();
+                            for g in groups {
+                                let mut win: Vec<(Vec<u8>, usize)> = Vec::with_capacity(g.len());
+                                for &ci in &g {
+                                    let (v, p) = r.value(ci);
+                                    let w = db.get_reference(v as usize).and_then(|rv| {
+                                        let (a, b) = (p as i64 - e as i64, p as i64 + 31 + e as i64);
+                                        if a < 0 || b as usize > rv.len() { return None; }
+                                        let f = rv.window(a as usize..b as usize).to_vec();
+                                        let rc: Vec<u8> = f.iter().rev().map(|&x| comp(x)).collect();
+                                        Some(f.min(rc))
+                                    });
+                                    match w {
+                                        Some(w) => win.push((w, ci)),
+                                        None => { set(v, p, li as u8 + 1); }
+                                    }
+                                }
+                                crate::database::refseq2::reset_scratch();
+                                win.sort_unstable();
+                                let mut i = 0;
+                                while i < win.len() {
+                                    let mut j = i + 1;
+                                    while j < win.len() && win[j].0 == win[i].0 { j += 1; }
+                                    if j - i >= 2 {
+                                        if li + 1 == EXT.len() {
+                                            for x in &win[i..j] { let (v, p) = r.value(x.1); set(v, p, li as u8 + 2); }
+                                        } else {
+                                            next_groups.push(win[i..j].iter().map(|x| x.1).collect());
+                                        }
+                                    } else {
+                                        let (v, p) = r.value(win[i].1);
+                                        set(v, p, li as u8 + 1);
+                                    }
+                                    i = j;
+                                }
+                            }
+                            groups = next_groups;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    use std::io::Write;
+    let bytes: Vec<u8> = track.iter().map(|x| x.load(Relaxed)).collect();
+    std::fs::write(format!("{prefix}.bin"), &bytes).expect("FA_UNIQ_OUT bin");
+    let mut w = std::io::BufWriter::new(std::fs::File::create(format!("{prefix}.names.tsv")).expect("FA_UNIQ_OUT names"));
+    for (id, &l) in lens.iter().enumerate() {
+        let _ = writeln!(w, "{id}\t{}\t{l}\t{}", db.get_rname(id).unwrap_or("?"), offs[id]);
+    }
+    let mut hist = [0u64; 6];
+    for &b in &bytes { hist[(b as usize).min(5)] += 1; }
+    eprintln!("[uniq] {} buckets in {:.0} s: none {}, unique@63 {}, tied@63 {}, @95 {}, @127 {}, @151 {}", bytes.len(), started.elapsed().as_secs_f64(), hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+}
