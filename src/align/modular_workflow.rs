@@ -3794,9 +3794,21 @@ impl<
         // whose placement rests on too little evidence).
         // and --near-min-agree X: or a mate whose seeded cores agree on its locus less than X.
         let (nseeded, agree) = (self.options.args.near_max_seeded, self.options.args.near_min_agree);
-        let few_seeds = (nseeded == 0 && agree <= 0.0)
+        // FA_UNIQ=<prefix> with --near-uniq R: the reference uniqueness track decides instead. A
+        // pair is checked when its less ambiguous mate still lies in sequence of rank <= R
+        // (0 = an exact copy at 151 bp, 1 = half tied at 95 bp, 2 = half tied at 63 bp).
+        let uniq_hit = uniq_track().map(|t| {
+            let rank = |a: Option<&Anchor>, len: usize| -> u8 {
+                let Some(a) = a.filter(|a| a.cigar.is_some()) else { return 4 };
+                let lead = a.cigar.as_ref().unwrap().0.iter().take_while(|&&o| o == b'S').count() as i64;
+                t.rank(a.reference as usize, (a.reference_cigar_range.start as i64 - lead).max(0) as usize, len)
+            };
+            let r = rank(fwd_anchor, rec_fwd.seq().len()).max(rank(rev_anchor, rec_rev.seq().len()));
+            r <= self.options.args.near_uniq
+        });
+        let few_seeds = if let Some(h) = uniq_hit { h } else { (nseeded == 0 && agree <= 0.0)
             || (nseeded > 0 && SEEDED_CORES.with(|c| c.get()).iter().any(|&n| n < nseeded))
-            || (agree > 0.0 && SEED_AGREE.with(|c| c.get()).iter().any(|&a| a < agree));
+            || (agree > 0.0 && SEED_AGREE.with(|c| c.get()).iter().any(|&a| a < agree)) };
         if self.options.args.near_pairs > 0 && pseudo_mapq > 0 && few_seeds {
             let placed = [fwd_anchor, rev_anchor];
             let reads = [(rec_fwd.seq(), self.rec_fwd_revc.seq()), (rec_rev.seq(), self.rec_rev_revc.seq())];
@@ -6137,4 +6149,45 @@ pub fn index_uniq_track<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: 
     let mut hist = [0u64; 6];
     for &b in &bytes { hist[(b as usize).min(5)] += 1; }
     eprintln!("[uniq] {} buckets in {:.0} s: none {}, unique@63 {}, tied@63 {}, @95 {}, @127 {}, @151 {}", bytes.len(), started.elapsed().as_secs_f64(), hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+}
+
+/// The reference uniqueness track (`FA_UNIQ=<prefix>`, written by `FA_UNIQ_OUT`).
+pub struct UniqTrack {
+    bytes: Vec<u8>,
+    refs: Vec<(usize, usize)>, // (byte offset, length) by reference id
+}
+
+impl UniqTrack {
+    /// How ambiguous the reference is under a read of `len` at `start`: 0 = an exact copy at
+    /// 151 bp, 1 = half its positions tied at 95 bp, 2 = half tied at 63 bp, 3 = some tied at
+    /// 63 bp, 4 = all unique. No index position under the read counts as 0.
+    pub fn rank(&self, id: usize, start: usize, len: usize) -> u8 {
+        let Some(&(o, l)) = self.refs.get(id) else { return 4 };
+        let (s, e) = (start.min(l), (start + len).min(l));
+        let b = &self.bytes[o + s / 8..(o + e.div_ceil(8)).min(self.bytes.len())];
+        let (mut known, mut t95, mut t63) = (0usize, 0usize, 0usize);
+        for &x in b {
+            known += (x > 0) as usize;
+            t95 += (x >= 3) as usize;
+            t63 += (x >= 2) as usize;
+        }
+        if known == 0 {
+            return 0;
+        }
+        let mid = &self.bytes[(o + (s + 40) / 8).min(self.bytes.len())..(o + (s + 90) / 8 + 1).min(self.bytes.len())];
+        if mid.contains(&5) { 0 } else if 2 * t95 >= known { 1 } else if 2 * t63 >= known { 2 } else if t63 > 0 { 3 } else { 4 }
+    }
+}
+
+fn uniq_track() -> Option<&'static UniqTrack> {
+    static T: std::sync::OnceLock<Option<UniqTrack>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let p = std::env::var("FA_UNIQ").ok()?;
+        let bytes = std::fs::read(format!("{p}.bin")).ok()?;
+        let refs = std::fs::read_to_string(format!("{p}.names.tsv")).ok()?.lines().map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[3].parse().unwrap_or(0), f[2].parse().unwrap_or(0))
+        }).collect();
+        Some(UniqTrack { bytes, refs })
+    }).as_ref()
 }

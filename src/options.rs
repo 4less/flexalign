@@ -674,6 +674,10 @@ pub struct Args {
     #[arg(long = "near-min-agree", default_value_t = 0.0)]
     pub near_min_agree: f64,
 
+    /// With FA_UNIQ: check pairs whose less ambiguous mate has uniqueness rank <= this.
+    #[arg(long = "near-uniq", default_value_t = 2)]
+    pub near_uniq: u8,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 
