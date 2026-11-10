@@ -679,7 +679,7 @@ pub struct Args {
     pub near_uniq: u8,
 
     /// FA_PLINK: a class of more copies than this is not listed (both mates in such classes: a tie).
-    #[arg(long = "plink-max-class", default_value_t = 256)]
+    #[arg(long = "plink-max-class", default_value_t = 4096)]
     pub plink_max_class: usize,
 
     #[arg(long = "near-tie-mapq", default_value_t = 0)]

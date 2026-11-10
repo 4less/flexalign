@@ -3833,10 +3833,9 @@ impl<
                 let (q0, q1) = if let Some(pl) = PLINKS.get() {
                     let fwd_placed = [placed[0].map_or(true, |a| a.forward), placed[1].map_or(true, |a| a.forward)];
                     let seqs = [0, 1].map(|sd| if fwd_placed[sd] { (reads[sd].0, reads[sd].1) } else { (reads[sd].1, reads[sd].0) });
-                    let (q0, q1, both_big) = plink_competition(self.db, pl, seqs, chosen, self.options.args.plink_max_class);
+                    let (q0, q1) = plink_competition(self.db, pl, seqs, fwd_placed, chosen, self.options.args.plink_max_class);
                     stats.plink_pairs += 1;
-                    stats.plink_big += both_big as usize;
-                    (q0 + both_big as usize, q1)
+                    (q0, q1)
                 } else {
                     near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac, self.options.args.near_slack)
                 };
@@ -5188,6 +5187,7 @@ pub mod fm_time {
     pub static FE_HAM_NS: AtomicU64 = AtomicU64::new(0);
     pub static FE_HAM_N: AtomicU64 = AtomicU64::new(0);
     pub static FE_DISTINCT_N: AtomicU64 = AtomicU64::new(0);
+    pub static PLINK_NS: AtomicU64 = AtomicU64::new(0);
     thread_local! { static IS_FM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5248,6 +5248,7 @@ pub mod fm_time {
         eprintln!("[fm-time] flank ext: select {:.2} s; store {:.2} s for {} copies ({:.1} ns a copy, {} from the reference); whole read {:.2} s for {} copies ({:.1} ns a copy)",
             s(&FE_SELECT_NS), s(&FE_STORE_NS), FE_STORE_N.load(Relaxed), per(&FE_STORE_NS, &FE_STORE_N), FE_FALLBACK_N.load(Relaxed),
             s(&FE_HAM_NS), FE_HAM_N.load(Relaxed), per(&FE_HAM_NS, &FE_HAM_N));
+        eprintln!("[fm-time] paralog-link check: {:.2} thread-s", s(&PLINK_NS));
         eprintln!("[fm-time] flank ext: distinct stored windows among the compared copies: {}", FE_DISTINCT_N.load(Relaxed));
         eprintln!("[fm-time] FM block {:.1} s: search+locate {:.1} (locate {:.1}), Hamming {:.1}",
             s(&FM_BLOCK_NS), s(&SEARCH_NS), s(&LOCATE_NS), s(&HAMMING_NS));
@@ -6337,23 +6338,23 @@ impl PLinks {
 }
 
 /// With paralog links: does another pair of loci fit the read pair as well as the chosen one?
-/// Each mate's alternative loci come from the classes of up to three index positions under it
-/// (the copies its 95 bp windows are identical to), mapped to read starts; pairs of an alternative
-/// with the other mate's alternative or chosen locus within 1 kb are compared with both whole
-/// reads. Returns (pairs at the chosen mismatches or fewer, pairs at +1, both mates in classes too
-/// large to list).
+/// A mate's alternative loci are the copies its 95 bp windows are identical to (the classes of up
+/// to three index positions under it), mapped to read starts. The mate with fewer copies lists
+/// them; each is paired with the other mate's chosen locus or with its copies near it (a binary
+/// search in the class, so a class of any size costs a search, not a scan). A pair must face
+/// inward-consistent strands and a plausible insert; both whole reads are then compared.
+/// Returns (pairs at the chosen mismatches or fewer, pairs at +1).
 fn plink_competition<D: FlexalignDatabase>(
-    db: &D, pl: &PLinks, seqs: [(&[u8], &[u8]); 2], chosen: [(u64, i64, usize); 2], max_class: usize,
-) -> (usize, usize, bool) {
-    // Per mate: alternative (global start, uses the other strand's sequence), or too many.
-    let mut alts: [Vec<(i64, bool)>; 2] = [Vec::new(), Vec::new()];
-    let mut big = [false, false];
+    db: &D, pl: &PLinks, seqs: [(&[u8], &[u8]); 2], fwd: [bool; 2], chosen: [(u64, i64, usize); 2], max_list: usize,
+) -> (usize, usize) {
+    let _t = fm_time::Span::new(&fm_time::PLINK_NS);
+    let lens = [seqs[0].0.len() as i64, seqs[1].0.len() as i64];
     let mut gstart = [0i64; 2];
+    let mut srcs: [Vec<(u32, u64)>; 2] = [Vec::new(), Vec::new()];
     for side in 0..2 {
-        let len = seqs[side].0.len() as i64;
+        let len = lens[side];
         let g0 = pl.ref_off[chosen[side].0 as usize] as i64 + chosen[side].1;
         gstart[side] = g0;
-        let mut seen: Vec<u32> = Vec::new();
         let third = (len / 3).max(8);
         for part in 0..3 {
             let mut b = (g0 + part * third) / 8;
@@ -6361,35 +6362,40 @@ fn plink_competition<D: FlexalignDatabase>(
             while b <= end {
                 if let Some(&(ci, me)) = pl.map.get(&(b as u64)) {
                     let p = (me >> 1) as i64;
-                    if p >= g0 && p + 31 <= g0 + len && !seen.contains(&ci) {
-                        seen.push(ci);
-                        let cl = pl.class(ci);
-                        if cl.len() > max_class {
-                            big[side] = true;
-                        } else {
-                            for &m in cl {
-                                if m == me { continue; }
-                                let q = (m >> 1) as i64;
-                                let flipped = (m & 1) != (me & 1);
-                                let st = if flipped { q + 31 + p - g0 - len } else { q - (p - g0) };
-                                alts[side].push((st, flipped));
-                            }
-                        }
+                    if p >= g0 && p + 31 <= g0 + len && !srcs[side].iter().any(|x| x.0 == ci) {
+                        srcs[side].push((ci, me));
                         break;
                     }
                 }
                 b += 1;
             }
         }
-        alts[side].sort_unstable();
-        alts[side].dedup_by(|a, b| a.1 == b.1 && (a.0 - b.0).abs() <= 4);
     }
+    if srcs[0].is_empty() && srcs[1].is_empty() {
+        return (0, 0);
+    }
+    // The read start an identical copy `m` of the position `me` implies, and whether it is on the
+    // other strand.
+    let alt = |side: usize, me: u64, m: u64| -> (i64, bool) {
+        let (p, q) = ((me >> 1) as i64, (m >> 1) as i64);
+        let flipped = (m & 1) != (me & 1);
+        (if flipped { q + 31 + p - gstart[side] - lens[side] } else { q - (p - gstart[side]) }, flipped)
+    };
+    let size = |side: usize| -> usize { srcs[side].iter().map(|x| pl.class(x.0).len()).sum() };
+    // The lister: the mate with copies, the fewer of the two.
+    let a = if srcs[1].is_empty() || (!srcs[0].is_empty() && size(0) <= size(1)) { 0 } else { 1 };
+    let o = 1 - a;
     let total = chosen[0].2 + chosen[1].2;
+    let (mean, sd) = crate::align::common::INSERT_STATS.get().copied().unwrap_or((0.0, 0.0));
+    let plausible = |s0: i64, s1: i64| -> bool {
+        let ins = (s0 + lens[0]).max(s1 + lens[1]) - s0.min(s1);
+        if sd > 0.0 { (ins as f64 - mean).abs() <= 4.0 * sd + 20.0 } else { ins <= 1000 }
+    };
     let mut memo: Vec<((usize, i64, bool), usize)> = Vec::new();
     let mut mm = |side: usize, st: i64, flipped: bool| -> usize {
         if let Some(e) = memo.iter().find(|e| e.0 == (side, st, flipped)) { return e.1; }
-        let (a, b) = seqs[side];
-        let s = if flipped { b } else { a };
+        let (x, y) = seqs[side];
+        let s = if flipped { y } else { x };
         let m = if st < 0 { usize::MAX / 4 } else {
             let (id, lp) = pl.local(st as u64);
             match db.get_reference(id) {
@@ -6401,28 +6407,59 @@ fn plink_competition<D: FlexalignDatabase>(
         m
     };
     let (mut q0, mut q1, mut tried) = (0usize, 0usize, 0usize);
-    // An alternative of one mate with the other mate's alternatives or its chosen locus.
-    for side in 0..2 {
-        let o = 1 - side;
-        for i in 0..alts[side].len() {
-            let (st, fl) = alts[side][i];
-            let mut partners: Vec<(i64, bool, Option<usize>)> = Vec::new();
-            if (gstart[o] - st).abs() <= 1000 { partners.push((gstart[o], false, Some(chosen[o].2))); }
-            if side == 0 {
-                let lo = alts[o].partition_point(|x| x.0 < st - 1000);
-                for &(s2, f2) in alts[o][lo..].iter().take_while(|x| x.0 <= st + 1000) { partners.push((s2, f2, None)); }
-            }
-            for (s2, f2, known) in partners {
-                if tried >= 256 { break; }
+    let mut seen: Vec<(i64, i64)> = Vec::new();
+    let mut judge = |sa: i64, fa: bool, so: i64, fo: bool, known_o: Option<usize>, mm: &mut dyn FnMut(usize, i64, bool) -> usize| {
+        // Strands: the pair keeps facing as placed only when both or neither mate flips.
+        if fa != fo && (fwd[a] != fwd[o]) { /* a flip of one mate of an FR pair makes it FF/RR */ return; }
+        if fa != fo { return; }
+        let (s0, s1) = if a == 0 { (sa, so) } else { (so, sa) };
+        if !plausible(s0, s1) || seen.iter().any(|x| (x.0 - sa).abs() <= 4 && (x.1 - so).abs() <= 4) { return; }
+        seen.push((sa, so));
+        let m1 = mm(a, sa, fa);
+        if m1 > total + 1 { return; }
+        let t = m1 + known_o.unwrap_or_else(|| mm(o, so, fo));
+        q0 += (t <= total) as usize;
+        q1 += (t == total + 1) as usize;
+    };
+    // 1. The lister's copies, each with the other mate's chosen locus or its copies nearby.
+    let mut listed = 0usize;
+    'list: for &(ci, me) in &srcs[a] {
+        for &m in pl.class(ci) {
+            if m == me { continue; }
+            listed += 1;
+            if listed > max_list || tried >= 256 { break 'list; }
+            let (sa, fa) = alt(a, me, m);
+            if (gstart[o] - sa).abs() <= 1200 {
                 tried += 1;
-                let m1 = mm(side, st, fl);
-                if m1 > total + 1 { break; }
-                let m2 = known.unwrap_or_else(|| mm(o, s2, f2));
-                let t = m1 + m2;
-                q0 += (t <= total) as usize;
-                q1 += (t == total + 1) as usize;
+                judge(sa, fa, gstart[o], false, Some(chosen[o].2), &mut mm);
+            }
+            for &(cj, me2) in &srcs[o] {
+                let cl = pl.class(cj);
+                let lo = cl.partition_point(|&x| ((x >> 1) as i64) < sa - 1400);
+                for &m2 in cl[lo..].iter().take_while(|&&x| ((x >> 1) as i64) <= sa + 1400) {
+                    if m2 == me2 { continue; }
+                    let (so, fo) = alt(o, me2, m2);
+                    tried += 1;
+                    judge(sa, fa, so, fo, None, &mut mm);
+                }
             }
         }
     }
-    (q0, q1, big[0] && big[1])
+    // 2. The other mate's copies near the lister's chosen locus.
+    for &(cj, me2) in &srcs[o] {
+        let cl = pl.class(cj);
+        let lo = cl.partition_point(|&x| ((x >> 1) as i64) < gstart[a] - 1400);
+        for &m2 in cl[lo..].iter().take_while(|&&x| ((x >> 1) as i64) <= gstart[a] + 1400) {
+            if m2 == me2 { continue; }
+            let (so, fo) = alt(o, me2, m2);
+            // Roles swapped: the chosen lister with an alternative of the other mate.
+            if fo { continue; }
+            let (s0, s1) = if a == 0 { (gstart[a], so) } else { (so, gstart[a]) };
+            if !plausible(s0, s1) { continue; }
+            let t = chosen[a].2 + mm(o, so, fo);
+            q0 += (t <= total) as usize;
+            q1 += (t == total + 1) as usize;
+        }
+    }
+    (q0, q1)
 }
