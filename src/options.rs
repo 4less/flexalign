@@ -682,6 +682,14 @@ pub struct Args {
     #[arg(long = "plink-max-class", default_value_t = 4096)]
     pub plink_max_class: usize,
 
+    /// FA_PLINK: MAPQ from the margin to the best other pair, the count of near pairs and the
+    /// repeated share of both mates (see --plink-frac-w), instead of the tie / +1 caps.
+    #[arg(long = "plink-model", action)]
+    pub plink_model: bool,
+
+    #[arg(long = "plink-frac-w", default_value_t = 0.5)]
+    pub plink_frac_w: f64,
+
     #[arg(long = "near-tie-mapq", default_value_t = 0)]
     pub near_tie_mapq: u8,
 

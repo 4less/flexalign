@@ -3833,9 +3833,28 @@ impl<
                 let (q0, q1) = if let Some(pl) = PLINKS.get() {
                     let fwd_placed = [placed[0].map_or(true, |a| a.forward), placed[1].map_or(true, |a| a.forward)];
                     let seqs = [0, 1].map(|sd| if fwd_placed[sd] { (reads[sd].0, reads[sd].1) } else { (reads[sd].1, reads[sd].0) });
-                    let (q0, q1) = plink_competition(self.db, pl, seqs, fwd_placed, chosen, self.options.args.plink_max_class);
+                    let (q0, q1, deltas) = plink_competition(self.db, pl, seqs, fwd_placed, chosen, self.options.args.plink_max_class);
                     stats.plink_pairs += 1;
-                    (q0, q1)
+                    // --plink-model: the MAPQ as minibwa builds it, from what the links and the
+                    // track know: the margin to the best other pair (30 a mismatch), less
+                    // 4.343 ln(1 + other pairs within +3), scaled by how much of both mates lies
+                    // in sequence repeated at 95 bp (1 - w (f1 + f2)).
+                    if self.options.args.plink_model {
+                        let margin = deltas.iter().copied().min().map_or(60.0, |d| 30.0 * d.max(0) as f64);
+                        let mut m = (margin - 4.343 * ((1 + deltas.len()) as f64).ln()).max(0.0);
+                        if let Some(t) = uniq_track() {
+                            let f: f64 = (0..2).map(|sd| t.frac95(chosen[sd].0 as usize, chosen[sd].1.max(0) as usize, reads[sd].0.len())).sum();
+                            m *= (1.0 - self.options.args.plink_frac_w * f).max(0.0);
+                        }
+                        let cap = (m.round() as u8).max(if q0 > 0 { 0 } else { 1 });
+                        if cap < pseudo_mapq {
+                            pseudo_mapq = cap;
+                            stats.near_mapq_lowered += 1;
+                        }
+                        (0, 0)
+                    } else {
+                        (q0, q1)
+                    }
                 } else {
                     near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac, self.options.args.near_slack)
                 };
@@ -6189,6 +6208,18 @@ impl UniqTrack {
     }
 }
 
+impl UniqTrack {
+    /// The share of the known buckets under a read that are tied at 95 bp or wider.
+    pub fn frac95(&self, id: usize, start: usize, len: usize) -> f64 {
+        let Some(&(o, l)) = self.refs.get(id) else { return 0.0 };
+        let (s, e) = (start.min(l), (start + len).min(l));
+        let b = &self.bytes[o + s / 8..(o + e.div_ceil(8)).min(self.bytes.len())];
+        let known = b.iter().filter(|&&x| x > 0).count();
+        if known == 0 { return 1.0; }
+        b.iter().filter(|&&x| x >= 3).count() as f64 / known as f64
+    }
+}
+
 fn uniq_track() -> Option<&'static UniqTrack> {
     static T: std::sync::OnceLock<Option<UniqTrack>> = std::sync::OnceLock::new();
     T.get_or_init(|| {
@@ -6346,7 +6377,7 @@ impl PLinks {
 /// Returns (pairs at the chosen mismatches or fewer, pairs at +1).
 fn plink_competition<D: FlexalignDatabase>(
     db: &D, pl: &PLinks, seqs: [(&[u8], &[u8]); 2], fwd: [bool; 2], chosen: [(u64, i64, usize); 2], max_list: usize,
-) -> (usize, usize) {
+) -> (usize, usize, Vec<i64>) {
     let _t = fm_time::Span::new(&fm_time::PLINK_NS);
     let lens = [seqs[0].0.len() as i64, seqs[1].0.len() as i64];
     let mut gstart = [0i64; 2];
@@ -6372,8 +6403,10 @@ fn plink_competition<D: FlexalignDatabase>(
         }
     }
     if srcs[0].is_empty() && srcs[1].is_empty() {
-        return (0, 0);
+        return (0, 0, Vec::new());
     }
+    // Mismatches over the chosen pair's of every alternative pair within +3.
+    let deltas = std::cell::RefCell::new(Vec::<i64>::new());
     // The read start an identical copy `m` of the position `me` implies, and whether it is on the
     // other strand.
     let alt = |side: usize, me: u64, m: u64| -> (i64, bool) {
@@ -6399,7 +6432,7 @@ fn plink_competition<D: FlexalignDatabase>(
         let m = if st < 0 { usize::MAX / 4 } else {
             let (id, lp) = pl.local(st as u64);
             match db.get_reference(id) {
-                Some(rv) if lp as usize + s.len() <= rv.len() => rv.mismatches(lp as usize, s, &pack2(s), total + 2),
+                Some(rv) if lp as usize + s.len() <= rv.len() => rv.mismatches(lp as usize, s, &pack2(s), total + 4),
                 _ => usize::MAX / 4,
             }
         };
@@ -6416,10 +6449,11 @@ fn plink_competition<D: FlexalignDatabase>(
         if !plausible(s0, s1) || seen.iter().any(|x| (x.0 - sa).abs() <= 4 && (x.1 - so).abs() <= 4) { return; }
         seen.push((sa, so));
         let m1 = mm(a, sa, fa);
-        if m1 > total + 1 { return; }
+        if m1 > total + 3 { return; }
         let t = m1 + known_o.unwrap_or_else(|| mm(o, so, fo));
         q0 += (t <= total) as usize;
         q1 += (t == total + 1) as usize;
+        if t <= total + 3 { deltas.borrow_mut().push(t as i64 - total as i64); }
     };
     // 1. The lister's copies, each with the other mate's chosen locus or its copies nearby.
     let mut listed = 0usize;
@@ -6459,7 +6493,9 @@ fn plink_competition<D: FlexalignDatabase>(
             let t = chosen[a].2 + mm(o, so, fo);
             q0 += (t <= total) as usize;
             q1 += (t == total + 1) as usize;
+            if t <= total + 3 { deltas.borrow_mut().push(t as i64 - total as i64); }
         }
     }
-    (q0, q1)
+    let d = deltas.into_inner();
+    (q0, q1, d)
 }
