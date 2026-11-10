@@ -220,6 +220,12 @@ pub fn run(args: Args) {
         },
     };
 
+    if std::env::var_os("FA_PLINK").is_some() {
+        let started = Instant::now();
+        let pl = crate::align::modular_workflow::PLinks::build(&db, C, options.args.threads.max(1) as usize);
+        eprintln!("[plink] built in {:.1} s: {}", started.elapsed().as_secs_f64(), pl.summary());
+        let _ = crate::align::modular_workflow::PLINKS.set(pl);
+    }
     if let Ok(p) = std::env::var("FA_UNIQ_OUT") {
         crate::align::modular_workflow::index_uniq_track(&db, C, options.args.threads.max(1) as usize, &p);
         return;

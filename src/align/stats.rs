@@ -144,6 +144,8 @@ pub struct Stats {
     pub fm_compared: usize,
     pub fm_located: usize,
     pub near_mapq_lowered: usize,
+    pub plink_pairs: usize,
+    pub plink_big: usize,
     pub flank_ext_ranges: usize,
     pub flank_ext_copies: usize,
     pub flank_ext_rescued: usize,
@@ -543,6 +545,8 @@ impl Merge for Stats {
         self.fm_compared += other.fm_compared;
         self.fm_located += other.fm_located;
         self.near_mapq_lowered += other.near_mapq_lowered;
+        self.plink_pairs += other.plink_pairs;
+        self.plink_big += other.plink_big;
         self.flank_ext_ranges += other.flank_ext_ranges;
         self.flank_ext_copies += other.flank_ext_copies;
         self.flank_ext_rescued += other.flank_ext_rescued;
@@ -610,7 +614,7 @@ impl Display for Stats {
                 self.flank_ext_ranges, self.flank_ext_copies, self.flank_ext_stored, self.flank_ext_rescued, self.flank_ext_seeds, self.flank_ext_mates_skipped, self.flank_ext_cores_skipped, self.flank_ext_hamming, self.flank_ext_level_compares)?;
         }
         if self.near_mapq_lowered > 0 {
-            writeln!(f, "Near pairs: MAPQ lowered {}", self.near_mapq_lowered)?;
+            writeln!(f, "Near pairs: MAPQ lowered {} (paralog-link pairs checked {}, both mates in large classes {})", self.near_mapq_lowered, self.plink_pairs, self.plink_big)?;
         }
         if self.fm_pairs > 0 {
             writeln!(f, "FM pairs: {}, rows located: {} ({} BWT steps), copies compared: {}, mates seeded: {}, ambiguous (> --fm-keep): {}, MAPQ lowered: {}",
@@ -880,6 +884,8 @@ impl Default for Stats {
             fm_compared: 0,
             fm_located: 0,
             near_mapq_lowered: 0,
+            plink_pairs: 0,
+            plink_big: 0,
             flank_ext_ranges: 0,
             flank_ext_copies: 0,
             flank_ext_rescued: 0,

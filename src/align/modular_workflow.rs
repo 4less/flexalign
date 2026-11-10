@@ -3830,7 +3830,16 @@ impl<
             if ok {
                 let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
                 let mut dist = Vec::new();
-                let (q0, q1) = near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac, self.options.args.near_slack);
+                let (q0, q1) = if let Some(pl) = PLINKS.get() {
+                    let fwd_placed = [placed[0].map_or(true, |a| a.forward), placed[1].map_or(true, |a| a.forward)];
+                    let seqs = [0, 1].map(|sd| if fwd_placed[sd] { (reads[sd].0, reads[sd].1) } else { (reads[sd].1, reads[sd].0) });
+                    let (q0, q1, both_big) = plink_competition(self.db, pl, seqs, chosen, self.options.args.plink_max_class);
+                    stats.plink_pairs += 1;
+                    stats.plink_big += both_big as usize;
+                    (q0 + both_big as usize, q1)
+                } else {
+                    near_pair_competition::<D, C, F>(self.db, reads, ranges, chosen, self.options.args.near_pairs, &mut dist, self.options.args.near_per_range, self.options.args.near_rare, self.options.args.near_min_frac, self.options.args.near_slack)
+                };
                 let cap = if q0 > 0 { self.options.args.near_tie_mapq } else if q1 > 0 { self.options.args.near_one_mapq } else { 255 };
                 if cap < pseudo_mapq {
                     pseudo_mapq = cap.max(if q0 > 0 { 0 } else { 1 });
@@ -6190,4 +6199,230 @@ fn uniq_track() -> Option<&'static UniqTrack> {
         }).collect();
         Some(UniqTrack { bytes, refs })
     }).as_ref()
+}
+
+/// Paralog links (`FA_PLINK`): for every index position whose 95 bp window (strand-free) is
+/// identical to another position's, the positions it is identical to. Built from the index at
+/// start-up (a prototype: a real version is a file next to the index).
+pub struct PLinks {
+    /// Global bp offset of each reference (one past the end last).
+    ref_off: Vec<u64>,
+    /// Global 8 bp bucket -> (class, the position there: global position << 1 | window was
+    /// reverse-complemented).
+    map: std::collections::HashMap<u64, (u32, u64)>,
+    class_start: Vec<u32>,
+    /// Per class its positions (global << 1 | flipped), sorted.
+    members: Vec<u64>,
+}
+
+pub static PLINKS: std::sync::OnceLock<PLinks> = std::sync::OnceLock::new();
+
+impl PLinks {
+    pub fn build<D: FlexalignDatabase + Sync>(db: &D, c: usize, threads: usize) -> PLinks {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        const EXT: [usize; 2] = [16, 32];
+        let mut ref_off = vec![0u64];
+        while let Some(rv) = db.get_reference(ref_off.len() - 1) {
+            ref_off.push(ref_off.last().unwrap() + rv.len() as u64);
+        }
+        crate::database::refseq2::reset_scratch();
+        let keys = 1u64 << (2 * c);
+        let next = AtomicU64::new(0);
+        let found = std::sync::Mutex::new(Vec::<Vec<u64>>::new());
+        std::thread::scope(|sc| {
+            for _ in 0..threads.max(1) {
+                sc.spawn(|| {
+                    let comp = |b: u8| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A', x => x };
+                    let mut local: Vec<Vec<u64>> = Vec::new();
+                    loop {
+                        let k0 = next.fetch_add(1 << 14, Relaxed);
+                        if k0 >= keys {
+                            break;
+                        }
+                        for key in k0..(k0 + (1 << 14)).min(keys) {
+                            let Some(r) = db.get_vrange(key) else { continue };
+                            let n = r.len();
+                            let mut groups: Vec<Vec<usize>> = Vec::new();
+                            match &r {
+                                flexmap::range::AnyRange::Packed(p) if r.has_header() => {
+                                    let mut idx: Vec<(u32, usize)> = p.flex_bytes().chunks_exact(4).enumerate()
+                                        .map(|(i, b)| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]), i)).collect();
+                                    idx.sort_unstable();
+                                    let mut i = 0;
+                                    while i < idx.len() {
+                                        let mut j = i + 1;
+                                        while j < idx.len() && idx[j].0 == idx[i].0 { j += 1; }
+                                        if j - i >= 2 { groups.push(idx[i..j].iter().map(|x| x.1).collect()); }
+                                        i = j;
+                                    }
+                                }
+                                _ => if n >= 2 { groups.push((0..n).collect()); },
+                            }
+                            for (li, &e) in EXT.iter().enumerate() {
+                                let mut next_groups: Vec<Vec<usize>> = Vec::new();
+                                for g in &groups {
+                                    // (window, copy, flipped)
+                                    let mut win: Vec<(Vec<u8>, usize, bool)> = Vec::with_capacity(g.len());
+                                    for &ci in g {
+                                        let (v, p) = r.value(ci);
+                                        if let Some(rv) = db.get_reference(v as usize) {
+                                            let (a, b) = (p as i64 - e as i64, p as i64 + 31 + e as i64);
+                                            if a >= 0 && b as usize <= rv.len() {
+                                                let f = rv.window(a as usize..b as usize).to_vec();
+                                                let rc: Vec<u8> = f.iter().rev().map(|&x| comp(x)).collect();
+                                                let flip = rc < f;
+                                                win.push((if flip { rc } else { f }, ci, flip));
+                                            }
+                                        }
+                                    }
+                                    crate::database::refseq2::reset_scratch();
+                                    win.sort_unstable();
+                                    let mut i = 0;
+                                    while i < win.len() {
+                                        let mut j = i + 1;
+                                        while j < win.len() && win[j].0 == win[i].0 { j += 1; }
+                                        if j - i >= 2 {
+                                            if li + 1 == EXT.len() {
+                                                let mut m: Vec<u64> = win[i..j].iter().map(|x| {
+                                                    let (v, p) = r.value(x.1);
+                                                    ((ref_off[v as usize] + p) << 1) | x.2 as u64
+                                                }).collect();
+                                                m.sort_unstable();
+                                                local.push(m);
+                                            } else {
+                                                next_groups.push(win[i..j].iter().map(|x| x.1).collect());
+                                            }
+                                        }
+                                        i = j;
+                                    }
+                                }
+                                groups = next_groups;
+                                if groups.is_empty() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    found.lock().unwrap().extend(local);
+                });
+            }
+        });
+        let classes = found.into_inner().unwrap();
+        let mut class_start = Vec::with_capacity(classes.len() + 1);
+        let mut members = Vec::with_capacity(classes.iter().map(|c| c.len()).sum());
+        let mut map = std::collections::HashMap::with_capacity(members.capacity());
+        for (ci, cl) in classes.iter().enumerate() {
+            class_start.push(members.len() as u32);
+            for &m in cl {
+                map.entry((m >> 1) / 8).or_insert((ci as u32, m));
+            }
+            members.extend_from_slice(cl);
+        }
+        class_start.push(members.len() as u32);
+        PLinks { ref_off, map, class_start, members }
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{} classes, {} positions, {} buckets", self.class_start.len() - 1, self.members.len(), self.map.len())
+    }
+
+    fn class(&self, c: u32) -> &[u64] {
+        &self.members[self.class_start[c as usize] as usize..self.class_start[c as usize + 1] as usize]
+    }
+
+    fn local(&self, g: u64) -> (usize, u64) {
+        let id = self.ref_off.partition_point(|&o| o <= g) - 1;
+        (id, g - self.ref_off[id])
+    }
+}
+
+/// With paralog links: does another pair of loci fit the read pair as well as the chosen one?
+/// Each mate's alternative loci come from the classes of up to three index positions under it
+/// (the copies its 95 bp windows are identical to), mapped to read starts; pairs of an alternative
+/// with the other mate's alternative or chosen locus within 1 kb are compared with both whole
+/// reads. Returns (pairs at the chosen mismatches or fewer, pairs at +1, both mates in classes too
+/// large to list).
+fn plink_competition<D: FlexalignDatabase>(
+    db: &D, pl: &PLinks, seqs: [(&[u8], &[u8]); 2], chosen: [(u64, i64, usize); 2], max_class: usize,
+) -> (usize, usize, bool) {
+    // Per mate: alternative (global start, uses the other strand's sequence), or too many.
+    let mut alts: [Vec<(i64, bool)>; 2] = [Vec::new(), Vec::new()];
+    let mut big = [false, false];
+    let mut gstart = [0i64; 2];
+    for side in 0..2 {
+        let len = seqs[side].0.len() as i64;
+        let g0 = pl.ref_off[chosen[side].0 as usize] as i64 + chosen[side].1;
+        gstart[side] = g0;
+        let mut seen: Vec<u32> = Vec::new();
+        let third = (len / 3).max(8);
+        for part in 0..3 {
+            let mut b = (g0 + part * third) / 8;
+            let end = (g0 + ((part + 1) * third).min(len - 31).max(0)) / 8;
+            while b <= end {
+                if let Some(&(ci, me)) = pl.map.get(&(b as u64)) {
+                    let p = (me >> 1) as i64;
+                    if p >= g0 && p + 31 <= g0 + len && !seen.contains(&ci) {
+                        seen.push(ci);
+                        let cl = pl.class(ci);
+                        if cl.len() > max_class {
+                            big[side] = true;
+                        } else {
+                            for &m in cl {
+                                if m == me { continue; }
+                                let q = (m >> 1) as i64;
+                                let flipped = (m & 1) != (me & 1);
+                                let st = if flipped { q + 31 + p - g0 - len } else { q - (p - g0) };
+                                alts[side].push((st, flipped));
+                            }
+                        }
+                        break;
+                    }
+                }
+                b += 1;
+            }
+        }
+        alts[side].sort_unstable();
+        alts[side].dedup_by(|a, b| a.1 == b.1 && (a.0 - b.0).abs() <= 4);
+    }
+    let total = chosen[0].2 + chosen[1].2;
+    let mut memo: Vec<((usize, i64, bool), usize)> = Vec::new();
+    let mut mm = |side: usize, st: i64, flipped: bool| -> usize {
+        if let Some(e) = memo.iter().find(|e| e.0 == (side, st, flipped)) { return e.1; }
+        let (a, b) = seqs[side];
+        let s = if flipped { b } else { a };
+        let m = if st < 0 { usize::MAX / 4 } else {
+            let (id, lp) = pl.local(st as u64);
+            match db.get_reference(id) {
+                Some(rv) if lp as usize + s.len() <= rv.len() => rv.mismatches(lp as usize, s, &pack2(s), total + 2),
+                _ => usize::MAX / 4,
+            }
+        };
+        memo.push(((side, st, flipped), m));
+        m
+    };
+    let (mut q0, mut q1, mut tried) = (0usize, 0usize, 0usize);
+    // An alternative of one mate with the other mate's alternatives or its chosen locus.
+    for side in 0..2 {
+        let o = 1 - side;
+        for i in 0..alts[side].len() {
+            let (st, fl) = alts[side][i];
+            let mut partners: Vec<(i64, bool, Option<usize>)> = Vec::new();
+            if (gstart[o] - st).abs() <= 1000 { partners.push((gstart[o], false, Some(chosen[o].2))); }
+            if side == 0 {
+                let lo = alts[o].partition_point(|x| x.0 < st - 1000);
+                for &(s2, f2) in alts[o][lo..].iter().take_while(|x| x.0 <= st + 1000) { partners.push((s2, f2, None)); }
+            }
+            for (s2, f2, known) in partners {
+                if tried >= 256 { break; }
+                tried += 1;
+                let m1 = mm(side, st, fl);
+                if m1 > total + 1 { break; }
+                let m2 = known.unwrap_or_else(|| mm(o, s2, f2));
+                let t = m1 + m2;
+                q0 += (t <= total) as usize;
+                q1 += (t == total + 1) as usize;
+            }
+        }
+    }
+    (q0, q1, big[0] && big[1])
 }
