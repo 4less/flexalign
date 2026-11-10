@@ -3896,7 +3896,57 @@ impl<
                             alt = alt.min(c - best_c);
                             n_close += (c - best_c <= 2 * penalties::MISMATCH as i64) as usize;
                         }
-                        let _ = w.lock().unwrap().write_all(format!("{near_name}\t{pseudo_mapq}\t{}\t{le0}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{ins}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                        // Per core (range) of each mate, against the placed locus: ranges, those
+                        // holding it, those where it is at the best flank, those where it is the
+                        // only copy there, those holding it at a worse flank (a vote against),
+                        // those without it, the fewest copies tied with it at the best flank, the
+                        // sum of its flank distances, and the fewest copies of a range holding it.
+                        let core_view = |sd: usize| -> [usize; 9] {
+                            let (rid, st, _) = chosen[sd];
+                            let len = reads[sd].0.len() as i64;
+                            let k = C as i64;
+                            let mut o = [0usize; 9];
+                            o[6] = usize::MAX;
+                            o[8] = usize::MAX;
+                            let mut db = Vec::new();
+                            for r in ranges[sd].iter() {
+                                o[0] += 1;
+                                let n = r.vrange.len();
+                                let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut db);
+                                let mut at: Option<usize> = None;
+                                for i in 0..n {
+                                    let (v, p) = r.vrange.value(i);
+                                    if v != rid { continue; }
+                                    let p = p as i64;
+                                    if (p - r.qpos as i64 - st).abs() <= 8 || (p - (len - r.qpos as i64 - k) - st).abs() <= 8 { at = Some(i); break; }
+                                }
+                                let Some(i) = at else { o[5] += 1; continue };
+                                o[1] += 1;
+                                o[8] = o[8].min(n);
+                                if db.is_empty() {
+                                    o[2] += 1;
+                                    o[3] += (n == 1) as usize;
+                                    o[6] = o[6].min(n);
+                                    continue;
+                                }
+                                let d = db[i] as u32;
+                                o[7] += d as usize;
+                                if d <= min {
+                                    let tied = db.iter().filter(|&&x| x as u32 == min).count();
+                                    o[2] += 1;
+                                    o[3] += (tied == 1) as usize;
+                                    o[6] = o[6].min(tied);
+                                } else {
+                                    o[4] += 1;
+                                }
+                            }
+                            if o[6] == usize::MAX { o[6] = 0; }
+                            if o[8] == usize::MAX { o[8] = 0; }
+                            o
+                        };
+                        let (cv0, cv1) = (core_view(0), core_view(1));
+                        let cvs = cv0.iter().chain(cv1.iter()).map(|x| x.to_string()).collect::<Vec<_>>().join("\t");
+                        let _ = w.lock().unwrap().write_all(format!("{near_name}\t{pseudo_mapq}\t{}\t{le0}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{ins}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{cvs}\n",
                             deltas.iter().copied().min().unwrap_or(9), cnt(1), cnt(2), cnt(3), fr(3, 0), fr(3, 1), fr(2, 0), fr(2, 1),
                             chosen[0].2, chosen[1].2, sc[0].min(99), sc[1].min(99), (chosen[0].0 == chosen[1].0) as u8,
                             sa.0, sb.0, sa.1, sb.1, sa.2, sb.2, n_al, if alt == i64::MAX { 999 } else { alt.clamp(-99, 998) }, n_close,
