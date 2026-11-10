@@ -3984,6 +3984,54 @@ impl<
                 }
             }
         }
+        // --support-mapq-step: core support bounds the MAPQ. For each placed mate, the cores whose
+        // best-flank copies include the placed locus are counted; with s such cores for the weaker
+        // mate the pair's MAPQ is at most --support-mapq-base + step * s. A mate no core points at
+        // was placed by alignment next to its partner only, and what else fits was never listed.
+        if self.options.args.support_mapq_step > 0 && pseudo_mapq > self.options.args.support_mapq_base {
+            let (base, step) = (self.options.args.support_mapq_base as usize, self.options.args.support_mapq_step as usize);
+            let enough = (60usize.saturating_sub(base)).div_ceil(step);
+            let placed = [fwd_anchor, rev_anchor];
+            let lens = [rec_fwd.seq().len() as i64, rec_rev.seq().len() as i64];
+            let ranges = [self.range_extractor_fwd.retrieve(), self.range_extractor_rev.retrieve()];
+            let mut weakest = usize::MAX;
+            let mut dist = Vec::new();
+            for side in 0..2 {
+                let Some(a) = placed[side].filter(|a| a.cigar.is_some()) else { continue };
+                let lead = a.cigar.as_ref().unwrap().0.iter().take_while(|&&o| o == b'S').count() as i64;
+                let start = a.reference_cigar_range.start as i64 - lead;
+                let k = C as i64;
+                let mut sup = 0usize;
+                for r in ranges[side].iter() {
+                    if sup >= enough {
+                        break;
+                    }
+                    let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, &mut dist);
+                    for i in 0..r.vrange.len() {
+                        if !dist.is_empty() && dist[i] as u32 > min {
+                            continue;
+                        }
+                        let (v, p) = r.vrange.value(i);
+                        if v != a.reference {
+                            continue;
+                        }
+                        let p = p as i64;
+                        if (p - r.qpos as i64 - start).abs() <= 8 || (p - (lens[side] - r.qpos as i64 - k) - start).abs() <= 8 {
+                            sup += 1;
+                            break;
+                        }
+                    }
+                }
+                weakest = weakest.min(sup);
+            }
+            if weakest != usize::MAX {
+                let cap = (base + step * weakest).min(60) as u8;
+                if cap < pseudo_mapq {
+                    pseudo_mapq = cap;
+                    stats.support_mapq_lowered += 1;
+                }
+            }
+        }
         // FA_REPEAT_MAPQ: minibwa's pair MAPQ scaling, MAPQ * (1 - w (f1 + f2)); a pair keeps 1.
         if let Some((_, w)) = repeat_mapq().filter(|_| pseudo_mapq > 0) {
             let f = REPEAT_FRAC.with(|c| c.get());

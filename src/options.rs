@@ -692,6 +692,14 @@ pub struct Args {
     #[arg(long = "plink-posterior", action)]
     pub plink_posterior: bool,
 
+    /// The MAPQ is at most --support-mapq-base + this * (cores of the weaker mate whose best-flank
+    /// copies include the placed locus). 0: off.
+    #[arg(long = "support-mapq-step", default_value_t = 0)]
+    pub support_mapq_step: u8,
+
+    #[arg(long = "support-mapq-base", default_value_t = 20)]
+    pub support_mapq_base: u8,
+
     #[arg(long = "plink-frac-w", default_value_t = 0.5)]
     pub plink_frac_w: f64,
 
