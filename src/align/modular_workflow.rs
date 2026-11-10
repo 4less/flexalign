@@ -3835,6 +3835,18 @@ impl<
                     let seqs = [0, 1].map(|sd| if fwd_placed[sd] { (reads[sd].0, reads[sd].1) } else { (reads[sd].1, reads[sd].0) });
                     let (q0, q1, deltas) = plink_competition(self.db, pl, seqs, fwd_placed, chosen, self.options.args.plink_max_class);
                     stats.plink_pairs += 1;
+                    // FA_FEAT_OUT=<file>: what is known about the pair when its MAPQ is set.
+                    if let Some(w) = feat_out() {
+                        let cnt = |d: i64| deltas.iter().filter(|&&x| x == d).count();
+                        let le0 = deltas.iter().filter(|&&x| x <= 0).count();
+                        let sc = SEEDED_CORES.with(|c| c.get());
+                        let fr = |lv: u8, sd: usize| uniq_track().map_or(0.0, |t| t.frac(lv, chosen[sd].0 as usize, chosen[sd].1.max(0) as usize, reads[sd].0.len()));
+                        let ins = ((chosen[0].1 + reads[0].0.len() as i64).max(chosen[1].1 + reads[1].0.len() as i64) - chosen[0].1.min(chosen[1].1)).abs();
+                        use std::io::Write;
+                        let _ = w.lock().unwrap().write_all(format!("{near_name}\t{pseudo_mapq}\t{}\t{le0}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\t{}\t{ins}\t{}\n",
+                            deltas.iter().copied().min().unwrap_or(9), cnt(1), cnt(2), cnt(3), fr(3, 0), fr(3, 1), fr(2, 0), fr(2, 1),
+                            chosen[0].2, chosen[1].2, sc[0].min(99), sc[1].min(99), (chosen[0].0 == chosen[1].0) as u8).as_bytes());
+                    }
                     // --plink-model: the MAPQ as minibwa builds it, from what the links and the
                     // track know: the margin to the best other pair (30 a mismatch), less
                     // 4.343 ln(1 + other pairs within +3), scaled by how much of both mates lies
@@ -5280,6 +5292,12 @@ fn near2_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
         .as_ref()
 }
 
+fn feat_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_FEAT_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(p).expect("FA_FEAT_OUT file")))))
+        .as_ref()
+}
+
 fn tied_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
     static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
     W.get_or_init(|| std::env::var_os("FA_TIED_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).expect("FA_TIED_OUT file")))))
@@ -5294,6 +5312,10 @@ fn agree_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
 
 pub fn fm_trace_flush() {
     fm_time::report();
+    if let Some(w) = feat_out() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
     if let Some(w) = tied_out() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
@@ -6209,6 +6231,17 @@ impl UniqTrack {
 }
 
 impl UniqTrack {
+    /// The share of the known buckets under a read at level `lv` or above (2 = tied at 63 bp,
+    /// 3 = at 95 bp); 1 when there is none.
+    pub fn frac(&self, lv: u8, id: usize, start: usize, len: usize) -> f64 {
+        let Some(&(o, l)) = self.refs.get(id) else { return 0.0 };
+        let (s, e) = (start.min(l), (start + len).min(l));
+        let b = &self.bytes[o + s / 8..(o + e.div_ceil(8)).min(self.bytes.len())];
+        let known = b.iter().filter(|&&x| x > 0).count();
+        if known == 0 { return 1.0; }
+        b.iter().filter(|&&x| x >= lv).count() as f64 / known as f64
+    }
+
     /// The share of the known buckets under a read that are tied at 95 bp or wider.
     pub fn frac95(&self, id: usize, start: usize, len: usize) -> f64 {
         let Some(&(o, l)) = self.refs.get(id) else { return 0.0 };
