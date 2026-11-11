@@ -2235,6 +2235,22 @@ impl<
         {
             let cores = |sd: &[Seed]| { let mut q: Vec<(u32, u8)> = sd.iter().map(|x| (x.qpos, x.length)).collect(); q.sort_unstable(); q.dedup(); q.len() };
             SEEDED_CORES.with(|c| c.set([cores(&seeds_fwd), cores(&seeds_rev)]));
+            // FA_MATE_OUT=<file>: per mate, its cores' multiplicities and its seeds: k-mers, ranges
+            // found, fewest / mean / most copies of a range, seeds after the flank comparison,
+            // cores that gave seeds.
+            if let Some(w) = mate_out() {
+                let name = String::from_utf8_lossy(rec_fwd.head()).split_whitespace().next().unwrap_or("").trim_start_matches('@').to_string();
+                let name = name.strip_suffix("/1").unwrap_or(&name).to_string();
+                let mut line = String::new();
+                for (mate, nk, rg, sd) in [("1", n_kmers_fwd, ranges_fwd, &seeds_fwd), ("2", n_kmers_rev, ranges_rev, &seeds_rev)] {
+                    let sizes: Vec<usize> = rg.iter().map(|r| r.vrange.len()).collect();
+                    let (mn, mx) = (sizes.iter().copied().min().unwrap_or(0), sizes.iter().copied().max().unwrap_or(0));
+                    let mean = if sizes.is_empty() { 0.0 } else { sizes.iter().sum::<usize>() as f64 / sizes.len() as f64 };
+                    line.push_str(&format!("{name}\t{mate}\t{nk}\t{}\t{mn}\t{mean:.1}\t{mx}\t{}\t{}\n", sizes.len(), sd.len(), cores(sd)));
+                }
+                use std::io::Write;
+                let _ = w.lock().unwrap().write_all(line.as_bytes());
+            }
             // FA_FEAT_OUT: per mate k-mers, ranges found, cores cut, fewest copies of a range.
             PAIR_FEATS.with(|c| c.set([
                 [n_kmers_fwd, ranges_fwd.len(), self.seed_extractor_fwd.last_ties().1, ranges_fwd.iter().map(|r| r.vrange.len()).min().unwrap_or(0)],
@@ -5575,6 +5591,12 @@ fn plink_parts() -> i64 {
     *V.get_or_init(|| std::env::var("FA_PLINK_PARTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3))
 }
 
+fn mate_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| std::env::var_os("FA_MATE_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(p).expect("FA_MATE_OUT file")))))
+        .as_ref()
+}
+
 fn feat_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
     static W: std::sync::OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::OnceLock::new();
     W.get_or_init(|| std::env::var_os("FA_FEAT_OUT").map(|p| std::sync::Mutex::new(std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(p).expect("FA_FEAT_OUT file")))))
@@ -5595,6 +5617,10 @@ fn agree_out() -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::F
 
 pub fn fm_trace_flush() {
     fm_time::report();
+    if let Some(w) = mate_out() {
+        use std::io::Write;
+        let _ = w.lock().unwrap().flush();
+    }
     if let Some(w) = feat_out() {
         use std::io::Write;
         let _ = w.lock().unwrap().flush();
