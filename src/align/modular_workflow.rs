@@ -3850,6 +3850,20 @@ impl<
                     // --plink-posterior: the MAPQ is the posterior of the placed pair among the
                     // pairs the links know: 1 / (1 + sum of their likelihood ratios + the mass of
                     // what cannot be seen, 1e-6). Never above the MAPQ so far.
+                    // --search-competitor S: a pair whose weaker mate has at most S cores pointing
+                    // at its placed locus gets its own search for other pairs.
+                    let mut llrs = llrs;
+                    if self.options.args.search_competitor >= 0 {
+                        let mut dist = Vec::new();
+                        let s_max = self.options.args.search_competitor as usize;
+                        let weakest = (0..2).map(|sd| core_support::<C, F>(ranges[sd], chosen[sd].0, chosen[sd].1, reads[sd].0.len() as i64, s_max + 1, &mut dist)).min().unwrap_or(99);
+                        if weakest <= s_max {
+                            let found = search_competitors::<D, C, F>(self.db, reads, ql, ranges, chosen, fwd_placed, gapped_cost, self.options.args.search_per_range, self.options.args.search_top);
+                            stats.search_pairs += 1;
+                            stats.search_better += found.iter().any(|&l| l > 0.5) as usize;
+                            llrs.extend(found);
+                        }
+                    }
                     if self.options.args.plink_posterior {
                         let sum: f64 = llrs.iter().map(|&l| 10f64.powf(l.min(6.0))).sum::<f64>() + 1e-6;
                         let q = (-10.0 * (sum / (1.0 + sum)).log10()).clamp(0.0, 60.0).round() as u8;
@@ -5244,6 +5258,115 @@ fn near_pair_competition<D: FlexalignDatabase, const C: usize, const F: usize>(
         q1 += (t <= total + 1) as usize;
     }
     (q0, q1)
+}
+
+/// How many of a mate's cores have the placed locus among their best-flank copies (counting stops
+/// at `enough`).
+fn core_support<const C: usize, const F: usize>(
+    ranges: &[crate::align::process::range_extractor::Range<F>], reference: u64, start: i64, len: i64, enough: usize, dist: &mut Vec<u8>,
+) -> usize {
+    let k = C as i64;
+    let mut sup = 0usize;
+    for r in ranges.iter() {
+        if sup >= enough {
+            break;
+        }
+        let min = crate::align::process::seed_extractor::flank_distances(&r.vrange, r.fmer.0 as u32, dist);
+        for i in 0..r.vrange.len() {
+            if !dist.is_empty() && dist[i] as u32 > min {
+                continue;
+            }
+            let (v, p) = r.vrange.value(i);
+            if v != reference {
+                continue;
+            }
+            let p = p as i64;
+            if (p - r.qpos as i64 - start).abs() <= 8 || (p - (len - r.qpos as i64 - k) - start).abs() <= 8 {
+                sup += 1;
+                break;
+            }
+        }
+    }
+    sup
+}
+
+/// --search-competitor: other pairs of loci for a pair whose mate has little core support. Each
+/// mate's read starts come from its ranges' copies within one flank mismatch of the best (at most
+/// `per_range` a range), kept when two ranges agree (one, for a mate of fewer than three ranges);
+/// they are joined with the other mate's starts or its placed locus (one reference, within 1 kb,
+/// facing strands), ranked by votes, and the top `top` compared with both reads. Returns the log10
+/// likelihood ratio of each over the placed pair (base-quality-weighted mismatches, insert density).
+#[allow(clippy::too_many_arguments)]
+fn search_competitors<D: FlexalignDatabase, const C: usize, const F: usize>(
+    db: &D, reads: [(&[u8], &[u8]); 2], quals: [(&[u8], &[u8]); 2], ranges: [&[crate::align::process::range_extractor::Range<F>]; 2],
+    chosen: [(u64, i64, usize); 2], placed_fwd: [bool; 2], gapped_cost: [Option<f64>; 2], per_range: usize, top: usize,
+) -> Vec<f64> {
+    let lens = [reads[0].0.len() as i64, reads[1].0.len() as i64];
+    let mut dist = Vec::new();
+    let mut lists: [Vec<(u64, i64, bool, usize)>; 2] = [Vec::new(), Vec::new()];
+    for side in 0..2 {
+        let votes = if ranges[side].len() < 3 { 1 } else { 2 };
+        let _ = near_pick_sel::<D, C, F>(db, reads[side].0, reads[side].1, ranges[side], None, 1, votes, 0.0, 0, 0, &mut dist, per_range);
+        let mut l = NEAR_STARTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        // The placed locus itself is a partner for the other mate's alternatives.
+        l.retain(|x| !(x.0 == chosen[side].0 && (x.1 - chosen[side].1).abs() <= 150));
+        l.push((chosen[side].0, chosen[side].1, placed_fwd[side], usize::MAX / 4));
+        lists[side] = l;
+    }
+    let mut b = lists[1].clone();
+    b.sort_unstable();
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for (i0, x) in lists[0].iter().enumerate() {
+        let lo = b.partition_point(|y| (y.0, y.1) < (x.0, x.1 - 1000));
+        for (i1, y) in b.iter().enumerate().skip(lo) {
+            if y.0 != x.0 || y.1 > x.1 + 1000 {
+                break;
+            }
+            let both_placed = x.3 == usize::MAX / 4 && y.3 == usize::MAX / 4;
+            if y.2 != x.2 && !both_placed {
+                pairs.push((x.3.min(64) + y.3.min(64), i0, i1));
+            }
+        }
+    }
+    pairs.sort_unstable_by(|a, c| c.0.cmp(&a.0));
+    pairs.truncate(top);
+    let weight = |side: usize, x: (u64, i64, bool, usize)| -> f64 {
+        let (s, q) = if x.2 { (reads[side].0, quals[side].0) } else { (reads[side].1, quals[side].1) };
+        match db.get_reference(x.0 as usize) {
+            Some(rv) if x.1 >= 0 && (x.1 as usize) + s.len() <= rv.len() => {
+                let r = rv.window(x.1 as usize..x.1 as usize + s.len());
+                s.iter().zip(r).zip(q).filter(|((a, b), _)| a != b).map(|(_, &ql)| (ql.saturating_sub(33).min(41) as f64) / 10.0 + 0.477).sum()
+            }
+            _ => 99.0,
+        }
+    };
+    let placed = |side: usize| (chosen[side].0, chosen[side].1, placed_fwd[side], 0usize);
+    let w_ch = [0, 1].map(|sd| gapped_cost[sd].unwrap_or_else(|| weight(sd, placed(sd))));
+    let (mean, sd) = crate::align::common::INSERT_STATS.get().copied().unwrap_or((0.0, 0.0));
+    let ins_ll = |s0: i64, s1: i64| -> f64 {
+        if sd <= 0.0 { return 0.0; }
+        let z = (((s0 + lens[0]).max(s1 + lens[1]) - s0.min(s1)) as f64 - mean) / sd;
+        -(z * z) / (2.0 * std::f64::consts::LN_10)
+    };
+    let ins_ch = ins_ll(chosen[0].1, chosen[1].1);
+    let mut memo: Vec<((usize, usize), f64)> = Vec::new();
+    let mut out = Vec::new();
+    for &(_, i0, i1) in &pairs {
+        let (x, y) = (lists[0][i0], b[i1]);
+        let mut w = |side: usize, idx: usize, v: (u64, i64, bool, usize)| -> f64 {
+            if v.3 == usize::MAX / 4 { return w_ch[side]; }
+            if let Some(e) = memo.iter().find(|e| e.0 == (side, idx)) { return e.1; }
+            let val = weight(side, v);
+            memo.push(((side, idx), val));
+            val
+        };
+        let l = w_ch[0] + w_ch[1] - w(0, i0, x) - w(1, i1, y) + ins_ll(x.1, y.1) - ins_ch;
+        if l > -9.0 {
+            out.push(l);
+        }
+    }
+    crate::database::refseq2::reset_scratch();
+    out
 }
 
 /// FA_NEAR_READS=<file of read names> with FA_NEAR_OUT=<file>: for those pairs, how many other

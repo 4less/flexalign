@@ -700,6 +700,17 @@ pub struct Args {
     #[arg(long = "support-mapq-base", default_value_t = 20)]
     pub support_mapq_base: u8,
 
+    /// With --plink-posterior: search other pairs of loci for a pair whose weaker mate has at most
+    /// this many cores pointing at its placed locus (-1: off).
+    #[arg(long = "search-competitor", default_value_t = -1, allow_hyphen_values = true)]
+    pub search_competitor: i32,
+
+    #[arg(long = "search-per-range", default_value_t = 256)]
+    pub search_per_range: usize,
+
+    #[arg(long = "search-top", default_value_t = 32)]
+    pub search_top: usize,
+
     #[arg(long = "plink-frac-w", default_value_t = 0.5)]
     pub plink_frac_w: f64,
 
