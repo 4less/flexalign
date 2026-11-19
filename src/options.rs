@@ -551,6 +551,21 @@ pub struct Args {
     #[arg(long = "screen-z", default_value_t = 0)]
     pub screen_z: usize,
 
+    /// Compare every candidate pair holding a copy seeded by one of the X lowest-multiplicity
+    /// seeded cores of either mate, however the pair ranks on seeds. 0: off.
+    #[arg(long = "extend-x-lowest-multiplicity", default_value_t = 0)]
+    pub extend_x_lowest_multiplicity: usize,
+
+    /// --extend-x-lowest-multiplicity: the most candidate pairs the comparison window grows to.
+    #[arg(long = "extend-lowest-max", default_value_t = 256)]
+    pub extend_lowest_max: usize,
+
+    /// MAPQ times min(1, cover / (K x the sample's median cover)), at least 1. The cover is the
+    /// read bases under the seed cores of the pair's weaker mate plus half the stronger mate's;
+    /// the median is measured on the input's first pairs, before the run. 0: off.
+    #[arg(long = "cover-mapq-rel", default_value_t = 0.0)]
+    pub cover_mapq_rel: f64,
+
     /// --screen-z: the most pairs the window grows to for ties with the best.
     #[arg(long = "screen-tie-cap", default_value_t = 32)]
     pub screen_tie_cap: usize,

@@ -1274,6 +1274,22 @@ impl<
 {
     //RE, SE,
     /// The probe: would the fast-hit path place this pair? Writes nothing.
+    /// `--cover-mapq-rel`, the probe: twice the seed cover of one pair (`pair_cover2`), from its
+    /// plain seeding (no fast path, no second passes).
+    pub fn probe_seed_cover(&mut self, rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats) -> u32 {
+        crate::database::refseq2::reset_scratch();
+        let kmers_fwd = self.kmer_extractor_fwd.generate(rec_fwd, stats);
+        let kmers_rev = self.kmer_extractor_rev.generate(rec_rev, stats);
+        let ranges_fwd = self.range_extractor_fwd.generate(kmers_fwd, rec_fwd, stats);
+        let ranges_rev = self.range_extractor_rev.generate(kmers_rev, rec_rev, stats);
+        self.seed_extractor_fwd.generate(ranges_fwd, stats);
+        self.seed_extractor_rev.generate(ranges_rev, stats);
+        pair_cover2(
+            core_cover::<C, F>(self.seed_extractor_fwd.retrieve(), rec_fwd.seq().len()),
+            core_cover::<C, F>(self.seed_extractor_rev.retrieve(), rec_rev.seq().len()),
+        )
+    }
+
     pub fn probe_fast_hit(&mut self, rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats) -> bool {
         // A read (pair) starts: no reference slice of the previous one is used again.
         crate::database::refseq2::reset_scratch();
@@ -1634,6 +1650,14 @@ impl<
                 }
             }
         }
+        // --cover-mapq-rel: how much of the pair's reads its seeds cover, kept for the MAPQ.
+        let cover2 = (self.options.args.cover_mapq_rel > 0.0).then(|| {
+            pair_cover2(
+                core_cover::<C, F>(self.seed_extractor_fwd.retrieve(), rec_fwd.seq().len()),
+                core_cover::<C, F>(self.seed_extractor_rev.retrieve(), rec_rev.seq().len()),
+            )
+        });
+        PAIR_COVER2.with(|p| p.set(cover2));
         let keep = self.options.args.tie_read;
         if keep > 0 {
             let flex = if difficult { self.options.args.adaptive_flex } else { default_flex };
@@ -1902,7 +1926,7 @@ impl<
                     fm_time::FE_STORE_N.fetch_add(tied.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     // FA_FM_TIME: how many distinct stored windows the compared copies have.
                     if fm_time::on() {
-                        if let Some((st, w0, f0, cnt)) = store {
+                        if let Some((st, w0, f0, cnt)) = store.filter(|x| x.0.ladder_t > 0) {
                             let mut seen: std::collections::HashSet<Vec<u64>> = std::collections::HashSet::new();
                             let mut mp = 0usize;
                             for &i in &tied {
@@ -2653,7 +2677,7 @@ impl<
                     a.as_ref().is_some_and(|a| a.reference == rid && a.seeds.iter().any(|sd| (sd.rpos as i64 - *pos0 as i64).abs() <= 300))
                 }).map_or(-1, |i| i as i64)
             };
-            if truth.contains_key(&format!("{name}\t1")) {
+            if truth.contains_key(&format!("{name}\t1")) || truth.contains_key(&format!("{name}\t2")) {
                 let line = format!("R\t{name}\t{}\t{}\t{}\t{}\n", rank("1", 0), rank("2", 1), anchors.len(), extend_top_z);
                 use std::io::Write as _;
                 if let Some(w) = w.lock().unwrap().as_mut() {
@@ -2802,6 +2826,26 @@ impl<
                 stats.screen_window_grown += 1;
                 extend_top_z = ties.min(self.options.args.screen_tie_cap.max(extend_top_z));
             }
+        }
+        // --extend-x-lowest-multiplicity X: a mate's lowest-multiplicity cores are its most specific
+        // evidence, so every candidate pair holding a copy one of them seeded is compared, however
+        // the pair ranks on seeds (the window grows to at most --extend-lowest-max pairs).
+        let lowest = self.options.args.extend_x_lowest_multiplicity;
+        let lowest_max = self.options.args.extend_lowest_max;
+        if lowest > 0 && extend_top_z < lowest_max.min(anchors.len()) {
+            let loci_fwd = lowest_core_loci(self.range_extractor_fwd.retrieve(), &seeds_fwd, lowest);
+            let loci_rev = lowest_core_loci(self.range_extractor_rev.retrieve(), &seeds_rev, lowest);
+            let before = extend_top_z;
+            for i in extend_top_z..anchors.len() {
+                if extend_top_z >= lowest_max {
+                    break;
+                }
+                if holds_locus(&anchors[i].0, &loci_fwd) || holds_locus(&anchors[i].1, &loci_rev) {
+                    anchors.swap(i, extend_top_z);
+                    extend_top_z += 1;
+                }
+            }
+            stats.lowest_core_pairs += extend_top_z - before;
         }
         let pair_bonus = self.options.args.proper_pair_bonus;
         let mut time_extend = std::time::Duration::ZERO;
@@ -4062,6 +4106,14 @@ impl<
                 }
             }
         }
+        // --cover-mapq-rel K: little seed evidence by this sample's standards, little confidence.
+        if let (Some(cover2), Some(median2)) = (PAIR_COVER2.with(|p| p.get()), sample_cover_median2()) {
+            let scaled = cover_scaled_mapq(pseudo_mapq, cover2, median2, self.options.args.cover_mapq_rel);
+            if scaled < pseudo_mapq {
+                pseudo_mapq = scaled;
+                stats.cover_mapq_lowered += 1;
+            }
+        }
         // FA_REPEAT_MAPQ: minibwa's pair MAPQ scaling, MAPQ * (1 - w (f1 + f2)); a pair keeps 1.
         if let Some((_, w)) = repeat_mapq().filter(|_| pseudo_mapq > 0) {
             let f = REPEAT_FRAC.with(|c| c.get());
@@ -4969,6 +5021,100 @@ fn tie_read_seeds<const C: usize, const F: usize>(r: &crate::align::process::ran
 }
 
 /// A read at 2 bits a base, 32 to a word, the first in the low bits (A 0 C 1 G 2 T 3, others A).
+/// `--extend-x-lowest-multiplicity`: the loci (reference, position) seeded by the `x` seeded cores
+/// of a mate that have the fewest copies in the index.
+fn lowest_core_loci<const F: usize>(
+    ranges: &[crate::align::process::range_extractor::Range<F>], seeds: &[Seed], x: usize,
+) -> Vec<(u64, u64)> {
+    // A seed with an exact flank starts at its k-mer; a core-only seed half a flank into it.
+    let from = |qpos: usize, s: &Seed| s.qpos as usize == qpos || s.qpos as usize == qpos + F / 2;
+    let mut cores: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| seeds.iter().any(|s| from(r.qpos, s)))
+        .map(|r| (r.vrange.len(), r.qpos))
+        .collect();
+    cores.sort_unstable();
+    cores.truncate(x);
+    seeds.iter().filter(|s| cores.iter().any(|c| from(c.1, s))).map(|s| (s.rval, s.rpos)).collect()
+}
+
+/// Whether a candidate's seeds include one of `loci`.
+fn holds_locus(anchor: &Option<Anchor>, loci: &[(u64, u64)]) -> bool {
+    anchor.as_ref().is_some_and(|a| {
+        loci.iter().any(|&(reference, pos)| a.reference == reference && a.seeds.iter().any(|s| s.rpos == pos))
+    })
+}
+
+thread_local! {
+    /// Twice the seed cover of the pair being placed (`pair_cover2`); `None` when not measured.
+    static PAIR_COVER2: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Twice the median seed cover of the sample's probe pairs (0: not measured): the sample's own
+/// standard for `--cover-mapq-rel`, since how much of a read seeds cover depends on the genome.
+/// Set once, before the workers start, from the same pairs every run.
+static SAMPLE_COVER_MEDIAN2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sets the sample's standard from the probe pairs' covers (`probe_seed_cover`); returns it.
+pub fn set_sample_cover(mut covers2: Vec<u32>) -> Option<u32> {
+    if covers2.is_empty() {
+        return None;
+    }
+    let mid = covers2.len() / 2;
+    let median2 = *covers2.select_nth_unstable(mid).1;
+    SAMPLE_COVER_MEDIAN2.store(median2, std::sync::atomic::Ordering::Relaxed);
+    Some(median2)
+}
+
+fn sample_cover_median2() -> Option<u32> {
+    Some(SAMPLE_COVER_MEDIAN2.load(std::sync::atomic::Ordering::Relaxed)).filter(|&m| m > 0)
+}
+
+/// Read bases under the cores of a mate's seeds at the locus they support best (reference, read
+/// start in 8 bp buckets, strand), overlaps counted once.
+fn core_cover<const C: usize, const F: usize>(seeds: &[Seed], read_len: usize) -> u32 {
+    let core_len = (C - F) as u32;
+    // (locus, core start on the read), both strands: a seed does not know its read's strand.
+    let mut by_locus: Vec<((u64, i64, bool), u32)> = Vec::with_capacity(seeds.len() * 2);
+    for s in seeds {
+        let (fwd_start, rev_start) = s.offsets(read_len);
+        let core = s.qpos + if s.mismatch == 0 { (F / 2) as u32 } else { 0 };
+        by_locus.push(((s.rval, fwd_start.div_euclid(8), true), core));
+        by_locus.push(((s.rval, rev_start.div_euclid(8), false), core));
+    }
+    crate::align::common::sort_short_by_key(&mut by_locus, |e| *e);
+    by_locus
+        .chunk_by(|a, b| a.0 == b.0)
+        .map(|cores| {
+            // Sorted by start: the union of [start, start + core_len).
+            let (mut covered, mut end) = (0u32, 0u32);
+            for &(_, start) in cores {
+                let stop = (start + core_len).min(read_len as u32);
+                covered += stop.saturating_sub(start.max(end));
+                end = end.max(stop);
+            }
+            covered
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Twice a pair's seed cover: the weaker mate's core cover plus half the stronger mate's (the
+/// weaker mate limits what the pair can be sure of; twice, to stay in integers).
+fn pair_cover2(a: u32, b: u32) -> u32 {
+    2 * a.min(b) + a.max(b)
+}
+
+/// `--cover-mapq-rel K`: the MAPQ times min(1, cover / (K x the sample's median cover)). A pair
+/// that had MAPQ 1 or more keeps at least 1: it is less certain, not as good as unplaced.
+fn cover_scaled_mapq(mapq: u8, cover2: u32, median2: u32, k: f64) -> u8 {
+    if mapq == 0 || k <= 0.0 || median2 == 0 {
+        return mapq;
+    }
+    let share = (cover2 as f64 / (k * median2 as f64)).min(1.0);
+    ((mapq as f64 * share).round() as u8).max(1)
+}
+
 fn pack2(s: &[u8]) -> Vec<u64> {
     let mut v = vec![0u64; (s.len() + 31) / 32];
     for (i, &b) in s.iter().enumerate() {
@@ -6897,4 +7043,56 @@ fn plink_competition<D: FlexalignDatabase>(
     }
     let d = deltas.into_inner();
     (q0, q1, d, llrs.into_inner())
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    fn seed(qpos: u32, rpos: u64, exact: bool) -> Seed {
+        // An exact seed is the whole 31-mer; a core-only seed starts 8 bases in and is 15 long.
+        if exact {
+            Seed { qpos, rpos, rval: 0, mismatch: 0, length: 31, flag: 0 }
+        } else {
+            Seed { qpos: qpos + 8, rpos: rpos + 8, rval: 0, mismatch: 1, length: 15, flag: 0 }
+        }
+    }
+
+    #[test]
+    fn core_cover_counts_overlapping_cores_once() {
+        // Two k-mers 5 apart at one locus: cores at read 8..23 and 13..28, 20 bases together.
+        let seeds = [seed(0, 1000, true), seed(5, 1005, false)];
+        assert_eq!(core_cover::<31, 16>(&seeds, 150), 20);
+        // A third seed elsewhere does not add to the best locus.
+        let seeds = [seed(0, 1000, true), seed(5, 1005, false), seed(60, 90_000, true)];
+        assert_eq!(core_cover::<31, 16>(&seeds, 150), 20);
+        assert_eq!(core_cover::<31, 16>(&[], 150), 0);
+    }
+
+    #[test]
+    fn pair_cover_weighs_the_weaker_mate_twice() {
+        assert_eq!(pair_cover2(40, 100), 180);
+        assert_eq!(pair_cover2(100, 40), 180);
+    }
+
+    #[test]
+    fn cover_scaling_lowers_but_never_unplaces() {
+        // Cover at or above K x median: unchanged.
+        assert_eq!(cover_scaled_mapq(60, 200, 200, 0.8), 60);
+        // Half of K x median: half the MAPQ.
+        assert_eq!(cover_scaled_mapq(60, 80, 200, 0.8), 30);
+        // No cover: still placed, at the lowest confidence.
+        assert_eq!(cover_scaled_mapq(60, 0, 200, 0.8), 1);
+        assert_eq!(cover_scaled_mapq(0, 0, 200, 0.8), 0);
+        // Off, or no median yet: unchanged.
+        assert_eq!(cover_scaled_mapq(60, 10, 200, 0.0), 60);
+        assert_eq!(cover_scaled_mapq(60, 10, 0, 0.8), 60);
+    }
+
+    #[test]
+    fn sample_cover_is_the_probe_median() {
+        assert_eq!(set_sample_cover(Vec::new()), None);
+        assert_eq!(set_sample_cover(vec![300, 100, 200]), Some(200));
+        assert_eq!(sample_cover_median2(), Some(200));
+    }
 }

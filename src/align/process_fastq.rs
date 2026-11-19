@@ -377,6 +377,33 @@ pub fn process_fastq_wrapper_modular<
                     eprintln!("Fast-hit probe: {} of the first {} pairs placed -> {} ({:.1?})", hit, tried, if off { "off for this run" } else { "on" }, probe_started.elapsed());
                 }
 
+                // --cover-mapq-rel: the sample's typical seed cover, from the input's first pairs,
+                // once and before the workers start (the same pairs, so the same output, every run).
+                if options.args.cover_mapq_rel > 0.0 {
+                    let f1 = File::open(fwd).expect("reads");
+                    let f2 = File::open(rev).expect("reads");
+                    let (b1, b2): (Box<dyn std::io::Read + Send>, Box<dyn std::io::Read + Send>) = if fwd_gzip {
+                        (Box::new(GzDecoder::new(f1)), Box::new(GzDecoder::new(f2)))
+                    } else {
+                        (Box::new(f1), Box::new(f2))
+                    };
+                    let byte_reader = Arc::new(Mutex::new(FastqPairedByteReader::new(b1, b2, READ_BATCH_BYTES)));
+                    let mut reader = PairedFastqReader::new(byte_reader, READ_BATCH_BYTES);
+                    let mut probe_stats = Stats::default();
+                    let mut covers2 = Vec::with_capacity(modular_workflow::FAST_HIT_PROBE);
+                    while let Some((r1, r2)) = reader.next() {
+                        covers2.push(modular_pe.probe_seed_cover(&r1, &r2, &mut probe_stats));
+                        if covers2.len() >= modular_workflow::FAST_HIT_PROBE {
+                            break;
+                        }
+                    }
+                    let pairs = covers2.len();
+                    match modular_workflow::set_sample_cover(covers2) {
+                        Some(median2) => eprintln!("Seed cover: median {:.1} read bases (from the first {pairs} pairs)", median2 as f64 / 2.0),
+                        None => eprintln!("Seed cover: no pairs to measure, --cover-mapq-rel off for this run"),
+                    }
+                }
+
                 let worker_pe = move |rec_fwd: &RefFastqRecord, rec_rev: &RefFastqRecord, stats: &mut Stats| {
                     
                     modular_pe.run(rec_fwd, rec_rev, stats);

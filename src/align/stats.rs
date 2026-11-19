@@ -165,6 +165,10 @@ pub struct Stats {
     pub screen_pairs: usize,
     pub screen_reranked: usize,
     pub screen_window_grown: usize,
+    /// --extend-x-lowest-multiplicity: candidate pairs added to the comparison window.
+    pub lowest_core_pairs: usize,
+    /// --cover-mapq-rel: pairs whose MAPQ was lowered.
+    pub cover_mapq_lowered: usize,
     pub tie_mapq_checked: usize,
     pub tie_mapq_zeroed: usize,
     pub tie_read_aborted: usize,
@@ -372,6 +376,8 @@ impl Stats {
             ("screen_pairs", self.screen_pairs as f64, "count"),
             ("screen_reranked", self.screen_reranked as f64, "count"),
             ("screen_window_grown", self.screen_window_grown as f64, "count"),
+            ("lowest_core_pairs", self.lowest_core_pairs as f64, "count"),
+            ("cover_mapq_lowered", self.cover_mapq_lowered as f64, "count"),
             ("tie_mapq_checked", self.tie_mapq_checked as f64, "count"),
             ("tie_mapq_zeroed", self.tie_mapq_zeroed as f64, "count"),
             ("tie_read_aborted", self.tie_read_aborted as f64, "count"),
@@ -569,6 +575,8 @@ impl Merge for Stats {
         self.screen_pairs += other.screen_pairs;
         self.screen_reranked += other.screen_reranked;
         self.screen_window_grown += other.screen_window_grown;
+        self.lowest_core_pairs += other.lowest_core_pairs;
+        self.cover_mapq_lowered += other.cover_mapq_lowered;
         self.tie_mapq_checked += other.tie_mapq_checked;
         self.tie_mapq_zeroed += other.tie_mapq_zeroed;
         self.tie_read_aborted += other.tie_read_aborted;
@@ -917,6 +925,8 @@ impl Default for Stats {
             screen_pairs: 0,
             screen_reranked: 0,
             screen_window_grown: 0,
+            lowest_core_pairs: 0,
+            cover_mapq_lowered: 0,
             tie_mapq_checked: 0,
             tie_mapq_zeroed: 0,
             tie_read_aborted: 0,
